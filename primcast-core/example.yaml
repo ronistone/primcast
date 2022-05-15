@@ -1,0 +1,27 @@
+leader_timeout_secs: 2
+reconnect_timeout_secs: 2
+groups:
+  - gid: 0
+    quorum: 2
+    peers:
+      - pid: 0
+        ip: 127.0.0.1
+        port: 10000
+      - pid: 1
+        ip: 127.0.0.2
+        port: 10000
+      - pid: 2
+        ip: 127.0.0.3
+        port: 10000
+  - gid: 1
+    quorum: 2
+    peers:
+      - pid: 0
+        ip: 127.0.0.4
+        port: 10000
+      - pid: 1
+        ip: 127.0.0.5
+        port: 10000
+      - pid: 2
+        ip: 127.0.0.6
+        port: 10000
