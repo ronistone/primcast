@@ -49,15 +49,18 @@ pub struct Config {
     pub reconnect_timeout_secs: usize,
 }
 
+impl GroupConfig {
+    pub fn peer(&self, pid: Pid) -> Option<&PeerConfig> {
+        self.peers.iter().find(|it| it.pid == pid)
+    }
+}
+
 impl Config {
     pub fn load(conf_file: &str) -> Result<Self, Error> {
         let settings = ParseConfig::builder()
             .set_default("leader_timeout_secs", 2 as u16)?
             .set_default("reconnect_timeout_secs", 2 as u16)?
-            .add_source(parse_config::File::new(
-                conf_file,
-                parse_config::FileFormat::Yaml,
-            ))
+            .add_source(parse_config::File::new(conf_file, parse_config::FileFormat::Yaml))
             .build()?;
 
         let config: Config = settings.try_deserialize()?;
@@ -105,8 +108,7 @@ impl Config {
     }
 
     pub fn group_pids(&self, gid: Gid) -> Option<Vec<Pid>> {
-        self.group(gid)
-            .map(|g| g.peers.iter().map(|p| p.pid).collect())
+        self.group(gid).map(|g| g.peers.iter().map(|p| p.pid).collect())
     }
 
     pub fn quorum_size(&self, gid: Gid) -> Option<usize> {
@@ -114,8 +116,11 @@ impl Config {
     }
 
     pub fn peer(&self, gid: Gid, pid: Pid) -> Option<&PeerConfig> {
-        self.group(gid)
-            .and_then(|g| g.peers.iter().find(|it| it.pid == pid))
+        self.group(gid).and_then(|g| g.peers.iter().find(|it| it.pid == pid))
+    }
+
+    pub fn peers(&self, gid: Gid) -> Option<&Vec<PeerConfig>> {
+        self.group(gid).map(|g| &g.peers)
     }
 }
 
@@ -125,7 +130,7 @@ mod tests {
 
     #[test]
     fn config_test() {
-        let config = Config::load("example.yaml").unwrap();
+        let config = Config::load("../example.yaml").unwrap();
 
         assert!(config.group(Gid(0)).is_some());
         assert!(config.group(Gid(1)).is_some());

@@ -65,6 +65,15 @@ impl AsMut<SmallVec<[Gid; 8]>> for GidSet {
     }
 }
 
+impl std::iter::IntoIterator for GidSet {
+    type Item = Gid;
+    type IntoIter = smallvec::IntoIter<[Gid; 8]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 impl std::iter::FromIterator<Gid> for GidSet {
     fn from_iter<I: IntoIterator<Item = Gid>>(iter: I) -> Self {
         let mut vec: SmallVec<_> = iter.into_iter().collect();

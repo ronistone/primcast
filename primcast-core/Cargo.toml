@@ -7,13 +7,10 @@ edition = "2021"
 
 [dependencies]
 thiserror = "1.0"
-
-fnv = "1.0"
-smallvec = { version = "1.8", features = ["serde"] }
-parse-config = { version = "0.12", package = "config" }
 rand = "0.8"
 
-bincode = "1.3"
-bytes = { version = "1", features = ["serde"] }
+rustc-hash = "1.1.0"
+# fnv = "1.0"
+smallvec = { version = "1.8", features = ["serde"] }
+parse-config = { version = "0.12", package = "config" }
 serde = { version = "1", features = ["derive", "rc"] }
-

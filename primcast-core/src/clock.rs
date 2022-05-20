@@ -15,7 +15,7 @@ pub struct LogicalClock {
 impl LogicalClock {
     pub fn new<I: IntoIterator<Item = Pid>>(pid: Pid, epoch: Epoch, group: I) -> Self {
         let clocks = group.into_iter().map(|pid| (pid, 0)).collect::<Vec<_>>();
-        clocks.iter().find(|(p,_)| *p == pid).expect("pid not found");
+        clocks.iter().find(|(p, _)| *p == pid).expect("pid not found");
         LogicalClock {
             pid,
             epoch,
@@ -26,11 +26,19 @@ impl LogicalClock {
 
     /// Value of the clock for given pid
     pub fn get(&self, pid: Pid) -> Clock {
-        self.clocks.iter().find(|(p,_)| pid == *p).map(|(_,c)| *c).expect("pid not found")
+        self.clocks
+            .iter()
+            .find(|(p, _)| pid == *p)
+            .map(|(_, c)| *c)
+            .expect("pid not found")
     }
 
     fn get_mut(&mut self, pid: Pid) -> &mut Clock {
-        self.clocks.iter_mut().find(|(p,_)| pid == *p).map(|(_,c)| c).expect("pid not found")
+        self.clocks
+            .iter_mut()
+            .find(|(p, _)| pid == *p)
+            .map(|(_, c)| c)
+            .expect("pid not found")
     }
 
     /// Value of the local clock
@@ -76,7 +84,8 @@ impl LogicalClock {
             *c = clock;
             self.sorted = false;
 
-            if pid != self.pid { // ensure bump of local clock
+            if pid != self.pid {
+                // ensure bump of local clock
                 let c = self.get_mut(self.pid);
                 *c = max(*c, clock);
             }
@@ -128,11 +137,11 @@ mod tests {
         assert_eq!(c.local(), 2);
         assert_eq!(c.quorum(q), 0);
 
-        c.update(Pid(2), e2,  1); // 2,1,0,0
+        c.update(Pid(2), e2, 1); // 2,1,0,0
         assert_eq!(c.local(), 2);
         assert_eq!(c.quorum(q), 1);
 
-        c.update(Pid(3), e2,  2); // 2,1,2,0
+        c.update(Pid(3), e2, 2); // 2,1,2,0
         assert_eq!(c.local(), 2);
         assert_eq!(c.quorum(q), 2);
 
@@ -142,13 +151,13 @@ mod tests {
         assert_eq!(c.quorum(q), 3);
 
         // ignore old epoch values
-        c.update(Pid(2), e1,  99); // 3,1,3,0
+        c.update(Pid(2), e1, 99); // 3,1,3,0
         assert_eq!(c.current_epoch(), e2);
         assert_eq!(c.local(), 3);
         assert_eq!(c.quorum(q), 3);
 
         // ignore higher epoch values from other nodes
-        c.update(Pid(2), e3,  99); // 3,1,3,0
+        c.update(Pid(2), e3, 99); // 3,1,3,0
         assert_eq!(c.current_epoch(), e2);
         assert_eq!(c.local(), 3);
         assert_eq!(c.quorum(q), 3);

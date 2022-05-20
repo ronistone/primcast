@@ -1,8 +1,8 @@
 use crate::types::*;
 
-use fnv::FnvHashMap;
+use rustc_hash::FxHashMap as HashMap;
+use serde::{Serialize, Deserialize};
 use std::collections::VecDeque;
-
 
 #[derive(Debug, Clone)]
 /// Information kept for each replica in the remote group
@@ -11,7 +11,7 @@ pub struct RemoteInfo {
     log_len: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteEntry {
     pub epoch: Epoch,
     pub idx: u64,
@@ -22,12 +22,7 @@ pub struct RemoteEntry {
 
 #[derive(Debug)]
 pub enum Error {
-    EpochTooHigh {
-        current: Epoch,
-    },
-    EpochTooLow {
-        current: Epoch,
-    },
+    EpochTooOld { current: Epoch },
     OutOfOrderAppend,
 }
 
@@ -36,7 +31,7 @@ pub enum Error {
 #[derive(Debug)]
 pub struct RemoteLearner {
     remote_gid: Gid,
-    remote_info: FnvHashMap<Pid, RemoteInfo>,
+    remote_info: HashMap<Pid, RemoteInfo>,
     remote_log_epoch: Epoch,
     remote_log: VecDeque<RemoteEntry>,
     next_idx: u64,
@@ -44,11 +39,7 @@ pub struct RemoteLearner {
 }
 
 impl RemoteLearner {
-    pub fn new<I: IntoIterator<Item = Pid>>(
-        remote_gid: Gid,
-        remote_pids: I,
-        next_idx: u64,
-    ) -> Self {
+    pub fn new<I: IntoIterator<Item = Pid>>(remote_gid: Gid, remote_pids: I, next_idx: u64) -> Self {
         RemoteLearner {
             remote_log_epoch: Epoch(0, Pid(0)),
             remote_gid,
@@ -70,6 +61,10 @@ impl RemoteLearner {
         }
     }
 
+    pub fn remote_gid(&self) -> Gid {
+        self.remote_gid
+    }
+
     /// Next expected log entry from the remote group.
     /// The learner follows the log from a specific epoch (see `update_log_epoch`).
     pub fn next_expected_log_entry(&self) -> (Epoch, u64) {
@@ -81,11 +76,11 @@ impl RemoteLearner {
 
     /// Append info about the next log entry.
     /// The learner expects to know about remote entries _in log order_, but only those entries destined to the local group.
-    pub fn append_log_entry(&mut self, gid: Gid, entry: RemoteEntry) -> Result<(), Error> {
+    pub fn append(&mut self, gid: Gid, entry: RemoteEntry) -> Result<(), Error> {
         assert_eq!(self.remote_gid, gid);
         // the entry must come from an epoch earlier than our current knowledge of that group's epoch.
         if entry.epoch > self.remote_log_epoch {
-            return Err(Error::EpochTooHigh { current: self.remote_log_epoch });
+            return Err(Error::OutOfOrderAppend);
         }
         // entry can't be older than our next expected delivery idx
         if entry.idx < self.next_idx {
@@ -93,10 +88,7 @@ impl RemoteLearner {
         }
         // ensure entry is more recent than our previous entry in the log
         if let Some(prev) = self.remote_log.back() {
-            if prev.epoch > entry.epoch ||
-                prev.idx >= entry.idx ||
-                prev.ts >= entry.ts
-            {
+            if prev.epoch > entry.epoch || prev.idx >= entry.idx || prev.ts >= entry.ts {
                 return Err(Error::OutOfOrderAppend);
             }
         }
@@ -105,13 +97,13 @@ impl RemoteLearner {
     }
 
     /// Update remote replica info, for tracking safe log entries.
-    pub fn add_remote_ack(&mut self, gid: Gid, pid: Pid, epoch: Epoch, log_len: u64) -> Result<(), Error> {
+    pub fn add_remote_ack(&mut self, gid: Gid, pid: Pid, log_epoch: Epoch, log_len: u64) -> Result<(), Error> {
         assert_eq!(self.remote_gid, gid);
         let mut info = self.remote_info.get_mut(&pid).expect("pid should be present");
-        if epoch > info.epoch {
-            info.epoch = epoch;
+        if log_epoch > info.epoch {
+            info.epoch = log_epoch;
             info.log_len = log_len;
-        } else if info.epoch == epoch && log_len > info.log_len {
+        } else if info.epoch == log_epoch && log_len > info.log_len {
             info.log_len = log_len;
         }
         Ok(())
@@ -121,7 +113,9 @@ impl RemoteLearner {
     /// If the remote changes epochs, the logs may not be compatible anymore, so we truncate it to quorum safe state.
     pub fn update_log_epoch(&mut self, e: Epoch) -> Result<(), Error> {
         if e < self.remote_log_epoch {
-            return Err(Error::EpochTooHigh { current: self.remote_log_epoch });
+            return Err(Error::EpochTooOld {
+                current: self.remote_log_epoch,
+            });
         }
         self.update(); // update the current safe idx before changing our epoch avoid truncating unnecessarily
         self.remote_log_epoch = e;
@@ -181,6 +175,14 @@ impl RemoteLearner {
         self.safe_idx = std::cmp::max(self.safe_idx, self.calculate_safe_idx_from_remote_info());
     }
 
+    pub(crate) fn safe_idx(&self) -> Option<u64> {
+        self.safe_idx
+    }
+
+    pub(crate) fn remote_info(&self) -> impl Iterator<Item=(Pid, Epoch, u64)> + '_ {
+        self.remote_info.iter().map(|(pid, info)| { (*pid, info.epoch, info.log_len) })
+    }
+
     /// Return the next learned timetamp, if any.
     /// `update` should be called once before making calls to this.
     pub fn next_delivery(&mut self) -> Option<(MsgId, GidSet, Clock)> {
@@ -189,29 +191,12 @@ impl RemoteLearner {
                 if entry.idx <= safe_idx {
                     self.next_idx = entry.idx + 1;
                     return Some((entry.msg_id, entry.dest, entry.ts));
+                } else {
+                    self.remote_log.push_front(entry);
                 }
             }
         }
         None
-    }
-
-    /// Deliver safe message timestamps, by calling the given function in delivery order
-    /// TODO: remove this delivery interface?
-    pub fn with_deliveries<F>(&mut self, mut f: F)
-    where
-        F: FnMut(MsgId, GidSet, Clock),
-    {
-        self.update();
-        if let Some(safe_idx) = self.safe_idx {
-            while let Some(entry) = self.remote_log.pop_front() {
-                if entry.idx > safe_idx {
-                    self.remote_log.push_front(entry);
-                    break;
-                }
-                self.next_idx = entry.idx + 1;
-                f(entry.msg_id, entry.dest, entry.ts);
-            }
-        }
     }
 }
 
@@ -229,52 +214,122 @@ mod tests {
 
         let dest = GidSet::from_iter([Gid(0), Gid(1)].into_iter());
 
-        r.append_log_entry(gid, RemoteEntry { idx: 2, epoch, msg_id: 2, ts: 2, dest: dest.clone() });
-        r.append_log_entry(gid, RemoteEntry { idx: 3, epoch, msg_id: 3, ts: 3, dest: dest.clone() });
-        r.append_log_entry(gid, RemoteEntry { idx: 5, epoch, msg_id: 5, ts: 5, dest: dest.clone() });
-        r.append_log_entry(gid, RemoteEntry { idx: 7, epoch, msg_id: 7, ts: 7, dest: dest.clone() });
+        assert!(r
+            .append(
+                gid,
+                RemoteEntry {
+                    idx: 2,
+                    epoch,
+                    msg_id: 2,
+                    ts: 2,
+                    dest: dest.clone(),
+                },
+            )
+            .is_ok());
+        assert!(r
+            .append(
+                gid,
+                RemoteEntry {
+                    idx: 3,
+                    epoch,
+                    msg_id: 3,
+                    ts: 3,
+                    dest: dest.clone(),
+                },
+            )
+            .is_ok());
+        assert!(r
+            .append(
+                gid,
+                RemoteEntry {
+                    idx: 5,
+                    epoch,
+                    msg_id: 5,
+                    ts: 5,
+                    dest: dest.clone(),
+                },
+            )
+            .is_ok());
+        assert!(r
+            .append(
+                gid,
+                RemoteEntry {
+                    idx: 7,
+                    epoch,
+                    msg_id: 7,
+                    ts: 7,
+                    dest: dest.clone(),
+                },
+            )
+            .is_ok());
 
         // quorum replicas ack for log length 3, thus log idx 2 should be safe
-        r.add_remote_ack(gid, Pid(1), Epoch::initial(), 3);
-        r.add_remote_ack(gid, Pid(2), Epoch::initial(), 3);
+        assert!(r.add_remote_ack(gid, Pid(1), Epoch::initial(), 3).is_ok());
+        assert!(r.add_remote_ack(gid, Pid(2), Epoch::initial(), 3).is_ok());
 
         // only log idx 2 can be delivered
         let mut d = vec![];
-        r.with_deliveries(|msg_id, dest, ts| {
-            d.push((msg_id, ts));
-        });
+        r.update();
+        while let Some((id, _, ts)) = r.next_delivery() {
+            d.push((id, ts));
+        }
         assert_eq!(d.len(), 1);
         assert_eq!(d[0], (2, 2));
 
         // quorum replicas ack for log length 4, thus log idx 3 should be safe
-        r.add_remote_ack(gid, Pid(1), Epoch::initial(), 4);
-        r.add_remote_ack(gid, Pid(2), Epoch::initial(), 4);
+        assert!(r.add_remote_ack(gid, Pid(1), Epoch::initial(), 4).is_ok());
+        assert!(r.add_remote_ack(gid, Pid(2), Epoch::initial(), 4).is_ok());
 
         // idx 3 should be deliverable
-        r.with_deliveries(|msg_id, dest, ts| {
-            d.push((msg_id, ts));
-        });
+        r.update();
+        while let Some((id, _, ts)) = r.next_delivery() {
+            d.push((id, ts));
+        }
+
         assert_eq!(d.len(), 2);
         assert_eq!(d[1], (3, 3));
 
         // move to a higher epoch, which truncates the log to what we know to be safe
         epoch = epoch.next_for(Pid(0));
-        r.update_log_epoch(epoch);
+        assert!(r.update_log_epoch(epoch).is_ok());
 
         // append some more entries
-        r.append_log_entry(gid, RemoteEntry { idx: 5, epoch, msg_id: 5, ts: 5, dest: dest.clone() });
-        r.append_log_entry(gid, RemoteEntry { idx: 6, epoch, msg_id: 6, ts: 6, dest: dest.clone() });
+        assert!(r
+            .append(
+                gid,
+                RemoteEntry {
+                    idx: 5,
+                    epoch,
+                    msg_id: 5,
+                    ts: 5,
+                    dest: dest.clone(),
+                },
+            )
+            .is_ok());
+        assert!(r
+            .append(
+                gid,
+                RemoteEntry {
+                    idx: 6,
+                    epoch,
+                    msg_id: 6,
+                    ts: 6,
+                    dest: dest.clone(),
+                },
+            )
+            .is_ok());
         // old epoch info should be ignored
-        r.add_remote_ack(gid, Pid(2), Epoch::initial(), 5);
-        r.add_remote_ack(gid, Pid(3), Epoch::initial(), 5);
+        assert!(r.add_remote_ack(gid, Pid(2), Epoch::initial(), 5).is_ok());
+        assert!(r.add_remote_ack(gid, Pid(3), Epoch::initial(), 5).is_ok());
 
-        r.add_remote_ack(gid, Pid(2), epoch, 7);
-        r.add_remote_ack(gid, Pid(3), epoch, 7);
+        assert!(r.add_remote_ack(gid, Pid(2), epoch, 7).is_ok());
+        assert!(r.add_remote_ack(gid, Pid(3), epoch, 7).is_ok());
 
         // idx 5 and 6 should be deliverable
-        r.with_deliveries(|msg_id, dest, clock| {
-            d.push((msg_id, clock));
-        });
+        r.update();
+        while let Some((id, _, ts)) = r.next_delivery() {
+            d.push((id, ts));
+        }
         assert_eq!(d.len(), 4);
         assert_eq!(d[2], (5, 5));
         assert_eq!(d[3], (6, 6));
