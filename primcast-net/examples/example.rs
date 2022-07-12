@@ -4,8 +4,8 @@ use primcast_core::config::Config;
 use primcast_core::types::*;
 use primcast_net::PrimcastReplica;
 
-use serde::{Serialize, Deserialize};
-use tokio::runtime;
+use serde::Deserialize;
+use serde::Serialize;
 
 use clap::Parser;
 
@@ -38,7 +38,10 @@ struct Payload {
 fn main() {
     let args = Args::parse();
 
-    let rt = runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     let cfg = Config::load(&args.cfg).unwrap();
 
@@ -70,7 +73,13 @@ fn main() {
                 if (Gid(args.gid), Pid(args.pid)) == payload.sender {
                     let now = Instant::now() - start;
                     let lat = now - payload.amcast_at;
-                    println!("DELIVERY - final_ts:{:?} dest:{:?} msg_id:{:?} after {}usec", ts, dest, id, lat.as_micros());
+                    println!(
+                        "DELIVERY - final_ts:{:?} dest:{:?} msg_id:{:?} after {}usec",
+                        ts,
+                        dest,
+                        id,
+                        lat.as_micros()
+                    );
                 } else {
                     println!("DELIVERY - final_ts:{:?} dest:{:?} msg_id:{:?}", ts, dest, id);
                 }

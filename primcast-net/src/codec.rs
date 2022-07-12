@@ -1,4 +1,3 @@
-use bincode;
 use bytes::Buf;
 use bytes::BufMut;
 use bytes::BytesMut;
@@ -68,7 +67,8 @@ impl<M: Serialize> codec::Encoder<M> for BincodeCodec<M> {
         buf.reserve(HDR_SIZE + size);
         buf.put_u32(size as u32);
         let mut w = buf.writer();
-        Ok(bincode::serialize_into(&mut w, &m).expect("serialization error"))
+        bincode::serialize_into(&mut w, &m).expect("serialization error");
+        Ok(())
     }
 }
 

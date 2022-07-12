@@ -189,7 +189,7 @@ impl PrimcastReplica {
             ack_tx,
             ack_rx,
             ev_tx,
-            proposal_tx: proposal_tx.clone(),
+            proposal_tx: proposal_tx,
             shutdown,
         };
 
@@ -337,7 +337,7 @@ impl PrimcastReplica {
                     },
                     Some(ev) = self.ev_rx.recv() => {
                         match ev {
-                            Event::PeriodicChecks(now) => {
+                            Event::PeriodicChecks(_now) => {
                                 // TODO: leadership check
                             }
                             Event::Follow(conn, epoch) => {
@@ -409,7 +409,7 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
         }
     }
 
-    let (high_pid, high_log_epoch, high_log_len, high_clock) = promise_result.unwrap();
+    let (high_pid, _high_log_epoch, _high_log_len, _high_clock) = promise_result.unwrap();
 
     // sync with highest follower
     // TODO: retry?
@@ -540,7 +540,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
             res = &mut send_acks_task => return res,
             _ = &mut fetch_ack_tasks.next() => return Ok(()),
             // this default branch is only enabled when at least 1 msg is buffered
-            _default = future::ready(()), if msgs.len() > 0 => {}
+            _default = future::ready(()), if !msgs.is_empty() => {}
         }
 
         assert!(msgs.len() <= BATCH_SIZE_YIELD);
@@ -710,7 +710,10 @@ async fn get_promise(
     }
 }
 
-async fn deliver_task(mut delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet)>, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
+async fn deliver_task(
+    delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet)>,
+    s: Arc<RwLock<Shared>>,
+) -> Result<(), Error> {
     let mut update_rx = s.read().await.update_rx.clone();
     let mut deliveries = vec![];
     loop {
@@ -727,7 +730,7 @@ async fn deliver_task(mut delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet
     }
 }
 
-async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Result<(), Error> {
+async fn sync_with(_peer: &PeerConfig, _e: Epoch, _s: &Arc<RwLock<Shared>>) -> Result<(), Error> {
     unimplemented!()
 }
 

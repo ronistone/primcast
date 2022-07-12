@@ -75,11 +75,10 @@ impl Conn {
     }
 
     pub async fn recv(&mut self) -> Result<Message, std::io::Error> {
-        Ok(self
-            .rx
+        self.rx
             .next()
             .await
-            .unwrap_or(Err(std::io::ErrorKind::ConnectionReset.into()))?)
+            .unwrap_or(Err(std::io::ErrorKind::ConnectionReset.into()))
     }
 
     pub fn split(self) -> (ConnWrite, ConnRead) {
@@ -150,11 +149,10 @@ impl ConnRead {
     }
 
     pub async fn recv(&mut self) -> Result<Message, std::io::Error> {
-        Ok(self
-            .rx
+        self.rx
             .next()
             .await
-            .unwrap_or(Err(std::io::ErrorKind::ConnectionReset.into()))?)
+            .unwrap_or(Err(std::io::ErrorKind::ConnectionReset.into()))
     }
 
     pub fn unsplit(self, write_half: ConnWrite) -> Conn {
