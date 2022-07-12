@@ -4,6 +4,8 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
+use bytes::Bytes;
+
 use futures::future;
 use futures::stream::FuturesUnordered;
 use futures::Future;
@@ -33,6 +35,7 @@ use conn::Conn;
 
 const RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const PROPOSAL_QUEUE: usize = 1000;
+const DELIVERY_QUEUE: usize = 1000;
 const BATCH_SIZE_YIELD: usize = 10;
 
 pub struct ShutdownHandle(oneshot::Sender<()>);
@@ -114,7 +117,7 @@ pub struct PrimcastReplica {
     cfg: config::Config,
     shared: Arc<RwLock<Shared>>,
     ev_rx: mpsc::UnboundedReceiver<Event>,
-    proposal_rx: mpsc::Receiver<(MsgId, Vec<u8>, GidSet)>,
+    proposal_rx: mpsc::Receiver<(MsgId, Bytes, GidSet)>,
 }
 
 pub struct Shared {
@@ -124,7 +127,7 @@ pub struct Shared {
     ack_tx: watch::Sender<(Epoch, u64, Clock)>,
     ack_rx: watch::Receiver<(Epoch, u64, Clock)>,
     ev_tx: mpsc::UnboundedSender<Event>,
-    proposal_tx: mpsc::Sender<(MsgId, Vec<u8>, GidSet)>,
+    proposal_tx: mpsc::Sender<(MsgId, Bytes, GidSet)>,
     shutdown: Shutdown,
 }
 
@@ -135,11 +138,12 @@ enum Event {
 
 pub struct PrimcastHandle {
     _shutdown: ShutdownHandle,
-    gid_proposal_tx: FxHashMap<Gid, mpsc::Sender<(MsgId, Vec<u8>, GidSet)>>,
+    gid_proposal_tx: FxHashMap<Gid, mpsc::Sender<(MsgId, Bytes, GidSet)>>,
+    delivery_rx: Option<mpsc::Receiver<(Clock, MsgId, Bytes, GidSet)>>,
 }
 
 impl PrimcastHandle {
-    pub async fn propose(&mut self, msg_id: MsgId, msg: Vec<u8>, dest: GidSet) -> Result<(), Error> {
+    pub async fn propose(&mut self, msg_id: MsgId, msg: Bytes, dest: GidSet) -> Result<(), Error> {
         for gid in dest.iter() {
             self.gid_proposal_tx
                 .get_mut(gid)
@@ -148,6 +152,18 @@ impl PrimcastHandle {
                 .await?;
         }
         Ok(())
+    }
+
+    pub fn take_delivery_rx(&mut self) -> Option<mpsc::Receiver<(Clock, MsgId, Bytes, GidSet)>> {
+        self.delivery_rx.take()
+    }
+
+    pub async fn deliver(&mut self) -> Option<(Clock, MsgId, Bytes, GidSet)> {
+        if let Some(ref mut rx) = self.delivery_rx {
+            rx.recv().await
+        } else {
+            None
+        }
     }
 
     pub async fn shutdown(self) {}
@@ -163,6 +179,7 @@ impl PrimcastReplica {
         let (update_tx, update_rx) = watch::channel(());
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_QUEUE);
+        let (delivery_tx, delivery_rx) = mpsc::channel(DELIVERY_QUEUE);
         let (shutdown, shutdown_handle) = Shutdown::new();
 
         let shared = Shared {
@@ -193,14 +210,15 @@ impl PrimcastReplica {
             remote_proposal_tx.insert(g.gid, tx);
         }
 
-        tokio::spawn(s.run());
+        tokio::spawn(s.run(delivery_tx));
         PrimcastHandle {
             _shutdown: shutdown_handle,
+            delivery_rx: Some(delivery_rx),
             gid_proposal_tx: remote_proposal_tx,
         }
     }
 
-    async fn run(mut self) -> Result<(), Error> {
+    async fn run(mut self, delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet)>) -> Result<(), Error> {
         println!("starting replica {:?}:{:?}", self.gid, self.pid);
 
         // start acceptor task
@@ -213,7 +231,7 @@ impl PrimcastReplica {
         tokio::spawn(with_shutdown(shutdown.clone(), acceptor_task(listener, self.shared.clone())));
 
         // start delivery task
-        tokio::spawn(with_shutdown(shutdown.clone(), deliver_task(self.shared.clone())));
+        tokio::spawn(with_shutdown(shutdown.clone(), deliver_task(delivery_tx, self.shared.clone())));
 
         // {
         //     // debug printing
@@ -692,14 +710,19 @@ async fn get_promise(
     }
 }
 
-async fn deliver_task(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
+async fn deliver_task(mut delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet)>, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     let mut update_rx = s.read().await.update_rx.clone();
+    let mut deliveries = vec![];
     loop {
         update_rx.changed().await?;
         let mut s = s.write().await;
         s.core.update();
         while let Some(d) = s.core.next_delivery() {
-            println!("DELIVERY - final_ts:{:?} dest:{:?} msg_id:{:?}", d.final_ts.unwrap(), &d.dest, d.msg_id);
+            deliveries.push(d);
+        }
+        drop(s); // must not await with Shared locked
+        for d in deliveries.drain(..) {
+            delivery_tx.send((d.final_ts.unwrap(), d.msg_id, d.msg, d.dest)).await?;
         }
     }
 }
@@ -1027,7 +1050,7 @@ async fn proposal_sender(
     from: (Gid, Pid),
     to_gid: Gid,
     cfg: config::Config,
-    mut rx: mpsc::Receiver<(MsgId, Vec<u8>, GidSet)>,
+    mut rx: mpsc::Receiver<(MsgId, Bytes, GidSet)>,
 ) -> Result<(), Error> {
     let peers = cfg.peers(to_gid).unwrap();
     'connect: loop {

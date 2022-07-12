@@ -3,6 +3,8 @@ pub mod config;
 pub mod remote_learner;
 pub mod types;
 
+use bytes::Bytes;
+
 use crate::clock::LogicalClock;
 use crate::config::Config;
 use crate::types::*;
@@ -39,7 +41,7 @@ pub enum ReplicaState {
 pub struct LogEntry {
     pub ts: Clock,
     pub msg_id: MsgId,
-    pub msg: Vec<u8>,
+    pub msg: Bytes,
     pub dest: GidSet,
     pub final_ts: Option<Clock>,
 }
@@ -440,7 +442,7 @@ impl GroupReplica {
     }
 
     /// Add a client proposal to be proposed when primary.
-    pub fn add_proposal<I>(&mut self, msg_id: MsgId, msg: Vec<u8>, dest: I) -> Result<(), Error>
+    pub fn add_proposal<I>(&mut self, msg_id: MsgId, msg: Bytes, dest: I) -> Result<(), Error>
     where
         I: IntoIterator<Item = Gid>,
     {
@@ -747,7 +749,7 @@ impl GroupReplica {
     }
 
     /// Returns the next delivery (if any) in final timestamp order
-    pub fn next_delivery(&mut self) -> Option<&LogEntry> {
+    pub fn next_delivery(&mut self) -> Option<LogEntry> {
         let (ts, id) = self.pending_ts.iter().cloned().next()?;
         use std::collections::hash_map::Entry;
         if let Entry::Occupied(mut e) = self.pending.entry(id) {
@@ -757,7 +759,7 @@ impl GroupReplica {
                 e.remove();
                 let log_entry = self.log_entry_mut(self.msgid_to_idx[&id]).unwrap();
                 log_entry.final_ts = Some(ts);
-                return Some(log_entry);
+                return Some(log_entry.clone());
             }
         }
         None

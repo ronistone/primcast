@@ -1,6 +1,8 @@
 use primcast_core::types::*;
 use primcast_core::LogEntry;
 use primcast_core::RemoteEntry;
+
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14,7 +16,7 @@ pub enum Message {
     ProposalStart,
     Proposal {
         msg_id: MsgId,
-        msg: Vec<u8>,
+        msg: Bytes,
         dest: GidSet,
     },
 
