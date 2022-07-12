@@ -76,7 +76,7 @@ impl Config {
 
     pub fn new_for_test() -> Self {
         let mut groups = vec![];
-        let mut ip = 1;
+        let mut port = 0;
         for g in 0..2 {
             // 2 groups
             let mut peers = vec![];
@@ -84,10 +84,10 @@ impl Config {
                 // 3 peers per group
                 peers.push(PeerConfig {
                     pid: Pid(p),
-                    ip: format!("127.0.0.{}", ip).parse().unwrap(),
-                    port: 10000,
+                    ip: "127.0.0.1".parse().unwrap(),
+                    port: 10000 + port,
                 });
-                ip += 1;
+                port += 1;
             }
             groups.push(GroupConfig {
                 gid: Gid(g),
