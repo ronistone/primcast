@@ -1,15 +1,15 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
-use std::sync::Arc;
 use std::time::Instant;
 
+use futures::future;
+use futures::stream::FuturesUnordered;
 use futures::Future;
 use futures::FutureExt;
 use futures::SinkExt;
 use futures::StreamExt;
-use futures::future;
-use futures::stream::FuturesUnordered;
 
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -17,24 +17,23 @@ use tokio::sync::watch;
 use tokio::sync::RwLock;
 
 use messages::Message;
+use primcast_core::config;
 use primcast_core::config::PeerConfig;
 use primcast_core::types::*;
-use primcast_core::config;
 use primcast_core::GroupReplica;
 use primcast_core::ReplicaState;
 
 use rustc_hash::FxHashMap;
 
 mod codec;
-mod messages;
 mod conn;
+mod messages;
 
 use conn::Conn;
 
 const RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const PROPOSAL_QUEUE: usize = 1000;
 const BATCH_SIZE_YIELD: usize = 10;
-
 
 pub struct ShutdownHandle(oneshot::Sender<()>);
 #[derive(Clone)]
@@ -50,7 +49,7 @@ impl Future for Shutdown {
 
 impl Shutdown {
     pub fn new() -> (Self, ShutdownHandle) {
-        let (tx,rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         (Shutdown(rx.shared()), ShutdownHandle(tx))
     }
 }
@@ -140,10 +139,13 @@ pub struct PrimcastHandle {
 }
 
 impl PrimcastHandle {
-    pub async fn propose(&mut self, msg_id: MsgId, msg: Vec<u8>, dest: GidSet) -> Result<(), Error>
-    {
+    pub async fn propose(&mut self, msg_id: MsgId, msg: Vec<u8>, dest: GidSet) -> Result<(), Error> {
         for gid in dest.iter() {
-            self.gid_proposal_tx.get_mut(gid).unwrap().send((msg_id, msg.clone(), dest.clone())).await?;
+            self.gid_proposal_tx
+                .get_mut(gid)
+                .unwrap()
+                .send((msg_id, msg.clone(), dest.clone()))
+                .await?;
         }
         Ok(())
     }
@@ -187,7 +189,7 @@ impl PrimcastReplica {
         let mut remote_proposal_tx = FxHashMap::default();
         for g in s.cfg.groups.iter() {
             let (tx, rx) = mpsc::channel(PROPOSAL_QUEUE);
-            tokio::spawn(proposal_sender((gid,pid), g.gid, cfg.clone(), rx));
+            tokio::spawn(proposal_sender((gid, pid), g.gid, cfg.clone(), rx));
             remote_proposal_tx.insert(g.gid, tx);
         }
 
@@ -227,7 +229,9 @@ impl PrimcastReplica {
         // request remote log/acks
         for g in &self.cfg.groups {
             let gid = g.gid;
-            if gid == self.gid { continue; }
+            if gid == self.gid {
+                continue;
+            }
             for p in g.peers.iter().cloned() {
                 let pid = p.pid;
                 if p.pid == self.pid {
@@ -255,7 +259,7 @@ impl PrimcastReplica {
         }
 
         let (e, mut state) = self.shared.read().await.core.state();
-        let mut fut: Pin<Box<dyn Future<Output=Result<(), Error>> + Send>>;
+        let mut fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
 
         match state {
             ReplicaState::Promised | ReplicaState::Follower => {
@@ -382,7 +386,7 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
             }
             Err(higher_epoch) => {
                 s.core.new_epoch_proposal(higher_epoch).unwrap();
-                return Ok(())
+                return Ok(());
             }
         }
     }
@@ -455,7 +459,13 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
             loop {
                 ack_rx.changed().await?;
                 let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
-                conn_tx.send(Message::Ack { log_epoch, log_len, clock }).await?;
+                conn_tx
+                    .send(Message::Ack {
+                        log_epoch,
+                        log_len,
+                        clock,
+                    })
+                    .await?;
             }
         }
     };
@@ -548,7 +558,6 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     Err(err.into())
 }
 
-
 /// Accept connections and spawn handler tasks
 async fn acceptor_task(listener: tokio::net::TcpListener, s: Arc<RwLock<Shared>>) {
     let gid;
@@ -569,7 +578,11 @@ async fn acceptor_task(listener: tokio::net::TcpListener, s: Arc<RwLock<Shared>>
 }
 
 /// Wait for the first request msg to properly handle the connection
-async fn handle_connection(self_id: (Gid, Pid), sock: tokio::net::TcpStream, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
+async fn handle_connection(
+    self_id: (Gid, Pid),
+    sock: tokio::net::TcpStream,
+    s: Arc<RwLock<Shared>>,
+) -> Result<(), Error> {
     let mut conn = Conn::incoming(self_id, sock).await?;
     let shutdown = s.read().await.shutdown.clone();
     match conn.recv().await? {
@@ -579,14 +592,23 @@ async fn handle_connection(self_id: (Gid, Pid), sock: tokio::net::TcpStream, s: 
         Message::RemoteAckRequest => {
             tokio::spawn(with_shutdown(shutdown.clone(), ack_send(conn, s.clone())));
         }
-        Message::RemoteLogRequest { dest, log_epoch, next_idx } => {
+        Message::RemoteLogRequest {
+            dest,
+            log_epoch,
+            next_idx,
+        } => {
             tokio::spawn(with_shutdown(shutdown.clone(), remote_log_send(conn, dest, log_epoch, next_idx, s.clone())));
         }
         Message::NewEpoch { epoch } => {
             let res = s.write().await.core.new_epoch_proposal(epoch);
             match res {
                 Ok((log_epoch, log_len, clock)) => {
-                    conn.send(Message::Promise { log_epoch, log_len, clock }).await?;
+                    conn.send(Message::Promise {
+                        log_epoch,
+                        log_len,
+                        clock,
+                    })
+                    .await?;
                 }
                 Err(primcast_core::Error::EpochTooOld { promised, .. }) => {
                     conn.send(Message::NewEpoch { epoch: promised }).await?;
@@ -596,12 +618,14 @@ async fn handle_connection(self_id: (Gid, Pid), sock: tokio::net::TcpStream, s: 
             // TODO: interrupt main loop?
         }
         Message::StartEpochCheck { epoch, log_epochs } => {
-            let res =  s.write().await.core.start_epoch_check(epoch, log_epochs);
+            let res = s.write().await.core.start_epoch_check(epoch, log_epochs);
             match res {
                 Ok((log_epoch, log_len)) => {
                     conn.send(Message::Following { log_epoch, log_len }).await?;
                     let ev_tx = s.read().await.ev_tx.clone();
-                    ev_tx.send(Event::Follow(conn, epoch)).map_err(|_| Error::ReplicaShutdown)?;
+                    ev_tx
+                        .send(Event::Follow(conn, epoch))
+                        .map_err(|_| Error::ReplicaShutdown)?;
                 }
                 Err(primcast_core::Error::EpochTooOld { promised, .. }) => {
                     conn.send(Message::NewEpoch { epoch: promised }).await?;
@@ -642,7 +666,11 @@ async fn handle_connection(self_id: (Gid, Pid), sock: tokio::net::TcpStream, s: 
     Ok(())
 }
 
-async fn get_promise(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<Result<(Pid, Epoch, u64, Clock), Epoch>, Error> {
+async fn get_promise(
+    peer: PeerConfig,
+    e: Epoch,
+    s: Arc<RwLock<Shared>>,
+) -> Result<Result<(Pid, Epoch, u64, Clock), Epoch>, Error> {
     use Message::*;
     let self_gid;
     let self_pid;
@@ -654,12 +682,12 @@ async fn get_promise(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Resu
     let req = NewEpoch { epoch: e };
     let mut conn = Conn::request((self_gid, self_pid), (self_gid, peer.pid), peer.addr(), req).await?;
     match conn.recv().await? {
-        NewEpoch { epoch } => {
-            Ok(Err(epoch))
-        },
-        Promise { log_epoch, log_len, clock } => {
-            Ok(Ok((conn.pid(), log_epoch, log_len, clock)))
-        }
+        NewEpoch { epoch } => Ok(Err(epoch)),
+        Promise {
+            log_epoch,
+            log_len,
+            clock,
+        } => Ok(Ok((conn.pid(), log_epoch, log_len, clock))),
         m => panic!("unexpected msg {:?}", m),
     }
 }
@@ -706,7 +734,10 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             }
             log_epochs = s.core.log_epochs().clone();
         }
-        let req = StartEpochCheck { epoch: promised_epoch, log_epochs };
+        let req = StartEpochCheck {
+            epoch: promised_epoch,
+            log_epochs,
+        };
         Conn::request((self_gid, self_pid), (self_gid, peer.pid), peer.addr(), req).await?
     };
 
@@ -736,16 +767,24 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             let (log_epoch, log_len) = s.core.log_status();
             if promised_epoch != e || log_epoch != sync_log_epoch {
                 // replica changed epochs, stop task
-                return Ok(())
+                return Ok(());
             }
             while follower_log_len < log_len {
                 let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
                 if follower_log_epoch < epoch && epoch == e {
                     // follower synced up to e
                     let clock = s.core.clock();
-                    to_send.push(StartEpochAccept { epoch, prev_entry: (follower_log_epoch, follower_log_len), clock });
+                    to_send.push(StartEpochAccept {
+                        epoch,
+                        prev_entry: (follower_log_epoch, follower_log_len),
+                        clock,
+                    });
                 }
-                to_send.push(LogAppend { idx: follower_log_len, entry_epoch: epoch, entry: entry.clone() });
+                to_send.push(LogAppend {
+                    idx: follower_log_len,
+                    entry_epoch: epoch,
+                    entry: entry.clone(),
+                });
                 follower_log_epoch = epoch;
                 follower_log_len += 1;
                 if to_send.len() >= BATCH_SIZE_YIELD {
@@ -810,7 +849,11 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
         (epoch, next_idx) = s.core.remote_expected_entry(remote_gid);
     }
     use Message::*;
-    let req = RemoteLogRequest { dest: gid, log_epoch: epoch, next_idx };
+    let req = RemoteLogRequest {
+        dest: gid,
+        log_epoch: epoch,
+        next_idx,
+    };
     let mut conn = Conn::request((gid, pid), (remote_gid, remote_peer.pid), remote_peer.addr(), req).await?;
 
     let mut count = 0;
@@ -821,9 +864,11 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
                 s.write().await.core.remote_update_log_epoch(remote_gid, log_epoch)?;
                 return Ok(());
             }
-            RemoteLogAppend(entry) => { // batch?
+            RemoteLogAppend(entry) => {
+                // batch?
                 let mut s = s.write().await;
-                s.core.remote_add_ack(remote_gid, remote_peer.pid, epoch, entry.idx, entry.ts)?;
+                s.core
+                    .remote_add_ack(remote_gid, remote_peer.pid, epoch, entry.idx, entry.ts)?;
                 s.core.remote_append(remote_gid, entry)?;
                 s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
                 s.update_tx.send(())?;
@@ -851,7 +896,11 @@ async fn ack_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error
     let mut count = 0;
     loop {
         match conn.recv().await? {
-            Ack { log_epoch, log_len, clock } => {
+            Ack {
+                log_epoch,
+                log_len,
+                clock,
+            } => {
                 let mut s = s.write().await;
                 s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
                 s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
@@ -880,9 +929,14 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
     let mut count = 0;
     loop {
         match conn.recv().await? {
-            Ack { log_epoch, log_len, clock } => {
+            Ack {
+                log_epoch,
+                log_len,
+                clock,
+            } => {
                 let mut s = s.write().await;
-                s.core.remote_add_ack(conn.gid(), conn.pid(), log_epoch, log_len, clock)?;
+                s.core
+                    .remote_add_ack(conn.gid(), conn.pid(), log_epoch, log_len, clock)?;
                 s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
                 s.update_tx.send(())?;
             }
@@ -906,12 +960,23 @@ async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     use Message::*;
     loop {
         let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
-        conn.send(Ack { log_epoch, log_len, clock }).await?;
+        conn.send(Ack {
+            log_epoch,
+            log_len,
+            clock,
+        })
+        .await?;
         ack_rx.changed().await?;
     }
 }
 
-async fn remote_log_send(mut conn: Conn, dest: Gid, epoch: Epoch, mut next_idx: u64, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
+async fn remote_log_send(
+    mut conn: Conn,
+    dest: Gid,
+    epoch: Epoch,
+    mut next_idx: u64,
+    s: Arc<RwLock<Shared>>,
+) -> Result<(), Error> {
     println!("sending remote logs for {:?} starting at {:?}", dest, next_idx);
     let mut ack_rx = s.read().await.ack_rx.clone();
 
@@ -922,7 +987,7 @@ async fn remote_log_send(mut conn: Conn, dest: Gid, epoch: Epoch, mut next_idx: 
         let (log_epoch, log_len, _) = *ack_rx.borrow_and_update();
         if log_epoch != epoch {
             conn.send(RemoteLogEpoch { log_epoch }).await?;
-            return Ok(())
+            return Ok(());
         }
         if log_len <= next_idx {
             ack_rx.changed().await?;
@@ -936,7 +1001,7 @@ async fn remote_log_send(mut conn: Conn, dest: Gid, epoch: Epoch, mut next_idx: 
             if log_epoch != epoch {
                 drop(sr); // release lock before sending msg
                 conn.send(RemoteLogEpoch { log_epoch }).await?;
-                return Ok(())
+                return Ok(());
             }
 
             while next_idx < log_len && to_send.len() < BATCH_SIZE_YIELD {
@@ -958,7 +1023,12 @@ async fn remote_log_send(mut conn: Conn, dest: Gid, epoch: Epoch, mut next_idx: 
     }
 }
 
-async fn proposal_sender(from: (Gid, Pid), to_gid: Gid, cfg: config::Config, mut rx: mpsc::Receiver<(MsgId, Vec<u8>, GidSet)>) -> Result<(), Error> {
+async fn proposal_sender(
+    from: (Gid, Pid),
+    to_gid: Gid,
+    cfg: config::Config,
+    mut rx: mpsc::Receiver<(MsgId, Vec<u8>, GidSet)>,
+) -> Result<(), Error> {
     let peers = cfg.peers(to_gid).unwrap();
     'connect: loop {
         // connect to everyone and see who is the leader
@@ -966,8 +1036,7 @@ async fn proposal_sender(from: (Gid, Pid), to_gid: Gid, cfg: config::Config, mut
         let mut connect_futs = FuturesUnordered::new();
         for p in peers {
             let opid = p.pid;
-            let fut = connect_to_leader(from, (to_gid, opid), p.clone())
-                .map(move |res| (opid, res));
+            let fut = connect_to_leader(from, (to_gid, opid), p.clone()).map(move |res| (opid, res));
             connect_futs.push(fut);
         }
         let mut conn = loop {
@@ -975,7 +1044,7 @@ async fn proposal_sender(from: (Gid, Pid), to_gid: Gid, cfg: config::Config, mut
                 Some((opid, Ok(conn))) => {
                     println!("connected to leader {:?}:{:?}", to_gid, opid);
                     break conn;
-                },
+                }
                 Some((_opid, Err(Error::NotLeader(_epoch)))) => {
                     continue;
                 }

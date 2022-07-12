@@ -54,7 +54,10 @@ fn main() {
             // tokio::time::sleep(Duration::from_millis(1)).await;
             let id: MsgId = rng.gen();
             let dest = *[&dest0_1, &dest0, &dest1].choose(&mut rng).unwrap();
-            handle.propose(id, bincode::serialize(&id).unwrap(), dest.clone()).await.unwrap();
+            handle
+                .propose(id, bincode::serialize(&id).unwrap(), dest.clone())
+                .await
+                .unwrap();
             tokio::task::yield_now().await;
         }
     });

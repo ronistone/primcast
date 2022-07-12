@@ -37,7 +37,6 @@ pub enum ReplicaState {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LogEntry {
-
     pub ts: Clock,
     pub msg_id: MsgId,
     pub msg: Vec<u8>,
@@ -157,7 +156,9 @@ impl GroupReplica {
             .groups
             .iter()
             .filter_map(|g| {
-                if g.gid == gid { return None; }
+                if g.gid == gid {
+                    return None;
+                }
                 let pids = g.peers.iter().map(|p| p.pid);
                 Some((g.gid, RemoteLearner::new(g.gid, pids, 0)))
             })
@@ -228,20 +229,19 @@ impl GroupReplica {
             let e = &self.log[idx];
             let pending = self.pending.get(id).unwrap();
             println!("next pending details:");
-            println!("   id:{} log_idx:{} ts:{} final_ts:{:?} missing:{:?}",
-                     id,
-                     idx,
-                     e.ts,
-                     e.final_ts,
-                     pending.missing_group_ts);
+            println!(
+                "   id:{} log_idx:{} ts:{} final_ts:{:?} missing:{:?}",
+                id, idx, e.ts, e.final_ts, pending.missing_group_ts
+            );
         }
         println!("remote learners:");
         for (gid, l) in &self.remote_learners {
-            println!("    {:?} - safe_idx:{:?} next_entry:{:?} acks:{:?}",
-                     gid,
-                     l.safe_idx(),
-                     l.next_expected_log_entry(),
-                     Vec::from_iter(l.remote_info()),
+            println!(
+                "    {:?} - safe_idx:{:?} next_entry:{:?} acks:{:?}",
+                gid,
+                l.safe_idx(),
+                l.next_expected_log_entry(),
+                Vec::from_iter(l.remote_info()),
             );
         }
         println!("=================");
@@ -275,7 +275,8 @@ impl GroupReplica {
         self.accepts.clear();
         // add self promise
         let (current_epoch, log_len) = self.log_status();
-        self.add_promise(epoch, self.pid, self.clock.local(), current_epoch, log_len).unwrap();
+        self.add_promise(epoch, self.pid, self.clock.local(), current_epoch, log_len)
+            .unwrap();
         Ok(epoch)
     }
 
@@ -351,7 +352,8 @@ impl GroupReplica {
             let mut idx = 0;
             let mut prefix_len = 0;
             for (our, leader) in self.log_epochs.iter().zip(log_epochs.iter()) {
-                if our.0 == leader.0 { // same epoch
+                if our.0 == leader.0 {
+                    // same epoch
                     idx += 1;
                     prefix_len = std::cmp::min(our.1, leader.1);
                 } else {
@@ -479,8 +481,7 @@ impl GroupReplica {
             let (log_epoch, log_len) = self.log_status();
             let ts = self.clock.tick();
             log_entry.ts = ts;
-            self.append_inner(log_len, log_epoch, log_entry)
-                .unwrap();
+            self.append_inner(log_len, log_epoch, log_entry).unwrap();
         }
         Ok(appended)
     }
@@ -491,7 +492,8 @@ impl GroupReplica {
         // derive entry epoch from the log_epochs array
         let mut epoch = None;
         let mut total_len = 0;
-        for &(e, len) in &self.log_epochs { // TODO: store Epoch in LogEntry instead?
+        for &(e, len) in &self.log_epochs {
+            // TODO: store Epoch in LogEntry instead?
             total_len += len;
             if total_len > idx {
                 epoch = Some(e);
@@ -541,9 +543,7 @@ impl GroupReplica {
         assert_eq!(log_len, self.log.len() as u64);
 
         if log_len != idx {
-            return Err(Error::InvalidIndex {
-                len: log_len,
-            });
+            return Err(Error::InvalidIndex { len: log_len });
         }
 
         // add msg_id mapping
@@ -682,7 +682,7 @@ impl GroupReplica {
         self.current_epoch_acks.sort(); // sort by acked log len
         let safe_len_from_acks = self.current_epoch_acks[self.group_size - self.quorum_size].0;
         let safe_len = std::cmp::min(std::cmp::max(self.safe_len, safe_len_from_acks), self.log.len() as u64);
-        for entry in &mut self.log[self.safe_len as usize .. safe_len as usize] {
+        for entry in &mut self.log[self.safe_len as usize..safe_len as usize] {
             let p = self.pending.get_mut(&entry.msg_id).unwrap();
             assert_eq!(p.id, entry.msg_id);
             assert!(p.missing_group_ts.remove(self.gid));
@@ -726,13 +726,16 @@ impl GroupReplica {
 
     /// Returns the list of messages with some decided remote timestamp but not proposed locally yet.
     pub fn missing_local_ts(&mut self) -> Vec<(MsgId, GidSet)> {
-        self.pending.iter().filter_map(|(msg_id, p)| {
-            if self.msgid_to_idx.contains_key(msg_id) {
-                Some((*msg_id, p.dest.clone()))
-            } else {
-                None
-            }
-        }).collect()
+        self.pending
+            .iter()
+            .filter_map(|(msg_id, p)| {
+                if self.msgid_to_idx.contains_key(msg_id) {
+                    Some((*msg_id, p.dest.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn min_clock_leader(&self) -> Clock {
@@ -806,28 +809,16 @@ mod tests {
 
         // append to followers
         let (epoch, entry) = r0.log_entry(0).unwrap();
-        assert!(r1
-            .append(epoch, 0, entry.clone())
-            .is_ok());
-        assert!(r2
-                .append(epoch, 0, entry.clone())
-            .is_ok());
+        assert!(r1.append(epoch, 0, entry.clone()).is_ok());
+        assert!(r2.append(epoch, 0, entry.clone()).is_ok());
         let (epoch, entry) = r0.log_entry(1).unwrap();
-        assert!(r1
-                .append(epoch, 1, entry.clone())
-            .is_ok());
-        assert!(r2
-                .append(epoch, 1, entry.clone())
-            .is_ok());
+        assert!(r1.append(epoch, 1, entry.clone()).is_ok());
+        assert!(r2.append(epoch, 1, entry.clone()).is_ok());
 
         // invalid append (wrong idx)
         let (epoch, entry) = r0.log_entry(0).unwrap();
-        assert!(r1
-            .append(epoch, 0, entry.clone())
-            .is_err());
-        assert!(r1
-            .append(epoch, 4, entry.clone())
-            .is_err());
+        assert!(r1.append(epoch, 0, entry.clone()).is_err());
+        assert!(r1.append(epoch, 4, entry.clone()).is_err());
 
         // ack info from followers
         assert!(r0
@@ -872,13 +863,9 @@ mod tests {
 
         // append from primary to followers
         let (epoch, entry) = r0_0.log_entry(0).unwrap();
-        assert!(r0_1
-                .append(epoch, 0, entry.clone())
-            .is_ok());
+        assert!(r0_1.append(epoch, 0, entry.clone()).is_ok());
         let (epoch, entry) = r1_0.log_entry(0).unwrap();
-        assert!(r1_1
-            .append(epoch, 0, entry.clone())
-            .is_ok());
+        assert!(r1_1.append(epoch, 0, entry.clone()).is_ok());
 
         // append/ack from primaries to remote groups ("matchings Pid's" in each
         // group follow each other, only acks from other remotes)

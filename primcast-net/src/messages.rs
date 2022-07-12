@@ -3,29 +3,65 @@ use primcast_core::LogEntry;
 use primcast_core::RemoteEntry;
 use serde::{Deserialize, Serialize};
 
-
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
     /// first message sent from each side upon connection
-    Handshake { gid: Gid, pid: Pid },
+    Handshake {
+        gid: Gid,
+        pid: Pid,
+    },
 
     ProposalStart,
-    Proposal { msg_id: MsgId, msg: Vec<u8>, dest: GidSet },
+    Proposal {
+        msg_id: MsgId,
+        msg: Vec<u8>,
+        dest: GidSet,
+    },
 
-    NewEpoch { epoch: Epoch },
-    Promise { log_epoch: Epoch, log_len: u64, clock: Clock },
-    StartEpochCheck { epoch: Epoch, log_epochs: Vec<(Epoch, u64)> },
-    Following { log_epoch: Epoch, log_len: u64 },
-    StartEpochAccept { epoch: Epoch, prev_entry: (Epoch, u64), clock: Clock },
+    NewEpoch {
+        epoch: Epoch,
+    },
+    Promise {
+        log_epoch: Epoch,
+        log_len: u64,
+        clock: Clock,
+    },
+    StartEpochCheck {
+        epoch: Epoch,
+        log_epochs: Vec<(Epoch, u64)>,
+    },
+    Following {
+        log_epoch: Epoch,
+        log_len: u64,
+    },
+    StartEpochAccept {
+        epoch: Epoch,
+        prev_entry: (Epoch, u64),
+        clock: Clock,
+    },
 
-    LogAppend { idx: u64, entry_epoch: Epoch, entry: LogEntry },
+    LogAppend {
+        idx: u64,
+        entry_epoch: Epoch,
+        entry: LogEntry,
+    },
 
     AckRequest,
     RemoteAckRequest,
-    Ack { log_epoch: Epoch, log_len: u64, clock: u64 },
+    Ack {
+        log_epoch: Epoch,
+        log_len: u64,
+        clock: u64,
+    },
 
-    RemoteLogRequest { dest: Gid, log_epoch: Epoch, next_idx: u64 },
-    RemoteLogEpoch { log_epoch: Epoch },
+    RemoteLogRequest {
+        dest: Gid,
+        log_epoch: Epoch,
+        next_idx: u64,
+    },
+    RemoteLogEpoch {
+        log_epoch: Epoch,
+    },
     RemoteLogAppend(RemoteEntry),
 }
 

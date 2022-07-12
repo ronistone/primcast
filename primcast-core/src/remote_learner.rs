@@ -1,7 +1,7 @@
 use crate::types::*;
 
 use rustc_hash::FxHashMap as HashMap;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]
@@ -179,8 +179,10 @@ impl RemoteLearner {
         self.safe_idx
     }
 
-    pub(crate) fn remote_info(&self) -> impl Iterator<Item=(Pid, Epoch, u64)> + '_ {
-        self.remote_info.iter().map(|(pid, info)| { (*pid, info.epoch, info.log_len) })
+    pub(crate) fn remote_info(&self) -> impl Iterator<Item = (Pid, Epoch, u64)> + '_ {
+        self.remote_info
+            .iter()
+            .map(|(pid, info)| (*pid, info.epoch, info.log_len))
     }
 
     /// Return the next learned timetamp, if any.

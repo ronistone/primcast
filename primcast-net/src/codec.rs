@@ -13,7 +13,6 @@ use tokio_util::codec;
 
 const HDR_SIZE: usize = 4;
 
-
 pub type BincodeReader<M, IO> = codec::FramedRead<ReadHalf<IO>, BincodeCodec<M>>;
 pub type BincodeWriter<M, IO> = codec::FramedWrite<WriteHalf<IO>, BincodeCodec<M>>;
 
