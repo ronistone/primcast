@@ -162,11 +162,6 @@ fn main() {
             while let Ok(permit) = outstanding_consumer.acquire().await {
                 permit.forget(); // delivery will create more permits
                 let id: MsgId = rng.gen();
-                let payload = Payload {
-                    amcast_at: Instant::now() - start,
-                    sender: (gid, pid),
-                };
-                let msg: Bytes = bincode::serialize(&payload).unwrap().into();
                 let dest: GidSet = if rng.gen_bool(args.globals) {
                     // global msg
                     global_dests.choose(&mut rng).cloned().unwrap()
@@ -174,6 +169,11 @@ fn main() {
                     // local msg
                     local_dest.clone()
                 };
+                let payload = Payload {
+                    amcast_at: Instant::now() - start,
+                    sender: (gid, pid),
+                };
+                let msg: Bytes = bincode::serialize(&payload).unwrap().into();
                 handle.propose(id, msg.into(), dest).await.unwrap();
             }
         });
