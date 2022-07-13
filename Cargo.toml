@@ -4,3 +4,7 @@ members = [
     "primcast-core",
     "primcast-net",
 ]
+
+[profile.release]
+# add debug info to release builds (mostly for 'cargo flamegraph')
+debug = true
