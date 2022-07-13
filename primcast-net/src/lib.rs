@@ -79,6 +79,7 @@ pub enum Error {
     HandshakeFail,
     ReplicaShutdown,
     NotLeader(Epoch),
+    InvalidGid(Gid),
 }
 
 impl From<std::io::Error> for Error {
@@ -147,7 +148,7 @@ impl PrimcastHandle {
         for gid in dest.iter() {
             self.gid_proposal_tx
                 .get_mut(gid)
-                .unwrap()
+                .ok_or(Error::InvalidGid(*gid))?
                 .send((msg_id, msg.clone(), dest.clone()))
                 .await?;
         }
