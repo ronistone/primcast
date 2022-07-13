@@ -850,8 +850,11 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                         }
                         Ack { log_epoch, log_len, clock } => {
                             let mut s = s.write().await;
+                            let old_clock = s.core.clock();
                             s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
-                            s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                            if clock > old_clock {
+                                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                            }
                             s.update_tx.send(())?;
                         }
                         m => panic!("unexpected message: {:?}", m),
@@ -893,10 +896,14 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
             RemoteLogAppend(entry) => {
                 // batch?
                 let mut s = s.write().await;
+                let old_clock = s.core.clock();
+                let entry_ts = entry.ts;
                 s.core
                     .remote_add_ack(remote_gid, remote_peer.pid, epoch, entry.idx, entry.ts)?;
                 s.core.remote_append(remote_gid, entry)?;
-                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                if entry_ts > old_clock {
+                    s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                }
                 s.update_tx.send(())?;
             }
             _ => panic!("unexpected message"),
@@ -928,8 +935,11 @@ async fn ack_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error
                 clock,
             } => {
                 let mut s = s.write().await;
+                let old_clock = s.core.clock();
                 s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
-                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                if clock > old_clock {
+                    s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                }
                 s.update_tx.send(())?;
             }
             m => panic!("unexpected message: {:?}", m),
@@ -961,9 +971,12 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
                 clock,
             } => {
                 let mut s = s.write().await;
+                let old_clock = s.core.clock();
                 s.core
                     .remote_add_ack(conn.gid(), conn.pid(), log_epoch, log_len, clock)?;
-                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                if clock > old_clock {
+                    s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                }
                 s.update_tx.send(())?;
             }
             m => panic!("unexpected message: {:?}", m),
