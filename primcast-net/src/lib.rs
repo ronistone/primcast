@@ -30,6 +30,7 @@ use rustc_hash::FxHashMap;
 mod codec;
 mod conn;
 mod messages;
+pub mod util;
 
 use conn::Conn;
 
