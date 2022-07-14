@@ -155,3 +155,62 @@ mod tests {
         });
     }
 }
+
+/// wrapper over tokio RwLock instrumented with printing for debug purposes
+struct RwLock<T>(tokio::sync::RwLock<T>);
+struct RwLockWriteGuard<'a, T>(u32, tokio::sync::RwLockWriteGuard<'a, T>);
+struct RwLockReadGuard<'a, T>(u32, tokio::sync::RwLockReadGuard<'a, T>);
+
+impl<'a, T> Drop for RwLockReadGuard<'a, T> {
+    fn drop(&mut self) {
+        println!("=> unlocking read {}", self.0);
+    }
+}
+
+impl<'a, T> Drop for RwLockWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        println!("=> unlocking write {}", self.0);
+    }
+}
+
+impl<'a, T> std::ops::Deref for RwLockReadGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.1.deref()
+    }
+}
+
+impl<'a, T> std::ops::Deref for RwLockWriteGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.1.deref()
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for RwLockWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.1.deref_mut()
+    }
+}
+
+impl<T> RwLock<T> {
+    fn new(inner: T) -> Self {
+        RwLock(tokio::sync::RwLock::new(inner))
+    }
+
+    async fn write(&self, line: u32) -> RwLockWriteGuard<'_, T> {
+        println!("=> locking write {}", line);
+        let g = self.0.write().await;
+        println!("=> ok write {}", line);
+        RwLockWriteGuard(line, g)
+    }
+
+    async fn read(&self, line: u32) -> RwLockReadGuard<'_, T> {
+        println!("=> locking read {}", line);
+        let g = self.0.read().await;
+        println!("=> ok read {}", line);
+        RwLockReadGuard(line, g)
+    }
+}

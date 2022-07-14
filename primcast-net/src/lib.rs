@@ -429,25 +429,32 @@ async fn run_primary(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
 
     let mut sync_tasks = FuturesUnordered::new();
 
+    let (shutdown, _shutdown_handle) = Shutdown::new();
     for p in &cfg.group(gid).unwrap().peers {
         // connect to higher pids only (lower pid, higher leadership priority)
         if p.pid > pid {
             // sync them to our log
             let p = p.clone();
             let s = s.clone();
-            sync_tasks.push(async move {
+            let task = async move {
                 loop {
                     if let Err(err) = sync_follower(p.clone(), e, s.clone()).await {
                         eprintln!("error syncing follower {:?}:{:?}: {:?}", gid, p.pid, err);
                         tokio::time::sleep(RETRY_TIMEOUT).await;
                     }
                 }
-            });
+            };
+            let join_handle = tokio::spawn(with_shutdown(shutdown.clone(), task));
+            sync_tasks.push(join_handle);
         }
     }
 
     // a `sync_follower` task completing without error means some higher epoch was seen
-    sync_tasks.next().await.unwrap()
+    if let Err(err) = sync_tasks.next().await.unwrap() {
+        assert!(!err.is_panic());
+        std::panic::resume_unwind(err.into_panic());
+    }
+    Ok(())
 }
 
 async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
@@ -465,8 +472,8 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     let (mut conn_tx, mut conn_rx) = conn.split();
 
     // send ack back to primary
+    let mut ack_rx = s.read().await.ack_rx.clone();
     let send_acks_task = {
-        let mut ack_rx = s.read().await.ack_rx.clone();
         async move {
             println!("sending acks to {:?}:{:?}", conn_tx.gid(), conn_tx.pid());
             loop {
@@ -485,33 +492,41 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     tokio::pin!(send_acks_task);
 
     // fetch acks from other replicas in group
-    let mut fetch_ack_tasks = FuturesUnordered::new();
+    let (shutdown, _shutdown_handle) = Shutdown::new();
+    let mut fetch_acks_tasks = FuturesUnordered::new();
     for p in &cfg.group(gid).unwrap().peers {
         if p.pid != pid {
             let p = p.clone();
             let s = s.clone();
-            fetch_ack_tasks.push(async move {
+            let task = async move {
                 loop {
                     if let Err(err) = ack_fetch(p.clone(), s.clone()).await {
                         eprintln!("fetching acks from {:?}:{:?}: {:?}", gid, p.pid, err);
                         tokio::time::sleep(RETRY_TIMEOUT).await;
                     }
                 }
-            });
+            };
+            let join_handle = tokio::spawn(with_shutdown(shutdown.clone(), task));
+            fetch_acks_tasks.push(join_handle);
         }
     }
 
     let mut msgs = vec![];
     let err = 'recv: loop {
-        // make progress on other tasks while trying to read the next batch of msgs from the leader
         tokio::select! {
             // biased; // first branch always checked first
             n = conn_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs) => {
                 debug_assert!(n == msgs.len());
                 debug_assert!(msgs.len() <= BATCH_SIZE_YIELD);
             }
-            res = &mut send_acks_task => return res,
-            _ = &mut fetch_ack_tasks.next() => return Ok(()),
+            res = &mut send_acks_task => {
+                // could not write back to the primary
+                return res;
+            }
+            _ = &mut fetch_acks_tasks.next() => {
+                // any of the tasks failing means a higher epoch was seen from the peer
+                return Ok(());
+            }
         }
 
         if msgs.len() == 0 {
