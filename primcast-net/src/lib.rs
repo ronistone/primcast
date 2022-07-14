@@ -33,8 +33,8 @@ mod conn;
 mod messages;
 pub mod util;
 
-use messages::Message;
 use conn::Conn;
+use messages::Message;
 use util::StreamExt2;
 
 const RETRY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -503,70 +503,57 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
 
     let mut msgs = vec![];
     let err = 'recv: loop {
-        // the following weird logic is used to batch and prioritize sending log entries
+        // make progress on other tasks while trying to read the next batch of msgs from the leader
         tokio::select! {
-            biased; // first branch always checked first
-            res = conn_rx.recv() => {
-                match res {
-                    Ok(Message::LogAppend { idx, entry_epoch, entry }) => {
-                        msgs.push((idx, entry_epoch, entry));
-                        if msgs.len() < BATCH_SIZE_YIELD {
-                            continue 'recv; // read more
+            // biased; // first branch always checked first
+            n = conn_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs) => {
+                debug_assert!(n == msgs.len());
+                debug_assert!(msgs.len() <= BATCH_SIZE_YIELD);
+            }
+            res = &mut send_acks_task => return res,
+            _ = &mut fetch_ack_tasks.next() => return Ok(()),
+        }
+
+        if msgs.len() == 0 {
+            // connection to leader lost
+            break 'recv std::io::ErrorKind::ConnectionReset.into();
+        }
+
+        // process msg batch
+        {
+            let mut s = s.write().await;
+            for msg in msgs.drain(..) {
+                match msg {
+                    Ok(Message::LogAppend {
+                        idx,
+                        entry_epoch,
+                        entry,
+                    }) => {
+                        if entry_epoch < e {
+                            s.core.start_epoch_append(e, idx, entry_epoch, entry)?;
+                        } else {
+                            s.core.append(e, idx, entry)?;
                         }
                     }
-                    Ok(Message::StartEpochAccept { epoch, prev_entry, clock }) => {
-                        assert_eq!(e, epoch);
-                        let mut s = s.write().await;
-                        for (idx, entry_epoch, entry) in msgs.drain(..) {
-                            if entry_epoch < e {
-                                s.core.start_epoch_append(e, idx, entry_epoch, entry)?;
-                            }
-                        }
-                        s.core.start_epoch_accept(e, prev_entry, clock)?;
-                        let (epoch, len) = s.core.log_status();
-                        s.ack_tx.send((epoch, len, s.core.clock()))?;
-                        s.update_tx.send(())?;
-                        continue 'recv; // read more
+                    Ok(Message::StartEpochAccept {
+                        epoch,
+                        prev_entry,
+                        clock,
+                    }) => {
+                        s.core.start_epoch_accept(epoch, prev_entry, clock)?;
                     }
                     Ok(m) => panic!("unexpected message {:?}", m),
                     Err(err) => break 'recv err,
                 }
             }
-            res = &mut send_acks_task => return res,
-            _ = &mut fetch_ack_tasks.next() => return Ok(()),
-            // this default branch is only enabled when at least 1 msg is buffered
-            _default = future::ready(()), if !msgs.is_empty() => {}
-        }
 
-        assert!(msgs.len() <= BATCH_SIZE_YIELD);
-        {
-            let mut s = s.write().await;
-            for (idx, entry_epoch, entry) in msgs.drain(..) {
-                if entry_epoch < e {
-                    s.core.start_epoch_append(e, idx, entry_epoch, entry)?;
-                } else {
-                    s.core.append(e, idx, entry)?;
-                }
-            }
             let (epoch, len) = s.core.log_status();
             s.ack_tx.send((epoch, len, s.core.clock()))?;
             s.update_tx.send(())?;
         }
+        // let other tasks make progress
         tokio::task::yield_now().await;
     };
-
-    // append remaining buffered msgs
-    let mut s = s.write().await;
-    for (idx, entry_epoch, entry) in msgs.drain(..) {
-        if entry_epoch < e {
-            s.core.start_epoch_append(e, idx, entry_epoch, entry)?;
-        } else {
-            s.core.append(e, idx, entry)?;
-        }
-    }
-    let (epoch, len) = s.core.log_status();
-    s.ack_tx.send((epoch, len, s.core.clock()))?;
-    s.update_tx.send(())?;
 
     Err(err.into())
 }
@@ -658,19 +645,18 @@ async fn handle_connection(
                     return Ok(());
                 }
             }
-            let mut count = 0;
-            loop {
-                match conn.recv().await? {
-                    Message::Proposal { msg_id, msg, dest } => {
-                        proposal_tx.send((msg_id, msg, dest)).await?;
-                        count += 1;
-                        if count >= BATCH_SIZE_YIELD {
-                            count = 0;
-                            tokio::task::yield_now().await;
+            // forward proposals to main loop
+            let mut msgs = vec![];
+            while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
+                for msg in msgs.drain(..) {
+                    match msg? {
+                        Message::Proposal { msg_id, msg, dest } => {
+                            proposal_tx.send((msg_id, msg, dest)).await?;
                         }
+                        m => panic!("unexpected message: {:?}", m),
                     }
-                    m => panic!("unexpected message: {:?}", m),
                 }
+                tokio::task::yield_now().await;
             }
         }
 
@@ -880,35 +866,35 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
     };
     let mut conn = Conn::request((gid, pid), (remote_gid, remote_peer.pid), remote_peer.addr(), req).await?;
 
-    let mut count = 0;
-    loop {
-        match conn.recv().await? {
-            RemoteLogEpoch { log_epoch } => {
-                // possibly truncate log, return to be retried
-                s.write().await.core.remote_update_log_epoch(remote_gid, log_epoch)?;
-                return Ok(());
-            }
-            RemoteLogAppend(entry) => {
-                // batch?
-                let mut s = s.write().await;
-                let old_clock = s.core.clock();
-                let entry_ts = entry.ts;
-                s.core
-                    .remote_add_ack(remote_gid, remote_peer.pid, epoch, entry.idx, entry.ts)?;
-                s.core.remote_append(remote_gid, entry)?;
-                if entry_ts > old_clock {
-                    s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+    let mut msgs = vec![];
+    while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
+        {
+            let mut s = s.write().await;
+            let old_clock = s.core.clock();
+            for msg in msgs.drain(..) {
+                match msg? {
+                    RemoteLogEpoch { log_epoch } => {
+                        // possibly truncate log, return to be retried
+                        s.core.remote_update_log_epoch(remote_gid, log_epoch)?;
+                        return Ok(());
+                    }
+                    RemoteLogAppend(entry) => {
+                        s.core
+                            .remote_add_ack(remote_gid, remote_peer.pid, epoch, entry.idx, entry.ts)?;
+                        s.core.remote_append(remote_gid, entry)?;
+                    }
+                    _ => panic!("unexpected message"),
                 }
-                s.update_tx.send(())?;
             }
-            _ => panic!("unexpected message"),
+            let new_clock = s.core.clock();
+            if new_clock > old_clock {
+                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+            }
+            s.update_tx.send(())?;
         }
-        count += 1;
-        if count >= BATCH_SIZE_YIELD {
-            tokio::task::yield_now().await;
-            count = 0;
-        }
+        tokio::task::yield_now().await;
     }
+    Ok(())
 }
 
 async fn ack_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
@@ -920,31 +906,31 @@ async fn ack_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error
     let req = RemoteAckRequest;
     let mut conn = Conn::request((self_gid, self_pid), (self_gid, peer.pid), peer.addr(), req).await?;
 
-    // TODO: batch recvs?
-    let mut count = 0;
-    loop {
-        match conn.recv().await? {
-            Ack {
-                log_epoch,
-                log_len,
-                clock,
-            } => {
-                let mut s = s.write().await;
-                let old_clock = s.core.clock();
-                s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
-                if clock > old_clock {
-                    s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+    let mut msgs = vec![];
+    while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
+        {
+            let mut s = s.write().await;
+            let old_clock = s.core.clock();
+            for msg in msgs.drain(..) {
+                match msg? {
+                    Ack {
+                        log_epoch,
+                        log_len,
+                        clock,
+                    } => {
+                        s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
+                    }
+                    m => panic!("unexpected message: {:?}", m),
                 }
-                s.update_tx.send(())?;
             }
-            m => panic!("unexpected message: {:?}", m),
+            if s.core.clock() > old_clock {
+                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+            }
+            s.update_tx.send(())?;
         }
-        count += 1;
-        if count >= BATCH_SIZE_YIELD {
-            tokio::task::yield_now().await;
-            count = 0;
-        }
+        tokio::task::yield_now().await;
     }
+    Ok(())
 }
 
 async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
@@ -956,41 +942,36 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
     let req = RemoteAckRequest;
     let mut conn = Conn::request((self_gid, self_pid), (remote_gid, remote_peer.pid), remote_peer.addr(), req).await?;
 
-    // TODO: batch recvs?
-    let mut count = 0;
-    loop {
-        match conn.recv().await? {
-            Ack {
-                log_epoch,
-                log_len,
-                clock,
-            } => {
-                let mut s = s.write().await;
-                let old_clock = s.core.clock();
-                s.core
-                    .remote_add_ack(conn.gid(), conn.pid(), log_epoch, log_len, clock)?;
-                if clock > old_clock {
-                    s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+    let mut msgs = vec![];
+    while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
+        {
+            let mut s = s.write().await;
+            let old_clock = s.core.clock();
+            for msg in msgs.drain(..) {
+                match msg? {
+                    Ack {
+                        log_epoch,
+                        log_len,
+                        clock,
+                    } => {
+                        s.core
+                            .remote_add_ack(conn.gid(), conn.pid(), log_epoch, log_len, clock)?;
+                    }
+                    m => panic!("unexpected message: {:?}", m),
                 }
-                s.update_tx.send(())?;
             }
-            m => panic!("unexpected message: {:?}", m),
-        }
-        count += 1;
-        if count >= BATCH_SIZE_YIELD {
-            tokio::task::yield_now().await;
-            count = 0;
+            if s.core.clock() > old_clock {
+                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+            }
+            s.update_tx.send(())?;
         }
     }
+    Ok(())
 }
 
 async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     println!("sending acks to {:?}:{:?}", conn.gid(), conn.pid());
-    let mut ack_rx;
-    {
-        let s = s.read().await;
-        ack_rx = s.ack_rx.clone();
-    }
+    let mut ack_rx = s.read().await.ack_rx.clone();
     use Message::*;
     loop {
         let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
@@ -1013,7 +994,6 @@ async fn remote_log_send(
 ) -> Result<(), Error> {
     println!("sending remote logs for {:?} starting at {:?}", dest, next_idx);
     let mut ack_rx = s.read().await.ack_rx.clone();
-
     use Message::*;
     let mut to_send = vec![];
     loop {
@@ -1065,8 +1045,8 @@ async fn proposal_sender(
 ) -> Result<(), Error> {
     let peers = cfg.peers(to_gid).unwrap();
     'connect: loop {
-        // connect to everyone and see who is the leader
         // TODO: better remote leader selection?
+        // connect to everyone and see who is the leader
         let mut connect_futs = FuturesUnordered::new();
         for p in peers {
             let opid = p.pid;

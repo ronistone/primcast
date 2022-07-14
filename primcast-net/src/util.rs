@@ -9,16 +9,21 @@ use pin_project_lite::pin_project;
 pub trait StreamExt2: Stream {
     /// Stream that yields (i.e., returns Poll::Pending) after n consecutive items that return without waiting.
     fn yield_after(self, n: usize) -> Yield<Self>
-    where Self: Sized;
+    where
+        Self: Sized;
     /// Read the next (up to `max_items`) ready items into buf.
     /// It will block util at least one item is returned by the stream.
     /// Returns the number of items read (0 means the stream returned None).
     fn next_ready_chunk<'a>(&'a mut self, max_items: usize, buf: &'a mut Vec<Self::Item>) -> NextReadyChunk<Self>
-    where Self: Sized + Unpin;
+    where
+        Self: Sized + Unpin;
 }
 
 impl<S: Stream> StreamExt2 for S {
-    fn yield_after(self, n: usize) -> Yield<Self> where Self: Sized {
+    fn yield_after(self, n: usize) -> Yield<Self>
+    where
+        Self: Sized,
+    {
         assert!(n > 0);
         Yield {
             inner: self,
@@ -29,7 +34,8 @@ impl<S: Stream> StreamExt2 for S {
     }
 
     fn next_ready_chunk<'a>(&'a mut self, max_items: usize, buf: &'a mut Vec<S::Item>) -> NextReadyChunk<Self>
-    where Self: Sized + Unpin
+    where
+        Self: Sized + Unpin,
     {
         assert!(max_items > 0);
         NextReadyChunk {
@@ -99,7 +105,7 @@ impl<'a, S: Stream + Unpin> Future for NextReadyChunk<'a, S> {
         match s.poll_next(cx) {
             Poll::Ready(Some(it)) => {
                 self.buf.push(it);
-            },
+            }
             Poll::Ready(None) => return Poll::Ready(0),
             Poll::Pending => return Poll::Pending,
         }
