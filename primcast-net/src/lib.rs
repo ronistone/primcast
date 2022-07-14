@@ -18,21 +18,24 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::sync::RwLock;
 
-use messages::Message;
+use tokio_stream::wrappers::ReceiverStream;
+
+use rustc_hash::FxHashMap;
+
 use primcast_core::config;
 use primcast_core::config::PeerConfig;
 use primcast_core::types::*;
 use primcast_core::GroupReplica;
 use primcast_core::ReplicaState;
 
-use rustc_hash::FxHashMap;
-
 mod codec;
 mod conn;
 mod messages;
 pub mod util;
 
+use messages::Message;
 use conn::Conn;
+use util::StreamExt2;
 
 const RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const PROPOSAL_QUEUE: usize = 1000;
@@ -119,7 +122,7 @@ pub struct PrimcastReplica {
     cfg: config::Config,
     shared: Arc<RwLock<Shared>>,
     ev_rx: mpsc::UnboundedReceiver<Event>,
-    proposal_rx: mpsc::Receiver<(MsgId, Bytes, GidSet)>,
+    proposal_rx: ReceiverStream<(MsgId, Bytes, GidSet)>,
 }
 
 pub struct Shared {
@@ -191,7 +194,7 @@ impl PrimcastReplica {
             ack_tx,
             ack_rx,
             ev_tx,
-            proposal_tx: proposal_tx,
+            proposal_tx,
             shutdown,
         };
 
@@ -200,7 +203,7 @@ impl PrimcastReplica {
             pid,
             cfg: cfg.clone(),
             shared: Arc::new(RwLock::new(shared)),
-            proposal_rx,
+            proposal_rx: ReceiverStream::new(proposal_rx),
             ev_rx,
         };
 
@@ -294,42 +297,31 @@ impl PrimcastReplica {
             }
         }
 
-        let mut proposals = vec![];
+        let mut proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
 
         'main: loop {
             loop {
                 tokio::select! {
                     // biased;
                     _ = &mut shutdown => break 'main,
-                    Some(p) = self.proposal_rx.recv() => {
+                    n = self.proposal_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals) => {
+                        // propose next batch of msgs
+                        debug_assert!(proposals.len() <= BATCH_SIZE_YIELD);
+                        debug_assert!(proposals.len() == n);
 
-                        // try to batch a few proposals before adding to replica state
-                        proposals.push(p);
-                        loop {
-                            tokio::select! {
-                                biased;
-                                Some(p) = self.proposal_rx.recv(), if proposals.len() < BATCH_SIZE_YIELD => {
-                                    proposals.push(p);
-                                }
-                                _ = future::ready(()) => break,
+                        let mut s = self.shared.write().await;
+                        for (msg_id, msg, dest) in proposals.drain(..) {
+                            match s.core.add_proposal(msg_id, msg, dest) {
+                                Ok(_) => (),
+                                Err(err) => eprintln!("error queuing proposal {:?}: {:?}", msg_id, err),
                             }
                         }
-                        assert!(proposals.len() <= BATCH_SIZE_YIELD);
-                        {
-                            let mut s = self.shared.write().await;
-                            for (msg_id, msg, dest) in proposals.drain(..) {
-                                match s.core.add_proposal(msg_id, msg, dest) {
-                                    Ok(_) => (),
-                                    Err(err) => eprintln!("error queuing proposal {:?}: {:?}", msg_id, err),
-                                }
-                            }
-                            if let Err(err) = s.core.propose() {
-                                eprintln!("error proposing: {:?}", err);
-                            }
-                            let (log_epoch, log_len) = s.core.log_status();
-                            let clock = s.core.clock();
-                            s.ack_tx.send((log_epoch, log_len, clock))?;
+                        if let Err(err) = s.core.propose() {
+                            eprintln!("error proposing: {:?}", err);
                         }
+                        let (log_epoch, log_len) = s.core.log_status();
+                        let clock = s.core.clock();
+                        s.ack_tx.send((log_epoch, log_len, clock))?;
                     }
                     _ = &mut fut => {
                         // idle state: waiting for incoming leader connection or a timeout to become leader
@@ -343,6 +335,7 @@ impl PrimcastReplica {
                                 // TODO: leadership check
                             }
                             Event::Follow(conn, epoch) => {
+                                // promised for a new leader
                                 (_, state) = self.shared.read().await.core.state();
                                 assert!(state == ReplicaState::Promised || state == ReplicaState::Follower);
                                 fut = Box::pin(run_follower(conn, epoch, self.shared.clone()));
