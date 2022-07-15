@@ -1,8 +1,9 @@
 use std::pin::Pin;
 use std::task::Poll;
 
-use futures::Future;
-use futures::Stream;
+use futures::prelude::*;
+
+use tokio::sync::oneshot;
 
 use pin_project_lite::pin_project;
 
@@ -98,13 +99,14 @@ pub struct NextReadyChunk<'a, S: Stream> {
 impl<'a, S: Stream + Unpin> Future for NextReadyChunk<'a, S> {
     type Output = usize;
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         debug_assert!(self.max_items > 0);
+        let this = self.get_mut();
 
-        let s = Pin::new(&mut self.inner);
+        let s = Pin::new(&mut this.inner);
         match s.poll_next(cx) {
             Poll::Ready(Some(it)) => {
-                self.buf.push(it);
+                this.buf.push(it);
             }
             Poll::Ready(None) => return Poll::Ready(0),
             Poll::Pending => return Poll::Pending,
@@ -112,10 +114,10 @@ impl<'a, S: Stream + Unpin> Future for NextReadyChunk<'a, S> {
 
         let mut count = 1;
 
-        while count < self.max_items {
-            let s = Pin::new(&mut self.inner);
+        while count < this.max_items {
+            let s = Pin::new(&mut this.inner);
             if let Poll::Ready(Some(it)) = s.poll_next(cx) {
-                self.buf.push(it);
+                this.buf.push(it);
                 count += 1;
             } else {
                 break;
@@ -156,10 +158,77 @@ mod tests {
     }
 }
 
-/// wrapper over tokio RwLock instrumented with printing for debug purposes
-struct RwLock<T>(tokio::sync::RwLock<T>);
-struct RwLockWriteGuard<'a, T>(u32, tokio::sync::RwLockWriteGuard<'a, T>);
-struct RwLockReadGuard<'a, T>(u32, tokio::sync::RwLockReadGuard<'a, T>);
+/// When dropped, makes the related Shutdown futures complete.
+pub struct ShutdownHandle(oneshot::Sender<()>);
+#[derive(Clone)]
+
+/// Future that can be cloned to be waited on by multiple tasks. All copies complete when
+/// the related ShutdownHandle is dropped.
+pub struct Shutdown(future::Shared<oneshot::Receiver<()>>);
+
+impl Future for Shutdown {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        self.0.poll_unpin(cx).map(|_| ())
+    }
+}
+
+impl Shutdown {
+    /// Create a new Shutdown/ShutdownHandle pair.
+    pub fn new() -> (Self, ShutdownHandle) {
+        let (tx, rx) = oneshot::channel();
+        (Shutdown(rx.shared()), ShutdownHandle(tx))
+    }
+}
+
+/// Wrapper over async task JoinHandle that aborts the task if it is dropped.
+/// Can also be awaited (as a JoinHandle) to wait for task completion and
+/// result. Note that just dropping the AbortHandle or calling abort() does not
+/// mean the task is finished immediately.
+pub struct AbortHandle<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortHandle<T> {
+    /// wrap an existing join handle
+    pub fn new(join_handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(join_handle)
+    }
+
+    /// tokio::spawn the future, returning its AbortHandle
+    pub fn spawn<F>(future: F) -> Self
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let jh = tokio::spawn(future);
+        Self(jh)
+    }
+
+    /// abort the task
+    pub fn abort(&self) {
+        self.0.abort()
+    }
+}
+
+impl<T> Future for AbortHandle<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        Pin::new(&mut this.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort()
+    }
+}
+
+/// Wrapper over tokio RwLock, instrumented with printing for debugging.
+pub struct RwLock<T>(tokio::sync::RwLock<T>);
+pub struct RwLockWriteGuard<'a, T>(u32, tokio::sync::RwLockWriteGuard<'a, T>);
+pub struct RwLockReadGuard<'a, T>(u32, tokio::sync::RwLockReadGuard<'a, T>);
 
 impl<'a, T> Drop for RwLockReadGuard<'a, T> {
     fn drop(&mut self) {
@@ -196,18 +265,18 @@ impl<'a, T> std::ops::DerefMut for RwLockWriteGuard<'a, T> {
 }
 
 impl<T> RwLock<T> {
-    fn new(inner: T) -> Self {
+    pub fn new(inner: T) -> Self {
         RwLock(tokio::sync::RwLock::new(inner))
     }
 
-    async fn write(&self, line: u32) -> RwLockWriteGuard<'_, T> {
+    pub async fn write(&self, line: u32) -> RwLockWriteGuard<'_, T> {
         println!("=> locking write {}", line);
         let g = self.0.write().await;
         println!("=> ok write {}", line);
         RwLockWriteGuard(line, g)
     }
 
-    async fn read(&self, line: u32) -> RwLockReadGuard<'_, T> {
+    pub async fn read(&self, line: u32) -> RwLockReadGuard<'_, T> {
         println!("=> locking read {}", line);
         let g = self.0.read().await;
         println!("=> ok read {}", line);
