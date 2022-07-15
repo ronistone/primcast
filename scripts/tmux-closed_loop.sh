@@ -7,6 +7,7 @@ OPT="$@"
 OUTSTANDING=1
 GLOBAL_DESTS=2
 GLOBALS=0.0
+SINGLE_THREAD=""
 
 
 tmux_test ()  {
@@ -25,7 +26,7 @@ tmux_test ()  {
             CMD="$VG ./$BUILD/examples/closed_loop \
                       --gid $g --pid $i --cfg $CONFIG \
                       --global-dests $GLOBAL_DESTS --globals $GLOBALS \
-                      -o $OUTSTANDING --stats-secs $STATS_SECS"
+                      -o $OUTSTANDING --stats-secs $STATS_SECS $SINGLE_THREAD"
             tmux send-keys -t $(( $g * 3 + $i + $FIRST_PANE_NUMBER )) "$CMD" C-m
         done
     done
@@ -59,6 +60,9 @@ while [[ $# > 0 ]]; do
         --global-dests)
             GLOBAL_DESTS=$2
             shift
+            ;;
+        --single-thread)
+            SINGLE_THREAD="--single-thread"
             ;;
         -h|--help)
             usage

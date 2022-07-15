@@ -56,6 +56,10 @@ struct Args {
     /// stats printing interval in seconds
     #[clap(long, default_value_t = 1)]
     stats_secs: u64,
+
+    /// use single-threaded executor
+    #[clap(long)]
+    single_thread: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -131,10 +135,19 @@ fn main() {
         })
         .collect();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = if args.single_thread {
+        println!("running single-threaded executor");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    } else {
+        println!("running multi-threaded executor");
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
 
     rt.block_on(async {
         let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg);
