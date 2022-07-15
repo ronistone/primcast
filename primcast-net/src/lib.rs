@@ -428,7 +428,6 @@ async fn run_primary(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     }
 
     let mut sync_tasks = FuturesUnordered::new();
-
     let (shutdown, _shutdown_handle) = Shutdown::new();
     for p in &cfg.group(gid).unwrap().peers {
         // connect to higher pids only (lower pid, higher leadership priority)
@@ -479,13 +478,12 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
             loop {
                 ack_rx.changed().await?;
                 let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
-                conn_tx
-                    .send(Message::Ack {
-                        log_epoch,
-                        log_len,
-                        clock,
-                    })
-                    .await?;
+                let ack = Message::Ack {
+                    log_epoch,
+                    log_len,
+                    clock,
+                };
+                conn_tx.send(ack).await?;
             }
         }
     };
@@ -500,7 +498,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
             let s = s.clone();
             let task = async move {
                 loop {
-                    if let Err(err) = ack_fetch(p.clone(), s.clone()).await {
+                    if let Err(err) = acks_fetch(p.clone(), s.clone()).await {
                         eprintln!("fetching acks from {:?}:{:?}: {:?}", gid, p.pid, err);
                         tokio::time::sleep(RETRY_TIMEOUT).await;
                     }
@@ -783,6 +781,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
     let mut ack_rx = s.read().await.ack_rx.clone();
     let mut to_send = vec![];
     loop {
+        // lock the state and gather available (not yet sent) entries, at most BATCH_SIZE_YIELD
         {
             let s = s.read().await;
             let (promised_epoch, _) = s.core.state();
@@ -815,14 +814,23 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             }
         };
 
-        assert!(to_send.len() <= BATCH_SIZE_YIELD);
-
+        // send gathered entries
         for msg in to_send.drain(..) {
             conn.feed(msg).await?;
         }
         conn.flush().await?;
         tokio::task::yield_now().await;
 
+        // are more entries already available? then send them
+        let (new_log_epoch, new_log_len, _) = *ack_rx.borrow_and_update();
+        if sync_log_epoch != new_log_epoch {
+            return Ok(());
+        }
+        if new_log_len > follower_log_len {
+            continue;
+        }
+
+        // otherwise, wait for more entries to become available and read acks from follower
         'wait: loop {
             tokio::select! {
                 // check if there are more log entries to send
@@ -894,9 +902,10 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
                         return Ok(());
                     }
                     RemoteLogAppend(entry) => {
-                        s.core
-                            .remote_add_ack(remote_gid, remote_peer.pid, epoch, entry.idx, entry.ts)?;
+                        let idx = entry.idx;
+                        let ts = entry.ts;
                         s.core.remote_append(remote_gid, entry)?;
+                        s.core.remote_add_ack(remote_gid, remote_peer.pid, epoch, idx, ts)?;
                     }
                     _ => panic!("unexpected message"),
                 }
@@ -912,7 +921,7 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
     Ok(())
 }
 
-async fn ack_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
+async fn acks_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     let self_gid = s.read().await.core.gid;
     let self_pid = s.read().await.core.pid;
     println!("fetching acks from {:?}:{:?}", self_gid, peer.pid);
@@ -990,12 +999,12 @@ async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     use Message::*;
     loop {
         let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
-        conn.send(Ack {
+        let ack = Ack {
             log_epoch,
             log_len,
             clock,
-        })
-        .await?;
+        };
+        conn.send(ack).await?;
         ack_rx.changed().await?;
     }
 }
