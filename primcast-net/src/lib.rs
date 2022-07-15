@@ -177,7 +177,7 @@ impl PrimcastReplica {
         // create a task forwarding proposals to leader of each group
         for g in s.cfg.groups.iter() {
             let (tx, rx) = mpsc::channel(PROPOSAL_QUEUE);
-            tokio::spawn(proposal_sender((gid, pid), g.gid, cfg.clone(), rx));
+            tokio::spawn(proposal_sender((gid, pid), g.gid, cfg.clone(), rx, s.shared.clone()));
             gid_proposal_tx.insert(g.gid, tx);
         }
 
@@ -1079,6 +1079,7 @@ async fn proposal_sender(
     to_gid: Gid,
     cfg: config::Config,
     rx: mpsc::Receiver<(MsgId, Bytes, GidSet)>,
+    s: Arc<RwLock<Shared>>,
 ) -> Result<(), Error> {
     let peers = cfg.peers(to_gid).unwrap();
     let mut rx = ReceiverStream::new(rx);
@@ -1111,12 +1112,37 @@ async fn proposal_sender(
             }
         };
 
+        if (conn.gid(), conn.pid()) == from {
+            println!("forwarding proposals to itself");
+            // we're the leader, send directly to main loop
+            let tx = s.read().await.proposal_tx.clone();
+            let mut proposals = vec![];
+            loop {
+                let (_, state) = s.read().await.core.state();
+                if state != ReplicaState::Primary && state != ReplicaState::Candidate {
+                    // not group leader anymore, try connect to leader
+                    continue 'connect;
+                }
+                if 0 == rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals).await {
+                    // input channel closed
+                    return Ok(());
+                }
+                for (msg_id, msg, dest) in proposals.drain(..) {
+                    tx.send((msg_id, msg, dest)).await?;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
         println!("forwarding proposals to {:?}:{:?}", conn.gid(), conn.pid());
 
-        // send proposals
+        // send proposals to the leader
         let mut proposals = vec![];
         loop {
-            if 0 == rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals).await {}
+            if 0 == rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals).await {
+                // input channel closed
+                return Ok(());
+            }
             for (msg_id, msg, dest) in proposals.drain(..) {
                 if let Err(err) = conn.feed(Message::Proposal { msg_id, msg, dest }).await {
                     eprintln!("error forwarding proposals to {:?}: {:?}", to_gid, err);
