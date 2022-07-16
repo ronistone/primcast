@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use primcast_core::config;
 use primcast_core::config::PeerConfig;
@@ -95,8 +95,8 @@ pub struct Shared {
     core: GroupReplica,
     update_tx: watch::Sender<()>,
     update_rx: watch::Receiver<()>,
-    ack_tx: watch::Sender<(Epoch, u64, Clock)>,
-    ack_rx: watch::Receiver<(Epoch, u64, Clock)>,
+    ack_tx: HashMap<Gid, watch::Sender<(Epoch, u64, Clock)>>,
+    ack_rx: HashMap<Gid, watch::Receiver<(Epoch, u64, Clock)>>,
     ev_tx: mpsc::UnboundedSender<Event>,
     proposal_tx: mpsc::Sender<(MsgId, Bytes, GidSet)>,
     shutdown: Shutdown,
@@ -109,7 +109,7 @@ enum Event {
 
 pub struct PrimcastHandle {
     _shutdown: ShutdownHandle,
-    gid_proposal_tx: FxHashMap<Gid, mpsc::Sender<(MsgId, Bytes, GidSet)>>,
+    gid_proposal_tx: HashMap<Gid, mpsc::Sender<(MsgId, Bytes, GidSet)>>,
     delivery_rx: Option<mpsc::Receiver<(Clock, MsgId, Bytes, GidSet)>>,
 }
 
@@ -146,7 +146,14 @@ impl PrimcastReplica {
         let (log_epoch, log_len) = core.log_status();
         let clock = core.clock();
 
-        let (ack_tx, ack_rx) = watch::channel((log_epoch, log_len, clock));
+        let mut ack_tx = HashMap::default();
+        let mut ack_rx = HashMap::default();
+        for gid in cfg.groups.iter().map(|g| g.gid) {
+            let (tx, rx) = watch::channel((log_epoch, log_len, clock));
+            ack_tx.insert(gid, tx);
+            ack_rx.insert(gid, rx);
+        }
+
         let (update_tx, update_rx) = watch::channel(());
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_QUEUE);
@@ -173,7 +180,7 @@ impl PrimcastReplica {
             ev_rx,
         };
 
-        let mut gid_proposal_tx = FxHashMap::default();
+        let mut gid_proposal_tx = HashMap::default();
         // create a task forwarding proposals to leader of each group
         for g in s.cfg.groups.iter() {
             let (tx, rx) = mpsc::channel(PROPOSAL_QUEUE);
@@ -261,6 +268,8 @@ impl PrimcastReplica {
         eprintln!("starting main loop...");
         'main: loop {
             let mut proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
+            // for tracking to which dests an ack should be sent
+            let mut ack_dests = GidSet::new();
             loop {
                 tokio::select! {
                     // biased;
@@ -272,6 +281,7 @@ impl PrimcastReplica {
 
                         let mut s = self.shared.write().await;
                         for (msg_id, msg, dest) in proposals.drain(..) {
+                            ack_dests.merge(&dest);
                             match s.core.add_proposal(msg_id, msg, dest) {
                                 Ok(_) => (),
                                 Err(err) => eprintln!("error queuing proposal {msg_id}: {err:?}"),
@@ -282,7 +292,9 @@ impl PrimcastReplica {
                         }
                         let (log_epoch, log_len) = s.core.log_status();
                         let clock = s.core.clock();
-                        s.ack_tx.send((log_epoch, log_len, clock))?;
+                        for gid in ack_dests.0.drain(..) {
+                            s.ack_tx[&gid].send((log_epoch, log_len, clock))?;
+                        }
                     }
                     _ = &mut fut => {
                         // when the main task resolves, become idle
@@ -339,27 +351,27 @@ async fn run_idle() -> Result<(), Error> {
 async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     eprintln!("== CANDIDATE FOR {e:?} ==");
     let cfg;
-    let gid;
-    let pid;
+    let self_gid;
+    let self_pid;
     {
         let s = s.read().await;
         cfg = s.core.config.clone();
-        pid = s.core.pid;
-        gid = s.core.gid;
+        self_pid = s.core.pid;
+        self_gid = s.core.gid;
     }
 
     let mut promise_reqs = FuturesUnordered::new();
 
-    for p in &cfg.group(gid).unwrap().peers {
+    for p in &cfg.group(self_gid).unwrap().peers {
         // connect to higher pids only (lower pid, higher leadership priority)
-        if p.pid > pid {
+        if p.pid > self_pid {
             let p = p.clone();
             let s = s.clone();
             promise_reqs.push(async move {
                 loop {
                     match get_promise(p.clone(), e, s.clone()).await {
                         Err(err) => {
-                            eprintln!("error getting promise from {:?}:{:?}: {:?}", gid, p.pid, err);
+                            eprintln!("error getting promise from {:?}:{:?}: {:?}", self_gid, p.pid, err);
                             tokio::time::sleep(RETRY_TIMEOUT).await;
                         }
                         Ok(p) => break p,
@@ -392,7 +404,7 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
 
     // sync with highest follower
     // TODO: retry?
-    sync_with(cfg.peer(gid, high_pid).unwrap(), e, &s).await?;
+    sync_with(cfg.peer(self_gid, high_pid).unwrap(), e, &s).await?;
 
     // TODO: sync a quorum of followers
 
@@ -404,26 +416,26 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
 async fn run_primary(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     eprintln!("== PRIMARY OF {e:?} ==");
     let cfg;
-    let gid;
-    let pid;
+    let self_gid;
+    let self_pid;
     {
         let s = s.read().await;
         cfg = s.core.config.clone();
-        pid = s.core.pid;
-        gid = s.core.gid;
+        self_pid = s.core.pid;
+        self_gid = s.core.gid;
     }
 
     let mut sync_tasks = FuturesUnordered::new();
-    for p in &cfg.group(gid).unwrap().peers {
+    for p in &cfg.group(self_gid).unwrap().peers {
         // connect to higher pids only (lower pid, higher leadership priority)
-        if p.pid > pid {
+        if p.pid > self_pid {
             // sync them to our log
             let p = p.clone();
             let s = s.clone();
             let task = async move {
                 loop {
                     if let Err(err) = sync_follower(p.clone(), e, s.clone()).await {
-                        eprintln!("error syncing follower {:?}:{:?}: {:?}", gid, p.pid, err);
+                        eprintln!("error syncing follower {:?}:{:?}: {:?}", self_gid, p.pid, err);
                         tokio::time::sleep(RETRY_TIMEOUT).await;
                     }
                 }
@@ -446,19 +458,19 @@ async fn run_primary(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
 async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     eprintln!("== FOLLOWER OF {e:?} ==");
     let cfg;
-    let gid;
-    let pid;
+    let self_gid;
+    let self_pid;
     {
         let s = s.read().await;
         cfg = s.core.config.clone();
-        pid = s.core.pid;
-        gid = s.core.gid;
+        self_pid = s.core.pid;
+        self_gid = s.core.gid;
     }
 
     let (mut conn_tx, mut conn_rx) = conn.split();
 
     // send ack back to primary
-    let mut ack_rx = s.read().await.ack_rx.clone();
+    let mut ack_rx = s.read().await.ack_rx[&self_gid].clone();
     let send_acks_task = {
         async move {
             eprintln!("sending acks to {:?}:{:?}", conn_tx.gid(), conn_tx.pid());
@@ -479,14 +491,14 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     // fetch acks from other replicas in group (except from the primary).
     // To ensure FIFO between appends/acks/bumps, those must come from the same primary connection.
     let mut fetch_acks_tasks = FuturesUnordered::new();
-    for p in &cfg.group(gid).unwrap().peers {
-        if p.pid != pid && p.pid != conn_rx.pid() {
+    for p in &cfg.group(self_gid).unwrap().peers {
+        if p.pid != self_pid && p.pid != conn_rx.pid() {
             let p = p.clone();
             let s = s.clone();
             let task = async move {
                 loop {
                     if let Err(err) = acks_fetch(p.clone(), s.clone()).await {
-                        eprintln!("fetching acks from {:?}:{:?}: {:?}", gid, p.pid, err);
+                        eprintln!("fetching acks from {:?}:{:?}: {:?}", self_gid, p.pid, err);
                         tokio::time::sleep(RETRY_TIMEOUT).await;
                     }
                 }
@@ -497,6 +509,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     }
 
     let mut msgs = vec![];
+    let mut ack_dests = GidSet::new();
     let err = 'recv: loop {
         tokio::select! {
             // biased;
@@ -529,6 +542,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                         entry_epoch,
                         entry,
                     }) => {
+                        ack_dests.merge(&entry.dest);
                         if entry_epoch < e {
                             s.core.start_epoch_append(e, idx, entry_epoch, entry)?;
                         } else {
@@ -541,6 +555,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                         clock,
                     }) => {
                         s.core.start_epoch_accept(epoch, prev_entry, clock)?;
+                        ack_dests.insert(self_gid);
                     }
                     Ok(Message::Ack {
                         log_epoch,
@@ -548,6 +563,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                         clock,
                     }) => {
                         s.core.add_ack(conn_rx.pid(), log_epoch, log_len, clock)?;
+                        ack_dests.insert(self_gid);
                     }
                     Ok(m) => panic!("unexpected message {:?}", m),
                     Err(err) => break 'recv err,
@@ -555,7 +571,10 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
             }
 
             let (epoch, len) = s.core.log_status();
-            s.ack_tx.send((epoch, len, s.core.clock()))?;
+            let clock = s.core.clock();
+            for gid in ack_dests.0.drain(..) {
+                s.ack_tx[&gid].send((epoch, len, clock))?;
+            }
             s.update_tx.send(())?;
         }
         // let other tasks make progress
@@ -567,20 +586,20 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
 
 /// Accept connections and spawn handler tasks
 async fn acceptor_task(listener: tokio::net::TcpListener, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
-    let gid;
-    let pid;
+    let self_gid;
+    let self_pid;
     let mut handles = FuturesUnordered::new();
     {
         let s = s.read().await;
-        gid = s.core.gid;
-        pid = s.core.pid;
+        self_gid = s.core.gid;
+        self_pid = s.core.pid;
     }
     eprintln!("accepting connections at {:?}", listener.local_addr());
     loop {
         tokio::select! {
             Ok((sock, _addr)) = listener.accept() => {
                 sock.set_nodelay(true).unwrap();
-                handles.push(AbortHandle::spawn(handle_connection((gid, pid), sock, s.clone())));
+                handles.push(AbortHandle::spawn(handle_connection((self_gid, self_pid), sock, s.clone())));
             }
             Err(err) = listener.accept() => {
                 panic!("error accepting new connections: {}", err);
@@ -796,7 +815,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
     };
 
     // send log entries as they become available
-    let mut ack_rx = s.read().await.ack_rx.clone();
+    let mut ack_rx = s.read().await.ack_rx[&self_gid].clone();
     let mut to_send = vec![];
     let mut last_clock_sent = 0;
     loop {
@@ -889,7 +908,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                             let old_clock = s.core.clock();
                             s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
                             if clock > old_clock {
-                                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                                s.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = s.core.clock());
                             }
                             s.update_tx.send(())?;
                         }
@@ -904,23 +923,23 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
 /// Fetch remote log entries from a replica in another group.
 async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     eprintln!("fetching remote log from {:?}:{:?}", remote_gid, remote_peer.pid);
-    let gid;
-    let pid;
+    let self_gid;
+    let self_pid;
     let epoch;
     let next_idx;
     {
         let s = s.read().await;
-        gid = s.core.gid;
-        pid = s.core.pid;
+        self_gid = s.core.gid;
+        self_pid = s.core.pid;
         (epoch, next_idx) = s.core.remote_expected_entry(remote_gid);
     }
     use Message::*;
     let req = RemoteLogRequest {
-        dest: gid,
+        dest: self_gid,
         log_epoch: epoch,
         next_idx,
     };
-    let mut conn = Conn::request((gid, pid), (remote_gid, remote_peer.pid), remote_peer.addr(), req).await?;
+    let mut conn = Conn::request((self_gid, self_pid), (remote_gid, remote_peer.pid), remote_peer.addr(), req).await?;
 
     let mut msgs = vec![];
     while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
@@ -947,7 +966,7 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
             }
             let new_clock = s.core.clock();
             if new_clock > old_clock {
-                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                s.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = s.core.clock());
             }
             s.update_tx.send(())?;
         }
@@ -984,7 +1003,7 @@ async fn acks_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Erro
                 }
             }
             if s.core.clock() > old_clock {
-                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                s.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = s.core.clock());
             }
             s.update_tx.send(())?;
         }
@@ -1022,7 +1041,7 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
                 }
             }
             if s.core.clock() > old_clock {
-                s.ack_tx.send_modify(|(_, _, clock)| *clock = s.core.clock());
+                s.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = s.core.clock());
             }
             s.update_tx.send(())?;
         }
@@ -1033,12 +1052,7 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
 /// Send acks to the incoming connection.
 /// If send_bump is false, don't send ack on "clock only" updates.
 async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>, send_bump: bool) -> Result<(), Error> {
-    // TODO: currently, we're sending acks to remote groups even when not
-    // needed. An ack only needs to be sent to a remote group if an entry
-    // destined to that group has been appended. We're still genuine in the
-    // sense that these "extra" acks don't matter for delivery, they are only
-    // being sent because its simpler to.
-    let mut ack_rx = s.read().await.ack_rx.clone();
+    let mut ack_rx = s.read().await.ack_rx[&conn.gid()].clone();
     use Message::*;
     let last_ack = None;
     let last_clock = 0;
@@ -1067,7 +1081,7 @@ async fn remote_log_send(
     s: Arc<RwLock<Shared>>,
 ) -> Result<(), Error> {
     eprintln!("sending remote logs for {dest:?} starting at {next_idx:?}");
-    let mut ack_rx = s.read().await.ack_rx.clone();
+    let mut ack_rx = s.read().await.ack_rx[&dest].clone();
     use Message::*;
     let mut to_send = vec![];
     loop {
