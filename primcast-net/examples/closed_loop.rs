@@ -53,13 +53,17 @@ struct Args {
     #[clap(long, default_value_t = 2)]
     global_dests: u8,
 
-    /// stats printing interval in seconds
-    #[clap(long, default_value_t = 1)]
-    stats_secs: u64,
+    /// print stats to stdout every N seconds
+    #[clap(long)]
+    stats: Option<u64>,
 
     /// use single-threaded executor
     #[clap(long)]
     single_thread: bool,
+
+    /// write deliveries to stdout
+    #[clap(long)]
+    check: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,7 +72,7 @@ struct Payload {
     sender: (Gid, Pid),
 }
 
-/// Print stats every INTERVAL_SECS
+/// Periodically print stats
 async fn print_stats(
     secs: u64,
     all: Arc<Mutex<Histogram<u64>>>,
@@ -102,16 +106,20 @@ async fn print_stats(
 fn main() {
     let args = Args::parse();
     let cfg = Config::load(&args.cfg).unwrap();
+    let mut cmd = Args::command(); // just to call .error()
 
     if args.globals < 0.0 || args.globals > 1.0 {
-        let mut cmd = Args::command();
         cmd.error(clap::ErrorKind::InvalidValue, "globals percentage must be a value between 0.0 and 1.0")
             .exit()
     }
     if args.global_dests < 1 || args.global_dests as usize > cfg.groups.len() {
-        let mut cmd = Args::command();
         cmd.error(clap::ErrorKind::InvalidValue, "global-dests larger than the number of groups in the configuration")
             .exit()
+    }
+    if let Some(secs) = args.stats {
+        if secs == 0 {
+            cmd.error(clap::ErrorKind::InvalidValue, "stats can't be 0").exit()
+        }
     }
 
     let gid = Gid(args.gid);
@@ -136,13 +144,13 @@ fn main() {
         .collect();
 
     let rt = if args.single_thread {
-        println!("running single-threaded executor");
+        eprintln!("running single-threaded executor");
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
     } else {
-        println!("running multi-threaded executor");
+        eprintln!("running multi-threaded executor");
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -160,7 +168,9 @@ fn main() {
         tokio::time::sleep(Duration::from_secs(4)).await; // wait for things to settle...
 
         // print stats
-        tokio::spawn(print_stats(args.stats_secs, hist.clone(), hist_locals.clone(), hist_globals.clone()));
+        if let Some(secs) = args.stats {
+            tokio::spawn(print_stats(secs, hist.clone(), hist_locals.clone(), hist_globals.clone()));
+        }
 
         // can't serialize Instant, so we use Duration from start
         let start = Instant::now();
@@ -192,7 +202,10 @@ fn main() {
         });
 
         // handle deliveries
-        while let Some((_ts, _id, msg, dest)) = delivery_rx.recv().await {
+        while let Some((ts, id, msg, dest)) = delivery_rx.recv().await {
+            if args.check {
+                println!("{ts} {id} {dest:?} DELIVERY");
+            }
             let payload: Payload = bincode::deserialize(&msg).unwrap();
             // if our msg, record latency and release another proposal
             if (gid, pid) == payload.sender {

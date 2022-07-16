@@ -11,6 +11,7 @@ rand = "0.8"
 
 rustc-hash = "1.1.0"
 # fnv = "1.0"
+priority-queue = "1.2"
 smallvec = { version = "1.8", features = ["serde"] }
 parse-config = { version = "0.12", package = "config" }
 serde = { version = "1", features = ["derive", "rc"] }

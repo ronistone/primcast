@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn config_test() {
-        let config = Config::load("../example.yaml").unwrap();
+        let config = Config::load("../example_2_groups.yaml").unwrap();
 
         assert!(config.group(Gid(0)).is_some());
         assert!(config.group(Gid(1)).is_some());

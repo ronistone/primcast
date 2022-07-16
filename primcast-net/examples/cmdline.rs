@@ -9,7 +9,6 @@ use serde::Serialize;
 
 use clap::Parser;
 
-use rand::seq::SliceRandom;
 use rand::Rng;
 use std::time::Instant;
 
@@ -33,6 +32,7 @@ struct Args {
 struct Payload {
     amcast_at: Duration,
     sender: (Gid, Pid),
+    msg: String,
 }
 
 fn main() {
@@ -48,24 +48,29 @@ fn main() {
     let mut rng = rand::thread_rng();
     let start = Instant::now();
 
+    let (proposal_tx, mut proposal_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // read proposals from stdin
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            if let Err(_) = line {
+                return;
+            }
+            let line = line.unwrap();
+            let parts: Vec<_> = line.split(":").collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let dests: GidSet = parts[0].split_whitespace().map(|g| Gid(g.parse().unwrap())).collect();
+            let msg: String = parts[1..].join(":");
+            proposal_tx.send((dests, msg)).unwrap();
+        }
+    });
+
     rt.block_on(async {
         let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg);
-        let dest0: GidSet = [Gid(0)].into_iter().collect();
-        let dest1: GidSet = [Gid(1)].into_iter().collect();
-        let dest0_1: GidSet = [Gid(0), Gid(1)].into_iter().collect();
         tokio::time::sleep(Duration::from_secs(2)).await; // wait for things to settle...
 
-        // if (args.gid,args.pid) == (0, 0) {
-        //     loop {
-        //         // tokio::time::sleep(Duration::from_millis(1)).await;
-        //         let id: MsgId = rand::random();
-        //         handle.propose(id, format!("{:?}", id).into_bytes(), dest.clone()).await.unwrap();
-        //     }
-        // } else {
-        //     futures::future::pending::<()>().await;
-        // }
-
-        // println!("DELIVERY - final_ts:{:?} dest:{:?} msg_id:{:?}", d.final_ts.unwrap(), &d.dest, d.msg_id);
         let mut rx = handle.take_delivery_rx().unwrap();
         tokio::spawn(async move {
             while let Some((ts, id, msg, dest)) = rx.recv().await {
@@ -74,28 +79,30 @@ fn main() {
                     let now = Instant::now() - start;
                     let lat = now - payload.amcast_at;
                     println!(
-                        "DELIVERY - final_ts:{:?} dest:{:?} msg_id:{:?} after {}usec",
+                        "DELIVERY: \"{}\" - final_ts:{:?} dest:{:?} msg_id:{:?} after {}usec",
+                        payload.msg,
                         ts,
                         dest,
                         id,
                         lat.as_micros()
                     );
                 } else {
-                    println!("DELIVERY - final_ts:{:?} dest:{:?} msg_id:{:?}", ts, dest, id);
+                    println!("DELIVERY: \"{}\" - final_ts:{:?} dest:{:?} msg_id:{:?}", payload.msg, ts, dest, id);
                 }
             }
         });
 
-        loop {
+        while let Some((dest, msg)) = proposal_rx.recv().await {
             // tokio::time::sleep(Duration::from_millis(1)).await;
+            println!("sending multicast to {:?}", dest);
             let id: MsgId = rng.gen();
-            let dest = *[&dest0_1, &dest0, &dest1].choose(&mut rng).unwrap();
             let payload = Payload {
                 amcast_at: Instant::now() - start,
                 sender: (Gid(args.gid), Pid(args.pid)),
+                msg,
             };
             handle
-                .propose(id, bincode::serialize(&payload).unwrap().into(), dest.clone())
+                .propose(id, bincode::serialize(&payload).unwrap().into(), dest)
                 .await
                 .unwrap();
             tokio::task::yield_now().await;

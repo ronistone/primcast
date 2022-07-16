@@ -1,33 +1,40 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 STATS_SECS=1
 BUILD="target/debug"
-CONFIG="example.yaml"
 OPT="$@"
 OUTSTANDING=1
 GLOBAL_DESTS=2
 GLOBALS=0.0
 SINGLE_THREAD=""
+CHECK=0
+
+CONFIG="example_3_groups.yaml"
+GIDS=3
+PIDS=3
 
 
 tmux_test ()  {
     tmux new-session -d -s primcast
     tmux new-window -t primcast
 
-    for (( i = 0; i < 5; i++ )); do
+    for (( i = 0; i < (GIDS * PIDS) - 1; i++ )); do
         tmux split
         tmux select-layout even-vertical
     done
 
     FIRST_PANE_NUMBER=`tmux list-panes | head -1 | cut -d':' -f1`
 
-    for (( g = 0; g < 2; g++ )); do
-        for (( i = 0; i < 3; i++ )); do
+    for (( g = 0; g < $GIDS; g++ )); do
+        for (( i = 0; i < $PIDS; i++ )); do
             CMD="$VG ./$BUILD/examples/closed_loop \
                       --gid $g --pid $i --cfg $CONFIG \
                       --global-dests $GLOBAL_DESTS --globals $GLOBALS \
-                      -o $OUTSTANDING --stats-secs $STATS_SECS $SINGLE_THREAD"
-            tmux send-keys -t $(( $g * 3 + $i + $FIRST_PANE_NUMBER )) "$CMD" C-m
+                      -o $OUTSTANDING --stats $STATS_SECS $SINGLE_THREAD"
+            if (( CHECK != 0 )); then
+                CMD="$CMD --check > out_${g}_${i}.txt"
+            fi
+            tmux send-keys -t $(( $g * $GIDS + $i + $FIRST_PANE_NUMBER )) "$CMD" C-m
         done
     done
 
@@ -45,10 +52,6 @@ while [[ $# > 0 ]]; do
         --release)
             BUILD="target/release"
             ;;
-        --cfg)
-            CONFIG=$2
-            shift
-            ;;
         -o)
             OUTSTANDING=$2
             shift
@@ -63,6 +66,9 @@ while [[ $# > 0 ]]; do
             ;;
         --single-thread)
             SINGLE_THREAD="--single-thread"
+            ;;
+        --check)
+            CHECK=1
             ;;
         -h|--help)
             usage

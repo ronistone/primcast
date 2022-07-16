@@ -1,15 +1,5 @@
-pub mod clock;
-pub mod config;
-pub mod remote_learner;
-pub mod types;
-
 use bytes::Bytes;
 
-use crate::clock::LogicalClock;
-use crate::config::Config;
-use crate::types::*;
-
-use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -20,6 +10,17 @@ pub use remote_learner::RemoteEntry;
 use remote_learner::RemoteLearner;
 use serde::Deserialize;
 use serde::Serialize;
+
+pub mod clock;
+pub mod config;
+mod pending;
+pub mod remote_learner;
+pub mod types;
+
+use clock::LogicalClock;
+use config::Config;
+use pending::PendingSet;
+use types::*;
 
 // TODO: how to avoid MsgId conflicts? Right now we just assume random u128 won't collide.
 // The id must be picked by the proposer. If we assume only replicas are proposers, we could use gid+pid+sequence.
@@ -39,7 +40,7 @@ pub enum ReplicaState {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LogEntry {
-    pub ts: Clock,
+    pub local_ts: Clock,
     pub msg_id: MsgId,
     pub msg: Bytes,
     pub dest: GidSet,
@@ -49,34 +50,12 @@ pub struct LogEntry {
 impl std::fmt::Debug for LogEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogEntry")
-            .field("ts", &self.ts)
+            .field("ts", &self.local_ts)
             .field("msg_id", &self.msg_id)
             .field("msg_len", &self.msg.len())
             .field("dest", &self.dest)
             .field("final_ts", &self.final_ts)
             .finish()
-    }
-}
-
-#[derive(Clone)]
-/// Pending message information needed to track delivery
-struct PendingMsg {
-    id: MsgId,
-    dest: GidSet,
-    /// current minimum final ts.
-    min_ts: Clock,
-    /// group ts still to be decided
-    missing_group_ts: GidSet,
-    last_modified: Instant,
-}
-
-impl PendingMsg {
-    fn final_ts(&self) -> Option<Clock> {
-        if self.missing_group_ts.is_empty() {
-            Some(self.min_ts)
-        } else {
-            None
-        }
     }
 }
 
@@ -103,14 +82,9 @@ pub struct GroupReplica {
     /// Msgid to log idx.
     /// TODO: The mapping grows proportionally to the log. Should we do it differently?
     msgid_to_idx: HashMap<MsgId, u64>,
-
-    /// Msgs not yet delivered which we know of. Delivered is (msgid_to_idx / pending).
-    /// Best to do it like this then having an ever growing "delivered" set.
-    pending: HashMap<MsgId, PendingMsg>,
-    /// Id of pending messsages which have been proposed in the local group
-    /// (i.e., present in the log), in min_ts order.
-    /// Only msgs present here can block deliveries.
-    pending_ts: BTreeSet<(Clock, MsgId)>,
+    /// Msgs which we know about that have not yet been delivered.
+    /// We don't keep an explicit set of delivered msgs: the set of delivered msgs is (msgid_to_idx - pending).
+    pending: PendingSet,
 
     remote_learners: HashMap<Gid, RemoteLearner>,
 
@@ -193,8 +167,7 @@ impl GroupReplica {
             current_epoch_acks,
             safe_len: 0,
             msgid_to_idx: Default::default(),
-            pending: Default::default(),
-            pending_ts: Default::default(),
+            pending: PendingSet::new(gid),
 
             leader_last_seen: Instant::now(),
             proposals: Default::default(),
@@ -218,27 +191,17 @@ impl GroupReplica {
     }
 
     pub fn print_debug_info(&mut self) {
-        println!("=================");
-        println!("log_len: {}", self.log.len());
-        println!("safe_len: {}", self.safe_len);
-        println!("acks: {:?}", self.current_epoch_acks);
-        println!("clock: {:?}", self.clock());
-        println!("min_clock_leader: {:?}", self.min_clock_leader());
-        println!("min_new_epoch_ts: {:?}", self.min_new_epoch_ts());
-        // println!("pending_ts first 5: {:?}", Vec::from_iter(self.pending_ts.iter().take(5)));
-        if let Some((_, id)) = self.pending_ts.iter().next() {
-            let idx = *self.msgid_to_idx.get(id).unwrap() as usize;
-            let e = &self.log[idx];
-            let pending = self.pending.get(id).unwrap();
-            println!("next pending details:");
-            println!(
-                "   id:{} log_idx:{} ts:{} final_ts:{:?} missing:{:?}",
-                id, idx, e.ts, e.final_ts, pending.missing_group_ts
-            );
-        }
-        println!("remote learners:");
+        eprintln!("=================");
+        eprintln!("log_len: {}", self.log.len());
+        eprintln!("safe_len: {}", self.safe_len);
+        eprintln!("acks: {:?}", self.current_epoch_acks);
+        eprintln!("clock: {:?}", self.clock());
+        eprintln!("min_clock_leader: {:?}", self.min_clock_leader());
+        eprintln!("min_new_epoch_ts: {:?}", self.min_new_epoch_ts());
+        // TODO: print info about pending set
+        eprintln!("remote learners:");
         for (gid, l) in &self.remote_learners {
-            println!(
+            eprintln!(
                 "    {:?} - safe_idx:{:?} next_entry:{:?} acks:{:?}",
                 gid,
                 l.safe_idx(),
@@ -246,7 +209,7 @@ impl GroupReplica {
                 Vec::from_iter(l.remote_info()),
             );
         }
-        println!("=================");
+        eprintln!("=================");
     }
 
     pub fn current_epoch(&self) -> Epoch {
@@ -370,9 +333,7 @@ impl GroupReplica {
             while u64::try_from(self.log.len()).unwrap() > prefix_len {
                 let entry = self.log.pop().unwrap();
                 self.msgid_to_idx.remove(&entry.msg_id).expect("mapping should exist");
-                let min_ts = self.pending.get(&entry.msg_id).expect("should be pending").min_ts;
-                // no more current local ts, remote from pending_ts so it doesn't prevent other deliveries
-                assert!(self.pending_ts.remove(&(min_ts, entry.msg_id)));
+                self.pending.remove_entry_ts(entry.msg_id);
             }
 
             assert!(*last_entry <= *log_epochs.last().unwrap());
@@ -463,7 +424,7 @@ impl GroupReplica {
         }
 
         self.proposals.push_back(LogEntry {
-            ts: 0,
+            local_ts: 0,
             msg_id,
             msg,
             dest,
@@ -482,7 +443,7 @@ impl GroupReplica {
         while let Some(mut log_entry) = self.proposals.pop_front() {
             let (log_epoch, log_len) = self.log_status();
             let ts = self.clock.tick();
-            log_entry.ts = ts;
+            log_entry.local_ts = ts;
             self.append_inner(log_len, log_epoch, log_entry).unwrap();
         }
         Ok(appended)
@@ -515,7 +476,7 @@ impl GroupReplica {
             epoch,
             idx,
             msg_id: entry.msg_id,
-            ts: entry.ts,
+            ts: entry.local_ts,
             dest: entry.dest.clone(),
         })
     }
@@ -539,8 +500,6 @@ impl GroupReplica {
 
     /// Helper method for properly appending to the log
     fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<&LogEntry, Error> {
-        use std::collections::hash_map::Entry;
-
         let (log_epoch, log_len) = self.log_status();
         assert_eq!(log_len, self.log.len() as u64);
 
@@ -549,35 +508,11 @@ impl GroupReplica {
         }
 
         // add msg_id mapping
-        match self.msgid_to_idx.entry(entry.msg_id) {
-            Entry::Vacant(e) => {
-                e.insert(self.log.len() as u64);
-                match self.pending.entry(entry.msg_id) {
-                    Entry::Occupied(mut e) => {
-                        let m = e.get_mut();
-                        m.last_modified = Instant::now();
-                        debug_assert!(self.pending_ts.iter().find(|(_, id)| *id == m.id).is_none());
-                        // debug_assert!(m.missing_group_ts.len() < m.dest.len());
-                        m.min_ts = std::cmp::max(entry.ts, m.min_ts);
-                        self.pending_ts.insert((m.min_ts, m.id));
-                    }
-                    Entry::Vacant(e) => {
-                        // first time we see the msg
-                        e.insert(PendingMsg {
-                            id: entry.msg_id,
-                            dest: entry.dest.clone(),
-                            min_ts: entry.ts,
-                            missing_group_ts: entry.dest.clone(),
-                            last_modified: Instant::now(),
-                        });
-                        self.pending_ts.insert((entry.ts, entry.msg_id));
-                    }
-                }
-            }
-            Entry::Occupied(_) => {
-                panic!("unexpected msg_id present");
-            }
-        }
+        assert!(
+            self.msgid_to_idx.insert(entry.msg_id, self.log.len() as u64).is_none(),
+            "msg_id should not be present"
+        );
+        self.pending.add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts);
 
         // add to log_epochs
         if log_epoch == entry_epoch {
@@ -587,8 +522,8 @@ impl GroupReplica {
         }
 
         // add to log
-        assert!(entry.ts <= self.clock.local());
-        assert!(self.log.last().is_none() || self.log.last().unwrap().ts < entry.ts);
+        assert!(entry.local_ts <= self.clock.local());
+        assert!(self.log.last().is_none() || self.log.last().unwrap().local_ts < entry.local_ts);
         self.log.push(entry);
 
         // update own ack
@@ -617,7 +552,7 @@ impl GroupReplica {
         }
 
         self.leader_last_seen = Instant::now();
-        self.clock.update(epoch.owner(), epoch, entry.ts);
+        self.clock.update(epoch.owner(), epoch, entry.local_ts);
         self.append_inner(idx, epoch, entry)
     }
 
@@ -685,59 +620,23 @@ impl GroupReplica {
         let safe_len_from_acks = self.current_epoch_acks[self.group_size - self.quorum_size].0;
         let safe_len = std::cmp::min(std::cmp::max(self.safe_len, safe_len_from_acks), self.log.len() as u64);
         for entry in &mut self.log[self.safe_len as usize..safe_len as usize] {
-            let p = self.pending.get_mut(&entry.msg_id).unwrap();
-            assert_eq!(p.id, entry.msg_id);
-            assert!(p.missing_group_ts.remove(self.gid));
-            p.last_modified = Instant::now();
+            self.pending
+                .add_group_ts(entry.msg_id, &entry.dest, self.gid, entry.local_ts);
         }
         self.safe_len = safe_len;
 
         // update from remote learners
         for (gid, l) in &mut self.remote_learners {
             l.update();
-            while let Some((id, dest, ts)) = l.next_delivery() {
-                use std::collections::hash_map::Entry;
-                match self.pending.entry(id) {
-                    Entry::Occupied(mut e) => {
-                        // update existing pending state
-                        let e = e.get_mut();
-                        e.last_modified = Instant::now();
-                        assert!(e.missing_group_ts.remove(*gid));
-                        let old_min_ts = e.min_ts;
-                        e.min_ts = std::cmp::max(e.min_ts, ts);
-                        // update ordered ts if present
-                        if self.pending_ts.remove(&(old_min_ts, e.id)) {
-                            self.pending_ts.insert((e.min_ts, e.id));
-                        }
-                    }
-                    Entry::Vacant(e) => {
-                        // create new pending state
-                        let e = e.insert(PendingMsg {
-                            id,
-                            dest: dest.clone(),
-                            min_ts: ts,
-                            missing_group_ts: dest,
-                            last_modified: Instant::now(),
-                        });
-                        e.missing_group_ts.remove(*gid);
-                    }
-                }
+            while let Some((msg_id, dest, ts)) = l.next_delivery() {
+                self.pending.add_group_ts(msg_id, &dest, *gid, ts);
             }
         }
     }
 
     /// Returns the list of messages with some decided remote timestamp but not proposed locally yet.
     pub fn missing_local_ts(&mut self) -> Vec<(MsgId, GidSet)> {
-        self.pending
-            .iter()
-            .filter_map(|(msg_id, p)| {
-                if self.msgid_to_idx.contains_key(msg_id) {
-                    Some((*msg_id, p.dest.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.pending.missing_entry_ts()
     }
 
     pub fn min_clock_leader(&self) -> Clock {
@@ -750,17 +649,17 @@ impl GroupReplica {
 
     /// Returns the next delivery (if any) in final timestamp order
     pub fn next_delivery(&mut self) -> Option<LogEntry> {
-        let (ts, id) = self.pending_ts.iter().cloned().next()?;
-        use std::collections::hash_map::Entry;
-        if let Entry::Occupied(mut e) = self.pending.entry(id) {
-            if let Some(final_ts) = e.get_mut().final_ts() {
-                assert_eq!(final_ts, ts);
-                self.pending_ts.remove(&(ts, id));
-                e.remove();
-                let log_entry = self.log_entry_mut(self.msgid_to_idx[&id]).unwrap();
-                log_entry.final_ts = Some(ts);
-                return Some(log_entry.clone());
-            }
+        let (final_ts, id) = self.pending.peek_next_smallest()?;
+        let min_new_epoch_ts = self.min_new_epoch_ts();
+        // TODO: DIRTY HACK!!! temporary fix before we ensure FIFO order betwen leader appends and acks
+        // let min_clock_leader = self.min_clock_leader();
+        let min_clock_leader = self.log.iter().last().unwrap().local_ts;
+        if final_ts <= min_clock_leader && final_ts <= min_new_epoch_ts {
+            self.pending.pop_next_smallest();
+            let log_entry = self.log_entry_mut(self.msgid_to_idx[&id]).unwrap();
+            debug_assert!(log_entry.local_ts <= final_ts);
+            log_entry.final_ts = Some(final_ts);
+            return Some(log_entry.clone());
         }
         None
     }
@@ -939,12 +838,9 @@ mod tests {
             // local group timestamp is quorum safe
             assert_eq!(r.safe_len, 1);
             // check that final_ts is learned
-            let (pending_ts, pending_id) = r.pending_ts.iter().next().unwrap();
-            assert_eq!(*pending_id, id);
-            assert_eq!(*pending_ts, 4);
-            let p = r.pending.get(pending_id).unwrap();
-            assert_eq!(p.min_ts, 4);
-            assert_eq!(p.final_ts(), Some(4));
+            let (pending_ts, pending_id) = r.pending.peek_next_smallest().unwrap();
+            assert_eq!(pending_id, id);
+            assert_eq!(pending_ts, 4);
             // check that final_ts is safe for delivery
             assert_eq!(r.min_clock_leader(), 4);
             assert!(r.min_new_epoch_ts() > 4);
