@@ -651,9 +651,7 @@ impl GroupReplica {
     pub fn next_delivery(&mut self) -> Option<LogEntry> {
         let (final_ts, id) = self.pending.peek_next_smallest()?;
         let min_new_epoch_ts = self.min_new_epoch_ts();
-        // TODO: DIRTY HACK!!! temporary fix before we ensure FIFO order betwen leader appends and acks
-        // let min_clock_leader = self.min_clock_leader();
-        let min_clock_leader = self.log.iter().last().unwrap().local_ts;
+        let min_clock_leader = self.min_clock_leader();
         if final_ts <= min_clock_leader && final_ts <= min_new_epoch_ts {
             self.pending.pop_next_smallest();
             let log_entry = self.log_entry_mut(self.msgid_to_idx[&id]).unwrap();

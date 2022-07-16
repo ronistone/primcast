@@ -476,10 +476,11 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     };
     tokio::pin!(send_acks_task);
 
-    // fetch acks from other replicas in group
+    // fetch acks from other replicas in group (except from the primary).
+    // To ensure FIFO between appends/acks/bumps, those must come from the same primary connection.
     let mut fetch_acks_tasks = FuturesUnordered::new();
     for p in &cfg.group(gid).unwrap().peers {
-        if p.pid != pid {
+        if p.pid != pid && p.pid != conn_rx.pid() {
             let p = p.clone();
             let s = s.clone();
             let task = async move {
@@ -541,6 +542,13 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                     }) => {
                         s.core.start_epoch_accept(epoch, prev_entry, clock)?;
                     }
+                    Ok(Message::Ack {
+                        log_epoch,
+                        log_len,
+                        clock,
+                    }) => {
+                        s.core.add_ack(conn_rx.pid(), log_epoch, log_len, clock)?;
+                    }
                     Ok(m) => panic!("unexpected message {:?}", m),
                     Err(err) => break 'recv err,
                 }
@@ -570,8 +578,7 @@ async fn acceptor_task(listener: tokio::net::TcpListener, s: Arc<RwLock<Shared>>
     eprintln!("accepting connections at {:?}", listener.local_addr());
     loop {
         tokio::select! {
-            Ok((sock, addr)) = listener.accept() => {
-                eprintln!("new connection from {addr:?}");
+            Ok((sock, _addr)) = listener.accept() => {
                 sock.set_nodelay(true).unwrap();
                 handles.push(AbortHandle::spawn(handle_connection((gid, pid), sock, s.clone())));
             }
@@ -593,10 +600,10 @@ async fn handle_connection(
     let mut conn = Conn::incoming(self_id, sock).await?;
     match conn.recv().await? {
         Message::AckRequest => {
-            ack_send(conn, s.clone()).await?;
+            ack_send(conn, s.clone(), true).await?;
         }
         Message::RemoteAckRequest => {
-            ack_send(conn, s.clone()).await?;
+            ack_send(conn, s.clone(), false).await?;
         }
         Message::RemoteLogRequest {
             dest,
@@ -655,6 +662,7 @@ async fn handle_connection(
                 }
             }
             // forward proposals to main loop
+            eprintln!("receiving proposals from {:?}:{:?}", conn.gid(), conn.pid());
             let mut msgs = vec![];
             while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
                 for msg in msgs.drain(..) {
@@ -790,8 +798,8 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
     // send log entries as they become available
     let mut ack_rx = s.read().await.ack_rx.clone();
     let mut to_send = vec![];
+    let mut last_clock_sent = 0;
     loop {
-        // lock the state and gather available (not yet sent) entries, at most BATCH_SIZE_YIELD
         {
             let s = s.read().await;
             let (promised_epoch, _) = s.core.state();
@@ -800,6 +808,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                 // replica changed epochs, stop task
                 return Ok(());
             }
+            // gather entries to be sent (up to BATCH_SIZE_YIELD)
             while follower_log_len < log_len {
                 let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
                 if follower_log_epoch < epoch && epoch == e {
@@ -818,13 +827,26 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                 });
                 follower_log_epoch = epoch;
                 follower_log_len += 1;
+                last_clock_sent = std::cmp::max(last_clock_sent, entry.local_ts);
                 if to_send.len() >= BATCH_SIZE_YIELD {
                     break;
                 }
             }
+            // Send clock bump ack if needed (and safe to do). Acks and Appends
+            // from a primary *must be sent in ts order*. A follower can see its
+            // primary clock update ONLY IF it has received all log entries with
+            // smaller clock values.
+            if follower_log_len == log_len && s.core.clock() > last_clock_sent {
+                last_clock_sent = s.core.clock();
+                to_send.push(Ack {
+                    log_epoch,
+                    log_len,
+                    clock: last_clock_sent,
+                });
+            }
         };
 
-        // send gathered entries
+        // send gathered msgs
         for msg in to_send.drain(..) {
             conn.feed(msg).await?;
         }
@@ -845,12 +867,12 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             tokio::select! {
                 // check if there are more log entries to send
                 _ = ack_rx.changed() => {
-                    let (new_log_epoch, new_log_len, _) = *ack_rx.borrow_and_update();
+                    let (new_log_epoch, new_log_len, clock) = *ack_rx.borrow_and_update();
                     if sync_log_epoch != new_log_epoch {
                         return Ok(())
                     }
-                    if new_log_len > follower_log_len {
-                        // entries to send out
+                    if new_log_len > follower_log_len || clock > last_clock_sent {
+                        // entries or ack to send out
                         break 'wait;
                     }
                 }
@@ -1009,18 +1031,27 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
 }
 
 /// Send acks to the incoming connection.
-async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
-    eprintln!("sending acks to {:?}:{:?}", conn.gid(), conn.pid());
+/// If send_bump is false, don't send ack on "clock only" updates.
+async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>, send_bump: bool) -> Result<(), Error> {
+    // TODO: currently, we're sending acks to remote groups even when not
+    // needed. An ack only needs to be sent to a remote group if an entry
+    // destined to that group has been appended. We're still genuine in the
+    // sense that these "extra" acks don't matter for delivery, they are only
+    // being sent because its simpler to.
     let mut ack_rx = s.read().await.ack_rx.clone();
     use Message::*;
+    let last_ack = None;
+    let last_clock = 0;
     loop {
         let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
-        let ack = Ack {
-            log_epoch,
-            log_len,
-            clock,
-        };
-        conn.send(ack).await?;
+        if Some((log_epoch, log_len)) > last_ack || (send_bump && clock > last_clock) {
+            let ack = Ack {
+                log_epoch,
+                log_len,
+                clock,
+            };
+            conn.send(ack).await?;
+        }
         ack_rx.changed().await?;
     }
 }
