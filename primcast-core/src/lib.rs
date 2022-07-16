@@ -346,14 +346,15 @@ impl GroupReplica {
         }
     }
 
-    /// Append entry for recovery before accepting a new epoch
+    /// Append entry for recovery before accepting a new epoch.
+    /// Returns the new entry idx in the log.
     pub fn start_epoch_append(
         &mut self,
         epoch: Epoch,
         idx: u64,
         entry_epoch: Epoch,
         entry: LogEntry,
-    ) -> Result<&LogEntry, Error> {
+    ) -> Result<u64, Error> {
         if self.promised_epoch != epoch {
             return Err(Error::WrongEpoch {
                 expected: self.promised_epoch,
@@ -381,13 +382,14 @@ impl GroupReplica {
             return Ok(());
         }
 
-        self.clock.update(self.pid, epoch, clock);
-        self.clock.update(epoch.owner(), epoch, clock);
-
         let (_current_epoch, current_len) = self.log_status();
 
         // move current_epoch forward
         self.log_epochs.push((epoch, current_len));
+        // update clock info
+        self.clock.advance_epoch(epoch);
+        self.clock.update(self.pid, epoch, clock);
+        self.clock.update(epoch.owner(), epoch, clock);
         // reset ack info for new epoch
         for (len, pid) in self.current_epoch_acks.iter_mut() {
             *len = if *pid == self.pid || *pid == epoch.owner() {
@@ -499,7 +501,7 @@ impl GroupReplica {
     }
 
     /// Helper method for properly appending to the log
-    fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<&LogEntry, Error> {
+    fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<u64, Error> {
         let (log_epoch, log_len) = self.log_status();
         assert_eq!(log_len, self.log.len() as u64);
 
@@ -519,11 +521,14 @@ impl GroupReplica {
             self.log_epochs.last_mut().unwrap().1 += 1;
         } else {
             self.log_epochs.push((entry_epoch, 1));
+            // don't think the following ever does anything, but its safe to do.
+            self.clock.advance_epoch(entry_epoch);
         }
 
-        // add to log
-        assert!(entry.local_ts <= self.clock.local());
-        assert!(self.log.last().is_none() || self.log.last().unwrap().local_ts < entry.local_ts);
+        assert!(
+            self.log.last().is_none() || self.log.last().unwrap().local_ts < entry.local_ts,
+            "log append out of ts order"
+        );
         self.log.push(entry);
 
         // update own ack
@@ -531,11 +536,11 @@ impl GroupReplica {
         let ack = self.get_ack_mut(self.pid);
         *ack = std::cmp::max(*ack, len);
 
-        Ok(self.log.last().unwrap())
+        Ok(len - 1)
     }
 
-    /// Append log entry from the leader
-    pub fn append(&mut self, epoch: Epoch, idx: u64, entry: LogEntry) -> Result<&LogEntry, Error> {
+    /// Append log entry from the leader. Returns the entry idx the log.
+    pub fn append(&mut self, epoch: Epoch, idx: u64, entry: LogEntry) -> Result<u64, Error> {
         if self.promised_epoch > epoch || self.current_epoch() > epoch {
             return Err(Error::EpochTooOld {
                 promised: self.promised_epoch,
@@ -552,8 +557,12 @@ impl GroupReplica {
         }
 
         self.leader_last_seen = Instant::now();
-        self.clock.update(epoch.owner(), epoch, entry.local_ts);
-        self.append_inner(idx, epoch, entry)
+        let entry_ts = entry.local_ts;
+        let res = self.append_inner(idx, epoch, entry)?;
+        assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order");
+        self.clock.update(self.pid, epoch, entry_ts);
+        self.clock.update(epoch.owner(), epoch, entry_ts);
+        Ok(res)
     }
 
     /// Ack from a replica from our group.
@@ -580,8 +589,9 @@ impl GroupReplica {
         // update acked len
         let ack = self.get_ack_mut(pid);
         *ack = std::cmp::max(*ack, log_len);
-        // update clock
         self.clock.update(pid, epoch, clock);
+        // we use promised_epoch here because acks may be accepted when promised_epoch > current_epoch
+        self.clock.update(self.pid, self.promised_epoch, clock);
 
         Ok(())
     }
@@ -607,7 +617,8 @@ impl GroupReplica {
 
     /// Add information about the given remote replica
     pub fn remote_add_ack(&mut self, gid: Gid, pid: Pid, epoch: Epoch, log_len: u64, clock: u64) -> Result<(), Error> {
-        self.clock.update(pid, epoch, clock);
+        // we use promised_epoch here since the received epoch has no relation to our group
+        self.clock.update(self.pid, self.promised_epoch, clock);
         let learner = self.remote_learners.get_mut(&gid).unwrap();
         Ok(learner.add_remote_ack(gid, pid, epoch, log_len)?)
     }
@@ -643,8 +654,12 @@ impl GroupReplica {
         self.clock.get(self.current_epoch().owner())
     }
 
-    pub fn min_new_epoch_ts(&mut self) -> Clock {
-        1 + self.clock.quorum(self.quorum_size)
+    /// Minimum clock value for epochs higher than current_epoch(). When the log
+    /// is truncated, current epoch goes backward (node needs to recover state
+    /// from a peer) and we can't really use quorum clock information until the
+    /// node catches up.
+    pub fn min_new_epoch_ts(&mut self) -> Option<Clock> {
+        self.clock.quorum(self.quorum_size, self.current_epoch()).map(|c| c + 1)
     }
 
     /// Returns the next delivery (if any) in final timestamp order
@@ -652,7 +667,7 @@ impl GroupReplica {
         let (final_ts, id) = self.pending.peek_next_smallest()?;
         let min_new_epoch_ts = self.min_new_epoch_ts();
         let min_clock_leader = self.min_clock_leader();
-        if final_ts <= min_clock_leader && final_ts <= min_new_epoch_ts {
+        if final_ts <= min_clock_leader && Some(final_ts) <= min_new_epoch_ts {
             self.pending.pop_next_smallest();
             let log_entry = self.log_entry_mut(self.msgid_to_idx[&id]).unwrap();
             debug_assert!(log_entry.local_ts <= final_ts);
@@ -731,7 +746,7 @@ mod tests {
 
         assert_eq!(r0.log.len(), 3);
         assert_eq!(r0.safe_len, 2);
-        assert_eq!(r0.clock.quorum(r0.quorum_size), 2);
+        assert_eq!(r0.clock.quorum(r0.quorum_size, epoch), Some(2));
     }
 
     #[test]
@@ -841,7 +856,7 @@ mod tests {
             assert_eq!(pending_ts, 4);
             // check that final_ts is safe for delivery
             assert_eq!(r.min_clock_leader(), 4);
-            assert!(r.min_new_epoch_ts() > 4);
+            assert!(r.min_new_epoch_ts() > Some(4));
 
             // thus, msg should be deliverable
             let entry = r.next_delivery().unwrap();
@@ -849,9 +864,5 @@ mod tests {
             assert_eq!(entry.msg_id, id);
             assert!(r.next_delivery().is_none());
         }
-    }
-
-    fn group_replica_epoch_change() {
-        unimplemented!()
     }
 }
