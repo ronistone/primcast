@@ -52,6 +52,10 @@ struct Args {
     #[clap(long, default_value_t = 2)]
     global_dests: u8,
 
+    /// print debug info every N seconds
+    #[clap(long)]
+    debug: Option<u64>,
+
     /// print stats to stdout every N seconds
     #[clap(long)]
     stats: Option<u64>,
@@ -158,7 +162,7 @@ fn main() {
     };
 
     rt.block_on(async {
-        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg);
+        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, args.debug);
         let mut delivery_rx = handle.take_delivery_rx().unwrap();
 
         let hist = Arc::new(Mutex::new(Histogram::<u64>::new(3).unwrap()));

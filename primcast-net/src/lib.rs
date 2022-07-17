@@ -141,7 +141,7 @@ impl PrimcastHandle {
 }
 
 impl PrimcastReplica {
-    pub fn start(gid: Gid, pid: Pid, cfg: config::Config) -> PrimcastHandle {
+    pub fn start(gid: Gid, pid: Pid, cfg: config::Config, debug: Option<u64>) -> PrimcastHandle {
         let core = GroupReplica::new(gid, pid, cfg.clone());
         let (log_epoch, log_len) = core.log_status();
         let clock = core.clock();
@@ -188,7 +188,7 @@ impl PrimcastReplica {
             gid_proposal_tx.insert(g.gid, tx);
         }
 
-        tokio::spawn(s.run(delivery_tx));
+        tokio::spawn(s.run(delivery_tx, debug));
         PrimcastHandle {
             _shutdown: shutdown_handle,
             delivery_rx: Some(delivery_rx),
@@ -196,7 +196,11 @@ impl PrimcastReplica {
         }
     }
 
-    async fn run(mut self, delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet)>) -> Result<(), Error> {
+    async fn run(
+        mut self,
+        delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet)>,
+        debug: Option<u64>,
+    ) -> Result<(), Error> {
         eprintln!("starting replica {:?}:{:?}", self.gid, self.pid);
 
         // start acceptor task
@@ -205,16 +209,16 @@ impl PrimcastReplica {
 
         let mut abort_handles = vec![];
 
-        // {
-        //     // debug printing
-        //     let s = self.shared.clone();
-        //     abort_handles.push(AbortHandle::spawn(async move {
-        //         loop {
-        //             tokio::time::sleep(Duration::from_secs(2)).await;
-        //             s.write().await.core.print_debug_info();
-        //         }
-        //     }));
-        // }
+        if let Some(secs) = debug {
+            // debug printing
+            let s = self.shared.clone();
+            abort_handles.push(AbortHandle::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    s.write().await.core.print_debug_info();
+                }
+            }));
+        }
 
         // task accepting connections
         abort_handles.push(AbortHandle::spawn(acceptor_task(listener, self.shared.clone())));

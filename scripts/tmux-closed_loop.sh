@@ -8,6 +8,7 @@ GLOBAL_DESTS=2
 GLOBALS=0.0
 SINGLE_THREAD=""
 CHECK=0
+DEBUG=""
 
 CONFIG="example_3_groups.yaml"
 GIDS=3
@@ -30,7 +31,7 @@ tmux_test ()  {
             CMD="$VG ./$BUILD/examples/closed_loop \
                       --gid $g --pid $i --cfg $CONFIG \
                       --global-dests $GLOBAL_DESTS --globals $GLOBALS \
-                      -o $OUTSTANDING --stats $STATS_SECS $SINGLE_THREAD"
+                      -o $OUTSTANDING --stats $STATS_SECS $SINGLE_THREAD $DEBUG"
             if (( CHECK != 0 )); then
                 CMD="$CMD --check > out_${g}_${i}.txt"
             fi
@@ -69,6 +70,10 @@ while [[ $# > 0 ]]; do
             ;;
         --check)
             CHECK=1
+            ;;
+        --debug)
+            DEBUG="--debug $2"
+            shift
             ;;
         -h|--help)
             usage
