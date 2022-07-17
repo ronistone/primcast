@@ -37,9 +37,9 @@ struct Args {
     #[clap(long, short)]
     pid: u32,
 
-    /// outstanding messages
+    /// messages to send out per second
     #[clap(long, short, default_value_t = 1)]
-    outstanding: usize,
+    msgs_per_sec: usize,
 
     /// config file
     #[clap(long, short)]
@@ -121,6 +121,7 @@ fn main() {
             cmd.error(clap::ErrorKind::InvalidValue, "stats can't be 0").exit()
         }
     }
+    let msgs_per_millis = args.msgs_per_sec as f64 / 1000.0;
 
     let gid = Gid(args.gid);
     let pid = Pid(args.pid);
@@ -175,29 +176,33 @@ fn main() {
         // can't serialize Instant, so we use Duration from start
         let start = Instant::now();
 
-        // release outstanding msgs
-        let outstanding = Arc::new(Semaphore::new(args.outstanding));
-
         // proposal sender
-        let outstanding_consumer = outstanding.clone();
         tokio::spawn(async move {
+            let mut sent = 0.0;
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let start = Instant::now();
             let mut rng = StdRng::from_entropy();
-            while let Ok(permit) = outstanding_consumer.acquire().await {
-                permit.forget(); // delivery will create more permits
-                let id: MsgId = rng.gen();
-                let dest: GidSet = if rng.gen_bool(args.globals) {
-                    // global msg
-                    global_dests.choose(&mut rng).cloned().unwrap()
-                } else {
-                    // local msg
-                    local_dest.clone()
-                };
-                let payload = Payload {
-                    amcast_at: Instant::now() - start,
-                    sender: (gid, pid),
-                };
-                let msg: Bytes = bincode::serialize(&payload).unwrap().into();
-                handle.propose(id, msg.into(), dest).await.unwrap();
+            loop {
+                let d = Instant::now() - start;
+                let expected = d.as_millis() as f64 * msgs_per_millis;
+                while sent < expected {
+                    let id: MsgId = rng.gen();
+                    let dest: GidSet = if rng.gen_bool(args.globals) {
+                        // global msg
+                        global_dests.choose(&mut rng).cloned().unwrap()
+                    } else {
+                        // local msg
+                        local_dest.clone()
+                    };
+                    let payload = Payload {
+                        amcast_at: Instant::now() - start,
+                        sender: (gid, pid),
+                    };
+                    let msg: Bytes = bincode::serialize(&payload).unwrap().into();
+                    handle.propose(id, msg.into(), dest).await.unwrap();
+                    sent += 1.0;
+                }
+                interval.tick().await;
             }
         });
 
@@ -218,8 +223,6 @@ fn main() {
                 } else {
                     hist_globals.lock().await.record(lat_usec).unwrap();
                 }
-                // allow next proposal
-                outstanding.add_permits(1);
             }
         }
     })
