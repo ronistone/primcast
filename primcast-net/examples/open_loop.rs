@@ -3,7 +3,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
 
 use bytes::Bytes;
 
