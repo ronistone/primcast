@@ -150,6 +150,7 @@ impl PendingSet {
     }
 
     /// Return next smallest pending ts, but only if it is the final timestamp.
+    #[cfg(test)]
     pub fn peek_next_smallest(&mut self) -> Option<(Clock, MsgId)> {
         let (_, Reverse((ts, msg_id))) = self.ts_order.peek()?;
         let final_ts = self.all.get(&msg_id).unwrap().final_ts()?;
