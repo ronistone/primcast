@@ -273,29 +273,6 @@ impl PrimcastReplica {
             loop {
                 tokio::select! {
                     // biased;
-                    _ = &mut shutdown => break 'main,
-                    n = self.proposal_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals) => {
-                        // handle next batch of proposals
-                        debug_assert!(proposals.len() <= BATCH_SIZE_YIELD);
-                        debug_assert!(proposals.len() == n);
-
-                        let mut s = self.shared.write().await;
-                        for (msg_id, msg, dest) in proposals.drain(..) {
-                            ack_dests.merge(&dest);
-                            match s.core.add_proposal(msg_id, msg, dest) {
-                                Ok(_) => (),
-                                Err(err) => eprintln!("error queuing proposal {msg_id}: {err:?}"),
-                            }
-                        }
-                        if let Err(err) = s.core.propose() {
-                            eprintln!("error proposing: {err:?}");
-                        }
-                        let (log_epoch, log_len) = s.core.log_status();
-                        let clock = s.core.clock();
-                        for gid in ack_dests.0.drain(..) {
-                            s.ack_tx[&gid].send((log_epoch, log_len, clock))?;
-                        }
-                    }
                     _ = &mut fut => {
                         // when the main task resolves, become idle
                         let (e, state) = self.shared.read().await.core.state();
@@ -327,6 +304,29 @@ impl PrimcastReplica {
                             }
                         }
                     }
+                    n = self.proposal_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals) => {
+                        // handle next batch of proposals
+                        debug_assert!(proposals.len() <= BATCH_SIZE_YIELD);
+                        debug_assert!(proposals.len() == n);
+
+                        let mut s = self.shared.write().await;
+                        for (msg_id, msg, dest) in proposals.drain(..) {
+                            ack_dests.merge(&dest);
+                            match s.core.add_proposal(msg_id, msg, dest) {
+                                Ok(_) => (),
+                                Err(err) => eprintln!("error queuing proposal {msg_id}: {err:?}"),
+                            }
+                        }
+                        if let Err(err) = s.core.propose() {
+                            eprintln!("error proposing: {err:?}");
+                        }
+                        let (log_epoch, log_len) = s.core.log_status();
+                        let clock = s.core.clock();
+                        for gid in ack_dests.0.drain(..) {
+                            s.ack_tx[&gid].send((log_epoch, log_len, clock))?;
+                        }
+                    }
+                    _ = &mut shutdown => break 'main,
                 }
             }
         }
@@ -883,6 +883,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
         // otherwise, wait for more entries to become available and read acks from follower
         'wait: loop {
             tokio::select! {
+                // biased;
                 // check if there are more log entries to send
                 _ = ack_rx.changed() => {
                     let (new_log_epoch, new_log_len, clock) = *ack_rx.borrow_and_update();
