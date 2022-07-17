@@ -157,9 +157,13 @@ impl PendingSet {
         return Some((*ts, *msg_id));
     }
 
-    /// Remove and return the pending msg with the smallest ts, but only if it is the final timestamp.
-    pub fn pop_next_smallest(&mut self) -> Option<(Clock, MsgId)> {
+    /// Remove and return the pending msg with the smallest ts, but only if it
+    /// is the final timestamp and it's smaller than min_new_proposal.
+    pub fn pop_next_smallest(&mut self, min_new_proposal: Clock) -> Option<(Clock, MsgId)> {
         let (_, Reverse((ts, msg_id))) = self.ts_order.peek()?;
+        if *ts >= min_new_proposal {
+            return None;
+        }
         let final_ts = self.all.get(&msg_id).unwrap().final_ts()?;
         assert_eq!(*ts, final_ts);
         self.all.remove(&msg_id);

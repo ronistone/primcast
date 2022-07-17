@@ -663,18 +663,15 @@ impl GroupReplica {
     }
 
     /// Returns the next delivery (if any) in final timestamp order
-    pub fn next_delivery(&mut self) -> Option<LogEntry> {
-        let (final_ts, id) = self.pending.peek_next_smallest()?;
+    pub fn next_delivery(&mut self) -> Option<&LogEntry> {
         let min_new_epoch_ts = self.min_new_epoch_ts();
         let min_clock_leader = self.min_clock_leader();
-        if final_ts <= min_clock_leader && Some(final_ts) <= min_new_epoch_ts {
-            self.pending.pop_next_smallest();
-            let log_entry = self.log_entry_mut(self.msgid_to_idx[&id]).unwrap();
-            debug_assert!(log_entry.local_ts <= final_ts);
-            log_entry.final_ts = Some(final_ts);
-            return Some(log_entry.clone());
-        }
-        None
+        let min_new_proposal = std::cmp::min(min_new_epoch_ts, Some(min_clock_leader + 1))?;
+        let (final_ts, id) = self.pending.pop_next_smallest(min_new_proposal)?;
+        let log_entry = self.log_entry_mut(self.msgid_to_idx[&id]).unwrap();
+        debug_assert!(log_entry.local_ts <= final_ts);
+        log_entry.final_ts = Some(final_ts);
+        return Some(log_entry);
     }
 }
 

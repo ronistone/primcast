@@ -741,16 +741,13 @@ async fn deliver_task(
         s.core.update();
         while let Some(d) = s.core.next_delivery() {
             let final_ts = d.final_ts.unwrap();
-            if last_delivery > (final_ts, d.msg_id) {
-                s.core.print_debug_info();
-            }
             assert!(last_delivery < (final_ts, d.msg_id)); // sanity check!
             last_delivery = (final_ts, d.msg_id);
-            deliveries.push(d);
+            deliveries.push((final_ts, d.msg_id, d.msg.clone(), d.dest.clone()));
         }
         drop(s); // must not await with Shared locked
         for d in deliveries.drain(..) {
-            delivery_tx.send((d.final_ts.unwrap(), d.msg_id, d.msg, d.dest)).await?;
+            delivery_tx.send(d).await?;
         }
     }
 }
