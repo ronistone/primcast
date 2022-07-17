@@ -30,15 +30,24 @@ impl PendingMsg {
     }
 }
 
+pub struct Stats {
+    pub all: usize,
+    pub all_max: usize,
+    pub with_local_ts: usize,
+    pub with_local_ts_max: usize,
+}
+
 /// Tracks the timestamp of messages not yet delivered
 pub struct PendingSet {
     /// Replica's group
     gid: Gid,
     /// All pending msgs
     all: HashMap<MsgId, PendingMsg>,
+    all_max: usize,
     /// Messages with a local timestamp in the local group, sorted by "possible" final timestamp
     // TODO: kind of a waste of space to keep MsgId twice there... but should be fine
     ts_order: PriorityQueue<MsgId, Reverse<(Clock, MsgId)>, BuildHasherDefault<FxHasher>>,
+    ts_order_max: usize,
     /// sanity check: items should be popped in final_ts order
     last_popped: (Clock, MsgId),
 }
@@ -48,8 +57,19 @@ impl PendingSet {
         Self {
             gid,
             all: Default::default(),
+            all_max: 0,
             ts_order: Default::default(),
+            ts_order_max: 0,
             last_popped: (0, 0),
+        }
+    }
+
+    pub fn stats(&self) -> Stats {
+        Stats {
+            all: self.all.len(),
+            all_max: self.all_max,
+            with_local_ts: self.ts_order.len(),
+            with_local_ts_max: self.ts_order_max,
         }
     }
 
@@ -83,6 +103,8 @@ impl PendingSet {
             }
         }
         self.ts_order.push(msg_id, Reverse((ts, msg_id)));
+        self.all_max = std::cmp::max(self.all_max, self.all.len());
+        self.ts_order_max = std::cmp::max(self.ts_order_max, self.ts_order.len());
     }
 
     pub fn add_group_ts(&mut self, msg_id: MsgId, dest: &GidSet, gid: Gid, group_ts: Clock) {
@@ -123,6 +145,8 @@ impl PendingSet {
                 assert!(e.missing_group_ts.remove(gid));
             }
         }
+        self.all_max = std::cmp::max(self.all_max, self.all.len());
+        self.ts_order_max = std::cmp::max(self.ts_order_max, self.ts_order.len());
     }
 
     /// Remove information about a msg's log entry ts (happens when the log gets truncated)

@@ -91,6 +91,7 @@ pub struct GroupReplica {
     // Epoch change related state ---
     leader_last_seen: Instant,
     proposals: VecDeque<LogEntry>,
+    proposals_max: usize,
     promises: HashMap<Pid, (Epoch, u64, Clock)>,
     accepts: HashSet<Pid>,
 }
@@ -171,6 +172,7 @@ impl GroupReplica {
 
             leader_last_seen: Instant::now(),
             proposals: Default::default(),
+            proposals_max: 0,
             promises: Default::default(),
             accepts: Default::default(),
             remote_learners,
@@ -191,14 +193,21 @@ impl GroupReplica {
     }
 
     pub fn print_debug_info(&mut self) {
+        let pending = self.pending.stats();
         eprintln!("=================");
-        eprintln!("log_len: {}", self.log.len());
-        eprintln!("safe_len: {}", self.safe_len);
+        eprintln!("proposals: {} (max: {})", self.proposals.len(), self.proposals_max);
+        eprintln!(
+            "pending: {} (max: {}) with local ts: {} (max: {})",
+            pending.all, pending.all_max, pending.with_local_ts, pending.with_local_ts_max,
+        );
+        eprintln!("log_len: {} safe_len: {}", self.log.len(), self.safe_len);
+        eprintln!(
+            "clock: {} min_clock_leader: {:?} quorum_clock: {:?}",
+            self.clock(),
+            self.min_clock_leader(),
+            self.min_new_epoch_ts()
+        );
         eprintln!("acks: {:?}", self.current_epoch_acks);
-        eprintln!("clock: {:?}", self.clock());
-        eprintln!("min_clock_leader: {:?}", self.min_clock_leader());
-        eprintln!("min_new_epoch_ts: {:?}", self.min_new_epoch_ts());
-        // TODO: print info about pending set
         eprintln!("remote learners:");
         for (gid, l) in &self.remote_learners {
             eprintln!(
@@ -432,6 +441,7 @@ impl GroupReplica {
             dest,
             final_ts: None,
         });
+        self.proposals_max = std::cmp::max(self.proposals_max, self.proposals.len());
         Ok(())
     }
 
