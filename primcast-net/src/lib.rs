@@ -33,6 +33,7 @@ pub mod util;
 use conn::Conn;
 use messages::Message;
 use util::AbortHandle;
+use util::RoundRobinStreams;
 use util::Shutdown;
 use util::ShutdownHandle;
 use util::StreamExt2;
@@ -88,7 +89,6 @@ pub struct PrimcastReplica {
     cfg: config::Config,
     shared: Arc<RwLock<Shared>>,
     ev_rx: mpsc::UnboundedReceiver<Event>,
-    proposal_rx: ReceiverStream<(MsgId, Bytes, GidSet)>,
 }
 
 pub struct Shared {
@@ -105,6 +105,7 @@ pub struct Shared {
 enum Event {
     PeriodicChecks(Instant),
     Follow(Conn, Epoch),
+    ProposalIn(mpsc::Receiver<(MsgId, Bytes, GidSet)>),
 }
 
 pub struct PrimcastHandle {
@@ -176,7 +177,6 @@ impl PrimcastReplica {
             pid,
             cfg: cfg.clone(),
             shared: Arc::new(RwLock::new(shared)),
-            proposal_rx: ReceiverStream::new(proposal_rx),
             ev_rx,
         };
 
@@ -188,7 +188,7 @@ impl PrimcastReplica {
             gid_proposal_tx.insert(g.gid, tx);
         }
 
-        tokio::spawn(s.run(delivery_tx, debug));
+        tokio::spawn(s.run(proposal_rx, delivery_tx, debug));
         PrimcastHandle {
             _shutdown: shutdown_handle,
             delivery_rx: Some(delivery_rx),
@@ -198,6 +198,7 @@ impl PrimcastReplica {
 
     async fn run(
         mut self,
+        proposal_rx: mpsc::Receiver<(MsgId, Bytes, GidSet)>,
         delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet)>,
         debug: Option<u64>,
     ) -> Result<(), Error> {
@@ -270,8 +271,10 @@ impl PrimcastReplica {
         // The main loop stops when shutdown resolves
         let mut shutdown = self.shared.read().await.shutdown.clone();
         eprintln!("starting main loop...");
+        let mut proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
+        let mut rr_proposals_rx = RoundRobinStreams::new();
+        rr_proposals_rx.add(ReceiverStream::new(proposal_rx));
         'main: loop {
-            let mut proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
             // for tracking to which dests an ack should be sent
             let mut ack_dests = GidSet::new();
             loop {
@@ -294,9 +297,6 @@ impl PrimcastReplica {
                     },
                     Some(ev) = self.ev_rx.recv() => {
                         match ev {
-                            Event::PeriodicChecks(_now) => {
-                                // TODO:
-                            }
                             Event::Follow(conn, epoch) => {
                                 // new connection from a leader
                                 let (e, state) = self.shared.read().await.core.state();
@@ -306,9 +306,15 @@ impl PrimcastReplica {
                                     fut = Box::pin(run_idle());
                                 }
                             }
+                            Event::ProposalIn(rx) => {
+                                rr_proposals_rx.add(ReceiverStream::new(rx));
+                            }
+                            Event::PeriodicChecks(_now) => {
+                                // TODO:
+                            }
                         }
                     }
-                    n = self.proposal_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals) => {
+                    n = rr_proposals_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals) => {
                         // handle next batch of proposals
                         debug_assert!(proposals.len() <= BATCH_SIZE_YIELD);
                         debug_assert!(proposals.len() == n);
@@ -672,7 +678,6 @@ async fn handle_connection(
         }
         Message::ProposalStart => {
             // Incoming proposals from a process that thinks we're the primary
-            let proposal_tx = s.read().await.proposal_tx.clone();
             let (epoch, state) = s.read().await.core.state();
             match state {
                 ReplicaState::Primary | ReplicaState::Candidate => {
@@ -685,12 +690,15 @@ async fn handle_connection(
             }
             // forward proposals to main loop
             eprintln!("receiving proposals from {:?}:{:?}", conn.gid(), conn.pid());
+            let ev_tx = s.read().await.ev_tx.clone();
+            let (tx, rx) = mpsc::channel(PROPOSAL_QUEUE);
+            ev_tx.send(Event::ProposalIn(rx))?;
             let mut msgs = vec![];
             while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
                 for msg in msgs.drain(..) {
                     match msg? {
                         Message::Proposal { msg_id, msg, dest } => {
-                            proposal_tx.send((msg_id, msg, dest)).await?;
+                            tx.send((msg_id, msg, dest)).await?;
                         }
                         m => panic!("unexpected message: {:?}", m),
                     }
