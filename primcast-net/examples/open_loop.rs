@@ -179,7 +179,7 @@ fn main() {
         // proposal sender
         tokio::spawn(async move {
             let mut sent = 0.0;
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
             let start = Instant::now();
             let mut rng = StdRng::from_entropy();
             loop {
