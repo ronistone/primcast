@@ -577,7 +577,6 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
             }
             s.update_tx.send(())?;
         }
-        // let other tasks make progress
         tokio::task::yield_now().await;
     };
 
@@ -1164,9 +1163,9 @@ async fn proposal_sender(
             }
         };
 
+        // if we're the leader of the group, send directly to main loop
         if (conn.gid(), conn.pid()) == from {
             eprintln!("forwarding proposals to itself");
-            // we're the leader, send directly to main loop
             let tx = s.read().await.proposal_tx.clone();
             let mut proposals = vec![];
             loop {
@@ -1186,9 +1185,9 @@ async fn proposal_sender(
             }
         }
 
+        // send it to the leader of the given group
         eprintln!("forwarding proposals to {:?}:{:?}", conn.gid(), conn.pid());
 
-        // send proposals to the leader
         let mut proposals = vec![];
         loop {
             if 0 == rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals).await {
