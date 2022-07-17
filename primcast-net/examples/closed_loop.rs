@@ -61,9 +61,9 @@ struct Args {
     #[clap(long)]
     debug: Option<u64>,
 
-    /// use single-threaded executor
+    /// use multi-threaded executor with N threads
     #[clap(long)]
-    single_thread: bool,
+    threads: Option<usize>,
 
     /// write deliveries to stdout
     #[clap(long)]
@@ -147,15 +147,16 @@ fn main() {
         })
         .collect();
 
-    let rt = if args.single_thread {
-        eprintln!("running single-threaded executor");
-        tokio::runtime::Builder::new_current_thread()
+    let rt = if let Some(n) = args.threads {
+        eprintln!("running multi-threaded executor with {} worker threads", n);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(n)
             .enable_all()
             .build()
             .unwrap()
     } else {
-        eprintln!("running multi-threaded executor");
-        tokio::runtime::Builder::new_multi_thread()
+        eprintln!("running single-threaded executor");
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()

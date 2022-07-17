@@ -6,7 +6,7 @@ OPT="$@"
 MSGS_SEC=1
 GLOBAL_DESTS=2
 GLOBALS=0.0
-SINGLE_THREAD=""
+THREADS=""
 CHECK=0
 DEBUG=""
 
@@ -31,7 +31,7 @@ tmux_test ()  {
             CMD="$VG ./$BUILD/examples/open_loop \
                       --gid $g --pid $i --cfg $CONFIG \
                       --global-dests $GLOBAL_DESTS --globals $GLOBALS \
-                      -m $MSGS_SEC --stats $STATS_SECS $SINGLE_THREAD $DEBUG"
+                      -m $MSGS_SEC --stats $STATS_SECS $THREADS $DEBUG"
             if (( CHECK != 0 )); then
                 CMD="$CMD --check > out_${g}_${i}.txt"
             fi
@@ -43,7 +43,7 @@ tmux_test ()  {
 }
 
 usage () {
-    echo "$0 [--release] [--cfg CFG_FILE] [-o OUTSTANDING] [--globals PERCENT] [--global-dests N] [--help]"
+    echo "$0 [--release] [-o OUTSTANDING] [--globals PERCENT] [--global-dests N] [--threads N] [--help]"
     exit 1
 }
 
@@ -65,8 +65,9 @@ while [[ $# > 0 ]]; do
             GLOBAL_DESTS=$2
             shift
             ;;
-        --single-thread)
-            SINGLE_THREAD="--single-thread"
+        --threads)
+            THREADS="--threads $2"
+            shift
             ;;
         --check)
             CHECK=1
