@@ -13,6 +13,7 @@ rand = "0.8"
 clap = { version = "3.2", features = ["derive"] }
 rustc-hash = "1.1.0"
 itertools = "0.10"
+chrono = "0.4"
 hdrhistogram = "7.5"
 # console-subscriber = "*" # for tokio-console
 

@@ -587,7 +587,9 @@ impl GroupReplica {
         let entry_ts = entry.local_ts;
         let res = self.append_inner(idx, epoch, entry)?;
         assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order");
-        self.clock.update(self.pid, epoch, entry_ts);
+        // append is an ack from leader
+        self.add_ack(epoch.owner(), epoch, idx + 1, entry_ts).unwrap();
+
         self.clock.update(epoch.owner(), epoch, entry_ts);
         Ok(res)
     }
@@ -638,6 +640,8 @@ impl GroupReplica {
 
     /// Append the next relevant entry from the remote replica
     pub fn remote_append(&mut self, gid: Gid, entry: RemoteEntry) -> Result<(), Error> {
+        // we use promised_epoch here since the received epoch has no relation to our group
+        self.clock.update(self.pid, self.promised_epoch, entry.ts);
         let learner = self.remote_learners.get_mut(&gid).unwrap();
         Ok(learner.append(gid, entry)?)
     }

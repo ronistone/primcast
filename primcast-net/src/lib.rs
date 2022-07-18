@@ -38,7 +38,7 @@ use util::Shutdown;
 use util::ShutdownHandle;
 use util::StreamExt2;
 
-const RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const PROPOSAL_QUEUE: usize = 1000;
 const DELIVERY_QUEUE: usize = 1000;
 const BATCH_SIZE_YIELD: usize = 1000;
@@ -273,7 +273,7 @@ impl PrimcastReplica {
         eprintln!("starting main loop...");
         let mut proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
         let mut rr_proposals_rx = RoundRobinStreams::new();
-        rr_proposals_rx.add(ReceiverStream::new(proposal_rx));
+        rr_proposals_rx.push(ReceiverStream::new(proposal_rx));
         'main: loop {
             // for tracking to which dests an ack should be sent
             let mut ack_dests = GidSet::new();
@@ -307,7 +307,7 @@ impl PrimcastReplica {
                                 }
                             }
                             Event::ProposalIn(rx) => {
-                                rr_proposals_rx.add(ReceiverStream::new(rx));
+                                rr_proposals_rx.push(ReceiverStream::new(rx));
                             }
                             Event::PeriodicChecks(_now) => {
                                 // TODO:
@@ -499,8 +499,8 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     };
     tokio::pin!(send_acks_task);
 
-    // fetch acks from other replicas in group (except from the primary).
-    // To ensure FIFO between appends/acks/bumps, those must come from the same primary connection.
+    // fetch acks from other replicas in group (except from the primary, which
+    // uses its own connection to ensure FIFO between appends/acks/bumps).
     let mut fetch_acks_tasks = FuturesUnordered::new();
     for p in &cfg.group(self_gid).unwrap().peers {
         if p.pid != self_pid && p.pid != conn_rx.pid() {
@@ -573,8 +573,11 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                         log_len,
                         clock,
                     }) => {
+                        let old_clock = s.core.clock();
                         s.core.add_ack(conn_rx.pid(), log_epoch, log_len, clock)?;
-                        ack_dests.insert(self_gid);
+                        if clock > old_clock {
+                            ack_dests.insert(self_gid);
+                        }
                     }
                     Ok(m) => panic!("unexpected message {:?}", m),
                     Err(err) => break 'recv err,
@@ -840,7 +843,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             while follower_log_len < log_len {
                 let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
                 if follower_log_epoch < epoch && epoch == e {
-                    // follower synced up to e
+                    // follower synced up to primary epoch e
                     let clock = s.core.clock();
                     to_send.push(StartEpochAccept {
                         epoch,
@@ -882,11 +885,11 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
         tokio::task::yield_now().await;
 
         // are more entries already available? then send them
-        let (new_log_epoch, new_log_len, _) = *ack_rx.borrow_and_update();
+        let (new_log_epoch, new_log_len, new_clock) = *ack_rx.borrow_and_update();
         if sync_log_epoch != new_log_epoch {
             return Ok(());
         }
-        if new_log_len > follower_log_len {
+        if new_log_len > follower_log_len || new_clock > last_clock_sent {
             continue;
         }
 
@@ -896,11 +899,11 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                 // biased;
                 // check if there are more log entries to send
                 _ = ack_rx.changed() => {
-                    let (new_log_epoch, new_log_len, clock) = *ack_rx.borrow_and_update();
+                    let (new_log_epoch, new_log_len, new_clock) = *ack_rx.borrow_and_update();
                     if sync_log_epoch != new_log_epoch {
                         return Ok(())
                     }
-                    if new_log_len > follower_log_len || clock > last_clock_sent {
+                    if new_log_len > follower_log_len || new_clock > last_clock_sent {
                         // entries or ack to send out
                         break 'wait;
                     }

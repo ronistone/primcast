@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use futures::prelude::*;
+use futures::ready;
 
 use tokio::sync::oneshot;
 
@@ -103,24 +104,23 @@ impl<'a, S: Stream + Unpin> Future for NextReadyChunk<'a, S> {
         debug_assert!(self.max_items > 0);
         let this = self.get_mut();
 
-        let s = Pin::new(&mut this.inner);
-        match s.poll_next(cx) {
-            Poll::Ready(Some(it)) => {
+        // read at least one element
+        match ready!(this.inner.poll_next_unpin(cx)) {
+            Some(it) => {
                 this.buf.push(it);
             }
-            Poll::Ready(None) => return Poll::Ready(0),
-            Poll::Pending => return Poll::Pending,
+            None => return Poll::Ready(0),
         }
-
         let mut count = 1;
 
+        // read at most max_items ready elements
         while count < this.max_items {
-            let s = Pin::new(&mut this.inner);
-            if let Poll::Ready(Some(it)) = s.poll_next(cx) {
-                this.buf.push(it);
-                count += 1;
-            } else {
-                break;
+            match this.inner.poll_next_unpin(cx) {
+                Poll::Ready(Some(it)) => {
+                    this.buf.push(it);
+                    count += 1;
+                }
+                _ => break,
             }
         }
 
@@ -185,7 +185,7 @@ impl<T> Future for AbortHandle<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        Pin::new(&mut this.0).poll(cx)
+        this.0.poll_unpin(cx)
     }
 }
 
@@ -200,13 +200,16 @@ pub struct RoundRobinStreams<S> {
     inner: Vec<S>,
 }
 
-impl<S> RoundRobinStreams<S> {
+impl<S> RoundRobinStreams<S>
+where
+    S: Stream + Unpin,
+{
     pub fn new() -> Self {
         Self { next: 0, inner: vec![] }
     }
 
-    pub fn add(&mut self, stream: S) {
-        self.inner.push(stream)
+    pub fn push(&mut self, stream: S) {
+        self.inner.push(stream);
     }
 }
 
@@ -227,8 +230,7 @@ where
             let current = this.next;
             this.next += 1;
             this.next %= this.inner.len();
-            let s = Pin::new(this.inner.get_mut(current).unwrap());
-            match s.poll_next(cx) {
+            match this.inner.get_mut(current).unwrap().poll_next_unpin(cx) {
                 r @ Poll::Ready(Some(_)) => return r,
                 Poll::Ready(None) => {
                     done.push(current);
@@ -316,11 +318,11 @@ mod tests {
     #[test]
     fn test_roundrobin_stream() {
         let mut rr = RoundRobinStreams::<Box<dyn Stream<Item = usize> + Unpin>>::new();
-        rr.add(Box::new(futures::stream::repeat(1)));
-        rr.add(Box::new(futures::stream::repeat(2)));
-        rr.add(Box::new(futures::stream::repeat(3)));
-        rr.add(Box::new(futures::stream::repeat(4)));
-        rr.add(Box::new(futures::stream::repeat(5).take(3)));
+        rr.push(Box::new(futures::stream::repeat(1)));
+        rr.push(Box::new(futures::stream::repeat(2)));
+        rr.push(Box::new(futures::stream::repeat(3)));
+        rr.push(Box::new(futures::stream::repeat(4)));
+        rr.push(Box::new(futures::stream::repeat(5).take(3)));
         futures::executor::block_on(async {
             for _ in 0..3 {
                 for i in 1..6 {
