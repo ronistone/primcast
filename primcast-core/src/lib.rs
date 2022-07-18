@@ -88,7 +88,7 @@ pub struct GroupReplica {
     /// Safe prefix of the log (acknowledged by a quorum)
     safe_len: u64,
     /// All MsgId present in the log
-    msgid: HashMap<u8, HashSet<MsgId>>,
+    msgid: HashMap<u16, HashSet<MsgId>>,
     /// Msgs which we know about that have not yet been delivered.
     /// We don't keep an explicit set of delivered msgs: the set of delivered msgs is (msgid - pending).
     pending: PendingSet,
@@ -353,7 +353,7 @@ impl GroupReplica {
             last_entry.1 = prefix_len;
             while u64::try_from(self.log.len()).unwrap() > prefix_len {
                 let entry = self.log.pop().unwrap();
-                let id_low = (entry.msg_id & MSGID_LOW_MASK) as u8;
+                let id_low = (entry.msg_id & MSGID_LOW_MASK) as u16;
                 let id_set = self.msgid.get_mut(&id_low).expect("msgid should be present");
                 assert!(id_set.remove(&entry.msg_id), "msgid should be present");
                 self.pending.remove_entry_ts(entry.msg_id);
@@ -444,7 +444,7 @@ impl GroupReplica {
         }
 
         // check id not already used
-        let id_low = (msg_id & MSGID_LOW_MASK) as u8;
+        let id_low = (msg_id & MSGID_LOW_MASK) as u16;
         if self.msgid.get(&id_low).map_or(false, |s| s.contains(&msg_id))
             || self.proposals.iter().find(|e| e.msg_id == msg_id).is_some()
         {
@@ -530,7 +530,7 @@ impl GroupReplica {
 
         // add msg_id mapping
         use std::collections::hash_map::Entry;
-        let id_low = (entry.msg_id & MSGID_LOW_MASK) as u8;
+        let id_low = (entry.msg_id & MSGID_LOW_MASK) as u16;
         match self.msgid.entry(id_low) {
             Entry::Occupied(mut e) => {
                 assert!(e.get_mut().insert(entry.msg_id), "msg_id should not be present");
