@@ -65,6 +65,10 @@ struct Args {
     #[clap(long)]
     threads: Option<usize>,
 
+    #[clap(long)]
+    /// use hybrid logical clocks
+    hybrid: bool,
+
     /// write deliveries to stdout
     #[clap(long)]
     check: bool,
@@ -163,7 +167,7 @@ fn main() {
     };
 
     rt.block_on(async {
-        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, args.debug);
+        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, args.hybrid, args.debug);
         let mut delivery_rx = handle.take_delivery_rx().unwrap();
 
         let hist = Arc::new(Mutex::new(Histogram::<u64>::new(3).unwrap()));

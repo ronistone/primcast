@@ -129,7 +129,7 @@ impl GroupReplica {
     /// New replica state for the given (gid,pid).
     /// TODO: we don't currently use persistent storage.
     /// Every replica starts at epoch Epoch::initial() with an empty log.
-    pub fn new(gid: Gid, pid: Pid, config: Config) -> Self {
+    pub fn new(gid: Gid, pid: Pid, config: Config, hybrid_clock: bool) -> Self {
         let state = if Epoch::initial().owner() == pid {
             ReplicaState::Primary
         } else {
@@ -168,7 +168,7 @@ impl GroupReplica {
         GroupReplica {
             gid,
             pid,
-            clock: LogicalClock::new(pid, current_epoch, config.group_pids(gid).unwrap()),
+            clock: LogicalClock::new(pid, current_epoch, config.group_pids(gid).unwrap(), hybrid_clock),
             config,
             group_size,
             quorum_size,
@@ -721,9 +721,9 @@ mod tests {
         let config = Config::new_for_test();
         let mut idgen = IdGen(0);
 
-        let mut r0 = GroupReplica::new(Gid(0), Pid(0), config.clone());
-        let mut r1 = GroupReplica::new(Gid(0), Pid(1), config.clone());
-        let mut r2 = GroupReplica::new(Gid(0), Pid(2), config.clone());
+        let mut r0 = GroupReplica::new(Gid(0), Pid(0), config.clone(), false);
+        let mut r1 = GroupReplica::new(Gid(0), Pid(1), config.clone(), false);
+        let mut r2 = GroupReplica::new(Gid(0), Pid(2), config.clone(), false);
 
         assert_eq!(r0.state, Primary);
         assert_eq!(r1.state, Follower);
@@ -779,10 +779,10 @@ mod tests {
         let config = Config::new_for_test();
         let mut idgen = IdGen(0);
 
-        let mut r0_0 = GroupReplica::new(Gid(0), Pid(0), config.clone());
-        let mut r0_1 = GroupReplica::new(Gid(0), Pid(1), config.clone());
-        let mut r1_0 = GroupReplica::new(Gid(1), Pid(0), config.clone());
-        let mut r1_1 = GroupReplica::new(Gid(1), Pid(1), config.clone());
+        let mut r0_0 = GroupReplica::new(Gid(0), Pid(0), config.clone(), false);
+        let mut r0_1 = GroupReplica::new(Gid(0), Pid(1), config.clone(), false);
+        let mut r1_0 = GroupReplica::new(Gid(1), Pid(0), config.clone(), false);
+        let mut r1_1 = GroupReplica::new(Gid(1), Pid(1), config.clone(), false);
 
         // ----- STEP 1 ------
 

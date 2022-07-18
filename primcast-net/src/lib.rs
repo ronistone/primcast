@@ -142,8 +142,8 @@ impl PrimcastHandle {
 }
 
 impl PrimcastReplica {
-    pub fn start(gid: Gid, pid: Pid, cfg: config::Config, debug: Option<u64>) -> PrimcastHandle {
-        let core = GroupReplica::new(gid, pid, cfg.clone());
+    pub fn start(gid: Gid, pid: Pid, cfg: config::Config, hybrid_clock: bool, debug: Option<u64>) -> PrimcastHandle {
+        let core = GroupReplica::new(gid, pid, cfg.clone(), hybrid_clock);
         let (log_epoch, log_len) = core.log_status();
         let clock = core.clock();
 

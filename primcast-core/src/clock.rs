@@ -12,10 +12,11 @@ pub struct LogicalClock {
     clocks: Vec<(Pid, Clock)>,
     /// store acks from the "future" to be applied later when moving the epoch of the clock
     future_epochs: HashMap<Epoch, HashMap<Pid, Clock>>,
+    hybrid: bool,
 }
 
 impl LogicalClock {
-    pub fn new<I: IntoIterator<Item = Pid>>(pid: Pid, epoch: Epoch, group: I) -> Self {
+    pub fn new<I: IntoIterator<Item = Pid>>(pid: Pid, epoch: Epoch, group: I, hybrid: bool) -> Self {
         let clocks = group.into_iter().map(|pid| (pid, 0)).collect::<Vec<_>>();
         clocks.iter().find(|(p, _)| *p == pid).expect("pid not found");
         LogicalClock {
@@ -24,6 +25,7 @@ impl LogicalClock {
             sorted: false,
             clocks,
             future_epochs: Default::default(),
+            hybrid,
         }
     }
 
@@ -119,8 +121,15 @@ impl LogicalClock {
     /// Increment clock and return its value
     pub fn tick(&mut self) -> Clock {
         self.sorted = false;
+        let hybrid = self.hybrid;
         let c = self.get_mut(self.pid);
-        *c += 1;
+        if hybrid {
+            // micros from UNIX_EPOCH
+            let now = (chrono::Utc::now().timestamp_nanos() / 1000) as u64;
+            *c = std::cmp::max(now, *c + 1);
+        } else {
+            *c += 1;
+        }
         *c
     }
 }
@@ -132,13 +141,13 @@ mod tests {
     #[test]
     #[should_panic]
     fn clock_group_missing_pid() {
-        let _ = LogicalClock::new(Pid(0), Epoch::initial(), [Pid(1), Pid(2), Pid(3)]);
+        let _ = LogicalClock::new(Pid(0), Epoch::initial(), [Pid(1), Pid(2), Pid(3)], false);
     }
 
     #[test]
     #[should_panic]
     fn clock_group_missing_pid_update() {
-        let mut c = LogicalClock::new(Pid(1), Epoch::initial(), [Pid(1), Pid(2), Pid(3)]);
+        let mut c = LogicalClock::new(Pid(1), Epoch::initial(), [Pid(1), Pid(2), Pid(3)], false);
         c.update(Pid(0), Epoch::initial(), 1);
     }
 
@@ -148,7 +157,7 @@ mod tests {
         let e2 = e1.next_for(Pid(1));
         let e3 = e2.next_for(Pid(1));
         let q = 3;
-        let mut c = LogicalClock::new(Pid(1), e1, [Pid(1), Pid(2), Pid(3), Pid(4)]);
+        let mut c = LogicalClock::new(Pid(1), e1, [Pid(1), Pid(2), Pid(3), Pid(4)], false);
         assert_eq!(c.current_epoch(), e1);
         assert_eq!(c.local(), 0);
         assert_eq!(c.quorum(q, e1), Some(0));

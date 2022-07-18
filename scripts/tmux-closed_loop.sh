@@ -9,6 +9,7 @@ GLOBALS=0.0
 THREADS=""
 CHECK=0
 DEBUG=""
+HYBRID=""
 
 CONFIG="example_3_groups.yaml"
 GIDS=3
@@ -31,7 +32,7 @@ tmux_test ()  {
             CMD="$VG ./$BUILD/examples/closed_loop \
                       --gid $g --pid $i --cfg $CONFIG \
                       --global-dests $GLOBAL_DESTS --globals $GLOBALS \
-                      -o $OUTSTANDING --stats $STATS_SECS $THREADS $DEBUG"
+                      -o $OUTSTANDING --stats $STATS_SECS $THREADS $HYBRID $DEBUG"
             if (( CHECK != 0 )); then
                 CMD="$CMD --check > out_${g}_${i}.txt"
             fi
@@ -68,6 +69,9 @@ while [[ $# > 0 ]]; do
         --threads)
             THREADS="--threads $2"
             shift
+            ;;
+        --hybrid)
+            HYBRID="--hybrid"
             ;;
         --check)
             CHECK=1
