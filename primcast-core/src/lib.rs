@@ -25,7 +25,7 @@ use types::*;
 /// reallocations. The way we keep entries in memory (just a Vec), large
 /// reallocations may cause pauses due to the amount of copying.
 // TODO: handle this issue
-const INITIAL_CAP: usize = 100_000_000;
+const INITIAL_CAP: usize = 50_000_000;
 
 /// Split msgid set into multiple hashsets to prevent large reallocations
 const MSGID_LOW_MASK: MsgId = 0xff;
@@ -162,7 +162,8 @@ impl GroupReplica {
 
         let mut log = Vec::new();
         log.reserve(INITIAL_CAP);
-        let msgid = HashMap::default();
+        let mut msgid = HashMap::default();
+        msgid.reserve(MSGID_LOW_MASK as usize);
 
         GroupReplica {
             gid,
