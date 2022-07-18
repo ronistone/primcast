@@ -315,9 +315,10 @@ impl PrimcastReplica {
                         }
                     }
                     n = rr_proposals_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals) => {
+                        if n == 0 {
+                            break;
+                        }
                         // handle next batch of proposals
-                        debug_assert!(proposals.len() <= BATCH_SIZE_YIELD);
-                        debug_assert!(proposals.len() == n);
 
                         let mut s = self.shared.write().await;
                         for (msg_id, msg, dest) in proposals.drain(..) {
