@@ -128,36 +128,6 @@ impl<'a, S: Stream + Unpin> Future for NextReadyChunk<'a, S> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::StreamExt2;
-
-    #[test]
-    fn test_yield_chunks() {
-        let mut s = futures::stream::iter(0..10).yield_after(3);
-        let mut buf = vec![];
-        futures::executor::block_on(async {
-            // chunk of size 1
-            assert_eq!(1, s.next_ready_chunk(1, &mut buf).await);
-            assert_eq!(buf.len(), 1);
-            // will return only 2 since stream yields after 3 items
-            assert_eq!(2, s.next_ready_chunk(3, &mut buf).await);
-            assert_eq!(buf.len(), 3);
-            // should return full chunk
-            assert_eq!(3, s.next_ready_chunk(3, &mut buf).await);
-            assert_eq!(buf.len(), 6);
-            // will return 3 after stream yields
-            assert_eq!(3, s.next_ready_chunk(4, &mut buf).await);
-            assert_eq!(buf.len(), 9);
-            // return last element
-            assert_eq!(1, s.next_ready_chunk(4, &mut buf).await);
-            assert_eq!(buf.len(), 10);
-            // stream done
-            assert_eq!(0, s.next_ready_chunk(4, &mut buf).await);
-        });
-    }
-}
-
 /// When dropped, makes the related Shutdown futures complete.
 pub struct ShutdownHandle(oneshot::Sender<()>);
 #[derive(Clone)]
@@ -225,6 +195,61 @@ impl<T> Drop for AbortHandle<T> {
     }
 }
 
+pub struct RoundRobinStreams<S> {
+    next: usize,
+    inner: Vec<S>,
+}
+
+impl<S> RoundRobinStreams<S> {
+    pub fn new() -> Self {
+        Self { next: 0, inner: vec![] }
+    }
+
+    pub fn add(&mut self, stream: S) {
+        self.inner.push(stream)
+    }
+}
+
+impl<S> Stream for RoundRobinStreams<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.inner.len() == 0 {
+            return Poll::Pending;
+        }
+        let this = self.get_mut();
+        this.next %= this.inner.len();
+        let mut done = vec![];
+        for _ in 0..this.inner.len() {
+            let current = this.next;
+            this.next += 1;
+            this.next %= this.inner.len();
+            let s = Pin::new(this.inner.get_mut(current).unwrap());
+            match s.poll_next(cx) {
+                r @ Poll::Ready(Some(_)) => return r,
+                Poll::Ready(None) => {
+                    done.push(current);
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        done.sort_unstable();
+        while let Some(idx) = done.pop() {
+            this.inner.remove(idx);
+        }
+
+        if this.inner.is_empty() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 /// Wrapper over tokio RwLock, instrumented with printing for debugging.
 pub struct RwLock<T>(tokio::sync::RwLock<T>);
 pub struct RwLockWriteGuard<'a, T>(u32, tokio::sync::RwLockWriteGuard<'a, T>);
@@ -281,5 +306,57 @@ impl<T> RwLock<T> {
         let g = self.0.read().await;
         println!("=> ok read {}", line);
         RwLockReadGuard(line, g)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_roundrobin_stream() {
+        let mut rr = RoundRobinStreams::<Box<dyn Stream<Item = usize> + Unpin>>::new();
+        rr.add(Box::new(futures::stream::repeat(1)));
+        rr.add(Box::new(futures::stream::repeat(2)));
+        rr.add(Box::new(futures::stream::repeat(3)));
+        rr.add(Box::new(futures::stream::repeat(4)));
+        rr.add(Box::new(futures::stream::repeat(5).take(3)));
+        futures::executor::block_on(async {
+            for _ in 0..3 {
+                for i in 1..6 {
+                    assert_eq!(Some(i), rr.next().await);
+                }
+            }
+            // here, stream returning 5 was dropped
+            for i in 1..5 {
+                assert_eq!(Some(i), rr.next().await);
+            }
+            assert_eq!(Some(1), rr.next().await);
+        });
+    }
+
+    #[test]
+    fn test_yield_chunks() {
+        let mut s = futures::stream::iter(0..10).yield_after(3);
+        let mut buf = vec![];
+        futures::executor::block_on(async {
+            // chunk of size 1
+            assert_eq!(1, s.next_ready_chunk(1, &mut buf).await);
+            assert_eq!(buf.len(), 1);
+            // will return only 2 since stream yields after 3 items
+            assert_eq!(2, s.next_ready_chunk(3, &mut buf).await);
+            assert_eq!(buf.len(), 3);
+            // should return full chunk
+            assert_eq!(3, s.next_ready_chunk(3, &mut buf).await);
+            assert_eq!(buf.len(), 6);
+            // will return 3 after stream yields
+            assert_eq!(3, s.next_ready_chunk(4, &mut buf).await);
+            assert_eq!(buf.len(), 9);
+            // return last element
+            assert_eq!(1, s.next_ready_chunk(4, &mut buf).await);
+            assert_eq!(buf.len(), 10);
+            // stream done
+            assert_eq!(0, s.next_ready_chunk(4, &mut buf).await);
+        });
     }
 }
