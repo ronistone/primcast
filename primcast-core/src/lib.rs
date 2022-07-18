@@ -1,6 +1,5 @@
 use bytes::Bytes;
 
-use std::collections::VecDeque;
 use std::time::Instant;
 
 use rustc_hash::FxHashMap as HashMap;
@@ -21,6 +20,15 @@ use clock::LogicalClock;
 use config::Config;
 use pending::PendingSet;
 use types::*;
+
+/// Allocate space for this amount of log entries at the start, to avoid
+/// reallocations. The way we keep entries in memory (just a Vec), large
+/// reallocations may cause pauses due to the amount of copying.
+// TODO: handle this issue
+const INITIAL_CAP: usize = 100_000_000;
+
+/// Split msgid set into multiple hashsets to prevent large reallocations
+const MSGID_LOW_MASK: MsgId = 0xff;
 
 // TODO: how to avoid MsgId conflicts? Right now we just assume random u128 won't collide.
 // The id must be picked by the proposer. If we assume only replicas are proposers, we could use gid+pid+sequence.
@@ -79,18 +87,17 @@ pub struct GroupReplica {
     current_epoch_acks: Vec<(u64, Pid)>,
     /// Safe prefix of the log (acknowledged by a quorum)
     safe_len: u64,
-    /// Msgid to log idx.
-    /// TODO: The mapping grows proportionally to the log. Should we do it differently?
-    msgid_to_idx: HashMap<MsgId, u64>,
+    /// All MsgId present in the log
+    msgid: HashMap<u8, HashSet<MsgId>>,
     /// Msgs which we know about that have not yet been delivered.
-    /// We don't keep an explicit set of delivered msgs: the set of delivered msgs is (msgid_to_idx - pending).
+    /// We don't keep an explicit set of delivered msgs: the set of delivered msgs is (msgid - pending).
     pending: PendingSet,
 
     remote_learners: HashMap<Gid, RemoteLearner>,
 
     // Epoch change related state ---
     leader_last_seen: Instant,
-    proposals: VecDeque<LogEntry>,
+    proposals: Vec<LogEntry>,
     proposals_max: usize,
     promises: HashMap<Pid, (Epoch, u64, Clock)>,
     accepts: HashSet<Pid>,
@@ -153,6 +160,10 @@ impl GroupReplica {
         let group_size = current_epoch_acks.len();
         let quorum_size = config.quorum_size(gid).unwrap();
 
+        let mut log = Vec::new();
+        log.reserve(INITIAL_CAP);
+        let msgid = HashMap::default();
+
         GroupReplica {
             gid,
             pid,
@@ -163,11 +174,11 @@ impl GroupReplica {
 
             state,
             promised_epoch,
-            log: vec![],
+            log,
             log_epochs: vec![(Epoch::initial(), 0)],
             current_epoch_acks,
             safe_len: 0,
-            msgid_to_idx: Default::default(),
+            msgid,
             pending: PendingSet::new(gid),
 
             leader_last_seen: Instant::now(),
@@ -341,7 +352,9 @@ impl GroupReplica {
             last_entry.1 = prefix_len;
             while u64::try_from(self.log.len()).unwrap() > prefix_len {
                 let entry = self.log.pop().unwrap();
-                self.msgid_to_idx.remove(&entry.msg_id).expect("mapping should exist");
+                let id_low = (entry.msg_id & MSGID_LOW_MASK) as u8;
+                let id_set = self.msgid.get_mut(&id_low).expect("msgid should be present");
+                assert!(id_set.remove(&entry.msg_id), "msgid should be present");
                 self.pending.remove_entry_ts(entry.msg_id);
             }
 
@@ -430,11 +443,14 @@ impl GroupReplica {
         }
 
         // check id not already used
-        if self.msgid_to_idx.contains_key(&msg_id) || self.proposals.iter().find(|e| e.msg_id == msg_id).is_some() {
+        let id_low = (msg_id & MSGID_LOW_MASK) as u8;
+        if self.msgid.get(&id_low).map_or(false, |s| s.contains(&msg_id))
+            || self.proposals.iter().find(|e| e.msg_id == msg_id).is_some()
+        {
             return Err(Error::IdAlreadyUsed);
         }
 
-        self.proposals.push_back(LogEntry {
+        self.proposals.push(LogEntry {
             local_ts: 0,
             msg_id,
             msg,
@@ -452,12 +468,14 @@ impl GroupReplica {
             return Err(Error::NotPrimary);
         }
         let appended = !self.proposals.is_empty();
-        while let Some(mut log_entry) = self.proposals.pop_front() {
+        let mut proposals = std::mem::take(&mut self.proposals);
+        for mut log_entry in proposals.drain(..) {
             let (log_epoch, log_len) = self.log_status();
             let ts = self.clock.tick();
             log_entry.local_ts = ts;
             self.append_inner(log_len, log_epoch, log_entry).unwrap();
         }
+        self.proposals = proposals;
         Ok(appended)
     }
 
@@ -493,16 +511,6 @@ impl GroupReplica {
         })
     }
 
-    /// Get log entry by msg_id
-    pub fn log_entry_by_id(&self, msg_id: MsgId) -> Option<(Epoch, &LogEntry)> {
-        if let Some(idx) = self.msgid_to_idx.get(&msg_id) {
-            let (epoch, entry) = self.log_entry(*idx).expect("should be present");
-            assert_eq!(msg_id, entry.msg_id, "mapping from msg_id to log idx should be valid");
-            return Some((epoch, entry));
-        }
-        None
-    }
-
     /// Get the next log entry destined for to a given Gid, starting at idx.
     /// Needed by replicas from remote groups to fetch relevant log entries.
     pub fn next_log_entry_for_dest(&self, start_idx: u64, gid: Gid) -> Option<&LogEntry> {
@@ -520,11 +528,19 @@ impl GroupReplica {
         }
 
         // add msg_id mapping
-        assert!(
-            self.msgid_to_idx.insert(entry.msg_id, self.log.len() as u64).is_none(),
-            "msg_id should not be present"
-        );
-        self.pending.add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts);
+        use std::collections::hash_map::Entry;
+        let id_low = (entry.msg_id & MSGID_LOW_MASK) as u8;
+        match self.msgid.entry(id_low) {
+            Entry::Occupied(mut e) => {
+                assert!(e.get_mut().insert(entry.msg_id), "msg_id should not be present");
+            }
+            Entry::Vacant(e) => {
+                let s = e.insert(Default::default());
+                s.insert(entry.msg_id);
+            }
+        }
+        self.pending
+            .add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts, self.log.len() as u64);
 
         // add to log_epochs
         if log_epoch == entry_epoch {
@@ -677,8 +693,9 @@ impl GroupReplica {
         let min_new_epoch_ts = self.min_new_epoch_ts();
         let min_clock_leader = self.min_clock_leader();
         let min_new_proposal = std::cmp::min(min_new_epoch_ts, Some(min_clock_leader + 1))?;
-        let (final_ts, id) = self.pending.pop_next_smallest(min_new_proposal)?;
-        let log_entry = self.log_entry_mut(self.msgid_to_idx[&id]).unwrap();
+        let (final_ts, id, idx) = self.pending.pop_next_smallest(min_new_proposal)?;
+        let log_entry = self.log_entry_mut(idx).unwrap();
+        debug_assert_eq!(id, log_entry.msg_id);
         debug_assert!(log_entry.local_ts <= final_ts);
         log_entry.final_ts = Some(final_ts);
         return Some(log_entry);

@@ -18,6 +18,7 @@ struct PendingMsg {
     /// group ts still to be decided
     missing_group_ts: GidSet,
     last_modified: Instant,
+    log_idx: Option<u64>,
 }
 
 impl PendingMsg {
@@ -73,7 +74,7 @@ impl PendingSet {
         }
     }
 
-    pub fn add_entry_ts(&mut self, msg_id: MsgId, dest: &GidSet, entry_ts: Clock) {
+    pub fn add_entry_ts(&mut self, msg_id: MsgId, dest: &GidSet, entry_ts: Clock, log_idx: u64) {
         use std::collections::hash_map::Entry;
         let ts;
         debug_assert!((entry_ts, msg_id) > self.last_popped);
@@ -88,6 +89,7 @@ impl PendingSet {
                 debug_assert!(self.ts_order.get_priority(&msg_id).is_none());
                 assert!(m.entry_ts.is_none());
                 m.entry_ts = Some(entry_ts);
+                m.log_idx = Some(log_idx);
                 ts = std::cmp::max(m.entry_ts, m.max_group_ts).unwrap();
             }
             Entry::Vacant(e) => {
@@ -98,6 +100,7 @@ impl PendingSet {
                     max_group_ts: None,
                     missing_group_ts: dest.clone(),
                     last_modified: Instant::now(),
+                    log_idx: Some(log_idx),
                 });
                 ts = entry_ts;
             }
@@ -141,6 +144,7 @@ impl PendingSet {
                     max_group_ts: Some(group_ts),
                     missing_group_ts: dest.clone(),
                     last_modified: Instant::now(),
+                    log_idx: None,
                 });
                 assert!(e.missing_group_ts.remove(gid));
             }
@@ -153,6 +157,7 @@ impl PendingSet {
     pub fn remove_entry_ts(&mut self, msg_id: MsgId) {
         let p = self.all.get_mut(&msg_id).unwrap();
         p.entry_ts = None;
+        p.log_idx = None;
         // sanity check that the group timestamp is not decided
         debug_assert!(p.missing_group_ts.contains(self.gid));
         // remove from ts_order
@@ -184,17 +189,17 @@ impl PendingSet {
 
     /// Remove and return the pending msg with the smallest ts, but only if it
     /// is the final timestamp and it's smaller than min_new_proposal.
-    pub fn pop_next_smallest(&mut self, min_new_proposal: Clock) -> Option<(Clock, MsgId)> {
+    pub fn pop_next_smallest(&mut self, min_new_proposal: Clock) -> Option<(Clock, MsgId, u64)> {
         let (_, Reverse((ts, msg_id))) = self.ts_order.peek()?;
         if *ts >= min_new_proposal {
             return None;
         }
         let final_ts = self.all.get(&msg_id).unwrap().final_ts()?;
         assert_eq!(*ts, final_ts);
-        self.all.remove(&msg_id);
+        let p = self.all.remove(&msg_id).unwrap();
         let (_, Reverse((ts, msg_id))) = self.ts_order.pop().unwrap();
         debug_assert!((ts, msg_id) > self.last_popped);
         self.last_popped = (ts, msg_id);
-        return Some((ts, msg_id));
+        return Some((ts, msg_id, p.log_idx.unwrap()));
     }
 }
