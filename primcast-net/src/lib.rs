@@ -819,10 +819,6 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             assert!(log_epoch <= e);
             (log_epoch, log_len)
         }
-        // Ack { log_epoch, log_len, clock: _ } => {
-        //     assert!(log_epoch <= e);
-        //     (log_epoch, log_len)
-        // }
         m => panic!("unexpected msg {:?}", m),
     };
 
@@ -864,9 +860,9 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                 }
             }
             // Send clock bump ack if needed (and safe to do). Acks and Appends
-            // from a primary *must be sent in ts order*. A follower can see its
-            // primary clock update ONLY IF it has received all log entries with
-            // smaller clock values.
+            // from a primary *must be sent in ts order*. A follower should see
+            // its primary clock update ONLY IF it has received all log entries
+            // with smaller clock value.
             if follower_log_len == log_len && s.core.clock() > last_clock_sent {
                 last_clock_sent = s.core.clock();
                 to_send.push(Ack {
