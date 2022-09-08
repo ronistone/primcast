@@ -25,11 +25,16 @@ pub struct PeerConfig {
     pub pid: Pid,
     pub ip: IpAddr,
     pub port: u16,
+    pub client_port: u16,
 }
 
 impl PeerConfig {
     pub fn addr(&self) -> SocketAddr {
         (self.ip, self.port).into()
+    }
+
+    pub fn addr_for_client(&self) -> SocketAddr {
+        (self.ip, self.client_port).into()
     }
 }
 
@@ -86,6 +91,7 @@ impl Config {
                     pid: Pid(p),
                     ip: "127.0.0.1".parse().unwrap(),
                     port: 10000 + port,
+                    client_port: 20000 + port,
                 });
                 port += 1;
             }

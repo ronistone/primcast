@@ -25,7 +25,7 @@ use primcast_core::types::*;
 use primcast_core::GroupReplica;
 use primcast_core::ReplicaState;
 
-mod codec;
+pub mod codec;
 pub mod conn;
 mod messages;
 pub mod util;

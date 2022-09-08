@@ -10,16 +10,13 @@ use hdrhistogram::Histogram;
 
 use itertools::Itertools;
 
-use rand::prelude::StdRng;
-use rand::SeedableRng;
 use serde::Deserialize;
 use serde::Serialize;
 
 use clap::CommandFactory;
 use clap::Parser;
 
-use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::prelude::*;
 
 use primcast_core::config::Config;
 use primcast_core::types::*;

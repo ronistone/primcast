@@ -7,21 +7,27 @@ groups:
       - pid: 0
         ip: 127.0.0.1
         port: 10000
+        client_port: 20000
       - pid: 1
         ip: 127.0.0.1
         port: 10001
+        client_port: 20001
       - pid: 2
         ip: 127.0.0.1
         port: 10002
+        client_port: 20002
   - gid: 1
     quorum: 2
     peers:
       - pid: 0
         ip: 127.0.0.1
         port: 10003
+        client_port: 20003
       - pid: 1
         ip: 127.0.0.1
         port: 10004
+        client_port: 20004
       - pid: 2
         ip: 127.0.0.1
         port: 10005
+        client_port: 20005
