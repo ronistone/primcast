@@ -76,11 +76,11 @@ fn main() {
 
     if args.globals < 0.0 || args.globals > 1.0 {
         cmd.error(clap::ErrorKind::InvalidValue, "globals percentage must be a value between 0.0 and 1.0")
-            .exit()
+            .exit();
     }
     if args.global_dests < 1 || args.global_dests as usize > cfg.groups.len() {
         cmd.error(clap::ErrorKind::InvalidValue, "global-dests larger than the number of groups in the configuration")
-            .exit()
+            .exit();
     }
 
     // GidSet for local commands
@@ -102,6 +102,11 @@ fn main() {
         .collect();
 
     let mut rng = StdRng::from_entropy();
+
+    if args.size < 8 {
+        cmd.error(clap::ErrorKind::InvalidValue, "msg size must be at least 8 bytes")
+            .exit();
+    }
 
     let data_size = args.size - 8; // we add an extra u64 timestamp
     let mut data = BytesMut::with_capacity(data_size as usize);
