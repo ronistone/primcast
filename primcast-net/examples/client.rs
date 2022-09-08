@@ -129,6 +129,7 @@ fn main() {
                 return;
             }
         };
+        eprintln!("connected to {gid:?}:{pid:?} at {addr}");
         let (mut rx, mut tx) = bincode_split::<Reply, Request, _>(sock);
 
         // keep outstanding requests
