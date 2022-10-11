@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use tokio::net::TcpStream;
@@ -133,10 +134,19 @@ fn main() {
         let (mut rx, mut tx) = bincode_split::<Reply, Request, _>(sock);
 
         // keep outstanding requests
-        let outstanding = Arc::new(Semaphore::new(args.outstanding));
+        let outstanding = Arc::new(Semaphore::new(1));
+        let outstanding_initial_producer = outstanding.clone();
         let outstanding_consumer = outstanding.clone();
 
         let start = Instant::now();
+
+        // stagger initial requests a little bit
+        tokio::spawn(async move {
+            for _ in 0..args.outstanding {
+                tokio::time::sleep(Duration::from_micros(200)).await;
+                outstanding_initial_producer.add_permits(1);
+            }
+        });
 
         // send requests
         tokio::spawn(async move {
