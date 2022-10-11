@@ -39,9 +39,9 @@ use util::ShutdownHandle;
 use util::StreamExt2;
 
 const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
-const PROPOSAL_QUEUE: usize = 1000;
-const DELIVERY_QUEUE: usize = 1000;
-const BATCH_SIZE_YIELD: usize = 1000;
+const PROPOSAL_QUEUE: usize = 100_000;
+const DELIVERY_QUEUE: usize = 100_000;
+const BATCH_SIZE_YIELD: usize = 50;
 
 #[derive(Debug)]
 pub enum Error {
