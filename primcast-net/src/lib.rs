@@ -965,10 +965,10 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
                         return Ok(());
                     }
                     RemoteLogAppend(entry) => {
-                        let idx = entry.idx;
+                        let log_len = entry.idx + 1;
                         let ts = entry.ts;
                         s.core.remote_append(remote_gid, entry)?;
-                        s.core.remote_add_ack(remote_gid, remote_peer.pid, epoch, idx, ts)?;
+                        s.core.remote_add_ack(remote_gid, remote_peer.pid, epoch, log_len, ts)?;
                     }
                     _ => panic!("unexpected message"),
                 }
