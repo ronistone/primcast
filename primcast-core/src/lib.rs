@@ -144,7 +144,8 @@ impl GroupReplica {
                     return None;
                 }
                 let pids = g.peers.iter().map(|p| p.pid);
-                Some((g.gid, RemoteLearner::new(g.gid, pids, 0)))
+                let remote_quorum_size = config.quorum_size(g.gid).unwrap();
+                Some((g.gid, RemoteLearner::new(g.gid, pids, 0, remote_quorum_size)))
             })
             .collect();
 

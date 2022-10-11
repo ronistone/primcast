@@ -36,10 +36,16 @@ pub struct RemoteLearner {
     remote_log: VecDeque<RemoteEntry>,
     next_idx: u64,
     safe_idx: Option<u64>,
+    quorum_size: usize,
 }
 
 impl RemoteLearner {
-    pub fn new<I: IntoIterator<Item = Pid>>(remote_gid: Gid, remote_pids: I, next_idx: u64) -> Self {
+    pub fn new<I: IntoIterator<Item = Pid>>(
+        remote_gid: Gid,
+        remote_pids: I,
+        next_idx: u64,
+        quorum_size: usize,
+    ) -> Self {
         RemoteLearner {
             remote_log_epoch: Epoch(0, Pid(0)),
             remote_gid,
@@ -58,6 +64,7 @@ impl RemoteLearner {
             remote_log: Default::default(),
             safe_idx: None,
             next_idx,
+            quorum_size,
         }
     }
 
@@ -155,8 +162,7 @@ impl RemoteLearner {
                 }
             })
             .collect();
-        let maj_len = (self.remote_info.len() / 2) + 1;
-        let maj_diff = same_epoch_log_sizes.len() as isize - maj_len as isize;
+        let maj_diff = same_epoch_log_sizes.len() as isize - self.quorum_size as isize;
         if maj_diff >= 0 {
             same_epoch_log_sizes.sort_unstable();
             let safe_len = same_epoch_log_sizes[maj_diff as usize];
@@ -209,7 +215,8 @@ mod tests {
     #[test]
     fn remote_learner_basics() {
         let gid = Gid(1);
-        let mut r = RemoteLearner::new(gid, [Pid(1), Pid(2), Pid(3)], 2);
+        let quorum_size = 2;
+        let mut r = RemoteLearner::new(gid, [Pid(1), Pid(2), Pid(3)], 2, quorum_size);
         assert_eq!(r.next_expected_log_entry(), (Epoch::initial(), 2));
 
         let mut epoch = Epoch::initial();
