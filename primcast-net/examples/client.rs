@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use tokio::net::TcpStream;
@@ -133,10 +134,19 @@ fn main() {
         let (mut rx, mut tx) = bincode_split::<Reply, Request, _>(sock);
 
         // keep outstanding requests
-        let outstanding = Arc::new(Semaphore::new(args.outstanding));
+        let outstanding = Arc::new(Semaphore::new(1));
+        let outstanding_initial_producer = outstanding.clone();
         let outstanding_consumer = outstanding.clone();
 
         let start = Instant::now();
+
+        // stagger initial requests a little bit
+        tokio::spawn(async move {
+            for _ in 0..args.outstanding {
+                tokio::time::sleep(Duration::from_micros(200)).await;
+                outstanding_initial_producer.add_permits(1);
+            }
+        });
 
         // send requests
         tokio::spawn(async move {
@@ -176,8 +186,8 @@ fn main() {
                             let n_dest = dest.len();
                             // allow next request
                             outstanding.add_permits(1);
-                            // latency / deliver time from start / number of dests
-                            stats.push((latency_us, now_us, n_dest));
+                            // latency / sent at / number of dests
+                            stats.push((latency_us, payload.sent_at_us, n_dest));
                         }
                         _ => {
                             break;
@@ -191,10 +201,10 @@ fn main() {
         }
         let mut count = 0;
         eprintln!("printing stats...");
-        println!("# ORDER\tLATENCY\tABS\tDLEN");
-        for (latency_us, time_from_start_us, n_dest) in stats {
+        println!("# ORDER\tLATENCY\tSEND_AT\tDLEN");
+        for (latency_us, sent_at_us, n_dest) in stats {
             count += 1;
-            println!("{count}\t{latency_us}\t{time_from_start_us}\t{n_dest}");
+            println!("{count}\t{latency_us}\t{sent_at_us}\t{n_dest}");
         }
     })
 }
