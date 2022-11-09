@@ -188,7 +188,7 @@ fn main() {
                             // allow next request
                             outstanding.add_permits(1);
                             // latency / sent at / number of dests
-                            stats.push((latency_us, payload.sent_at_us, n_dest));
+                            stats.push((latency_us, payload.sent_at_us, n_dest, dest));
                         }
                         _ => {
                             break;
@@ -203,9 +203,9 @@ fn main() {
         let mut count = 0;
         eprintln!("printing stats...");
         println!("# ORDER\tLATENCY\tSEND_AT\tDLEN");
-        for (latency_us, sent_at_us, n_dest) in stats {
+        for (latency_us, sent_at_us, n_dest, dest) in stats {
             count += 1;
-            println!("{count}\t{latency_us}\t{sent_at_us}\t{n_dest}");
+            println!("{count}\t{latency_us}\t{sent_at_us}\t{n_dest}\t{dest:?}");
         }
     })
 }
