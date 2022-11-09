@@ -177,9 +177,8 @@ fn main() {
                             let payload: Payload = bincode::deserialize(&msg).expect("error: deserializing reply");
                             let now_us = u64::try_from((Instant::now() - start).as_micros()).unwrap();
                             let latency_us = now_us - payload.sent_at_us;
-                            let n_dest = dest.len();
-                            // latency / deliver time from start / number of dests
-                            stats.push((latency_us, now_us, n_dest));
+                            // latency / deliver time from start / dests
+                            stats.push((latency_us, payload.sent_at_us, dest));
                         }
                         _ => {
                             break;
@@ -192,11 +191,11 @@ fn main() {
             }
         }
         eprintln!("printing stats...");
-        println!("# ORDER\tLATENCY\tABS\tDLEN");
+        println!("# ORDER\tLATENCY\tSEND_AT\tDLEN");
         let mut count = 0;
-        for (latency_us, time_from_start_us, n_dest) in stats {
+        for (latency_us, sent_at_us, dest) in stats {
             count += 1;
-            println!("{count}\t{latency_us}\t{time_from_start_us}\t{n_dest}");
+            println!("{count}\t{latency_us}\t{sent_at_us}\t{dest:?}");
         }
     })
 }
