@@ -975,7 +975,7 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
             }
             let new_clock = s.core.clock();
             if new_clock > old_clock {
-                s.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = s.core.clock());
+                s.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = new_clock);
             }
             s.update_tx.send(())?;
         }
@@ -1063,17 +1063,19 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
 async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>, send_bump: bool) -> Result<(), Error> {
     let mut ack_rx = s.read().await.ack_rx[&conn.gid()].clone();
     use Message::*;
-    let last_ack = None;
-    let last_clock = 0;
+    let mut last_ack = None;
+    let mut last_clock = 0;
     loop {
         let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
         if Some((log_epoch, log_len)) > last_ack || (send_bump && clock > last_clock) {
-            let ack = Ack {
+            last_ack = Some((log_epoch, log_len));
+            last_clock = clock;
+            conn.send(Ack {
                 log_epoch,
                 log_len,
                 clock,
-            };
-            conn.send(ack).await?;
+            })
+            .await?;
         }
         ack_rx.changed().await?;
     }
