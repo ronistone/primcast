@@ -107,16 +107,14 @@ impl RemoteLearner {
     pub fn add_remote_ack(&mut self, gid: Gid, pid: Pid, log_epoch: Epoch, log_len: u64) -> Result<(), Error> {
         assert_eq!(self.remote_gid, gid);
         let mut info = self.remote_info.get_mut(&pid).expect("pid should be present");
-        if log_epoch > info.epoch {
+        if (log_epoch, log_len) > (info.epoch, info.log_len) {
             info.epoch = log_epoch;
-            info.log_len = log_len;
-        } else if info.epoch == log_epoch && log_len > info.log_len {
             info.log_len = log_len;
         }
         Ok(())
     }
 
-    /// The remote learner follows a remote replica in a single epoch.
+    /// The remote learner follows a remote replica in a specific epoch.
     /// If the remote changes epochs, the logs may not be compatible anymore, so we truncate it to quorum safe state.
     pub fn update_log_epoch(&mut self, e: Epoch) -> Result<(), Error> {
         if e < self.remote_log_epoch {
@@ -140,7 +138,7 @@ impl RemoteLearner {
         Ok(())
     }
 
-    /// Based on information know from remote replicas we can know when a given
+    /// Based on information know from remote replicas we know when a given
     /// log prefix is safe. Any two remote group replicas in the same Epoch will
     /// have compatible logs (i.e., one is a prefix of the other). Thus, if a
     /// quorum of processes are in the same Epoch (and so is our learner log),
@@ -162,10 +160,10 @@ impl RemoteLearner {
                 }
             })
             .collect();
-        let maj_diff = same_epoch_log_sizes.len() as isize - self.quorum_size as isize;
-        if maj_diff >= 0 {
+        let q_diff = same_epoch_log_sizes.len() as isize - self.quorum_size as isize;
+        if q_diff >= 0 {
             same_epoch_log_sizes.sort_unstable();
-            let safe_len = same_epoch_log_sizes[maj_diff as usize];
+            let safe_len = same_epoch_log_sizes[q_diff as usize];
             if safe_len > 0 {
                 Some(safe_len - 1)
             } else {

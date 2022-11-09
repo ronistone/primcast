@@ -33,16 +33,14 @@ impl LogicalClock {
     pub fn get(&self, pid: Pid) -> Clock {
         self.clocks
             .iter()
-            .find(|(p, _)| pid == *p)
-            .map(|(_, c)| *c)
+            .find_map(|(p, c)| if pid == *p { Some(*c) } else { None })
             .expect("pid not found")
     }
 
     fn get_mut(&mut self, pid: Pid) -> &mut Clock {
         self.clocks
             .iter_mut()
-            .find(|(p, _)| pid == *p)
-            .map(|(_, c)| c)
+            .find_map(|(p, c)| if pid == *p { Some(c) } else { None })
             .expect("pid not found")
     }
 
@@ -196,9 +194,11 @@ mod tests {
         // quorum for current epoch is lower bound for higher epochs
         assert_eq!(c.quorum(q, e3), Some(2));
 
-        // old epoch values can be considered
+        // old epoch values can still update clock
         c.update(Pid(2), e1, 4); // 2,4,3,0
+        assert_eq!(c.quorum(q, e2), Some(2));
         c.update(Pid(3), e1, 4); // 2,4,4,0
+        assert_eq!(c.quorum(q, e2), Some(2));
         c.update(Pid(4), e1, 4); // 2,4,4,4
         assert_eq!(c.current_epoch(), e2);
         assert_eq!(c.local(), 2);
