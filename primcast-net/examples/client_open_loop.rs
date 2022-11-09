@@ -130,6 +130,7 @@ fn main() {
                 return;
             }
         };
+        sock.set_nodelay(true).unwrap();
         eprintln!("connected to {gid:?}:{pid:?} at {addr}");
         let (mut rx, mut tx) = bincode_split::<Reply, Request, _>(sock);
 
