@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,8 +9,6 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-
-use chrono::prelude::*;
 
 use clap::CommandFactory;
 use clap::Parser;
@@ -29,7 +26,6 @@ use futures::prelude::*;
 mod shared;
 use shared::*;
 
-type ClientId = u64;
 type ReplyTx = mpsc::UnboundedSender<(Clock, Bytes, GidSet)>;
 type ReplyRx = mpsc::UnboundedReceiver<(Clock, Bytes, GidSet)>;
 type RequestMap = Arc<Mutex<HashMap<MsgId, ReplyTx>>>;

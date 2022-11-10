@@ -83,6 +83,21 @@ impl std::iter::FromIterator<Gid> for GidSet {
     }
 }
 
+impl std::fmt::Display for GidSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(")?;
+
+        if let Some(gid) = self.0.get(0) {
+            write!(f, "{}", gid.0)?;
+        }
+
+        for gid in self.0.iter().skip(1) {
+            write!(f, ",{}", gid.0)?;
+        }
+        write!(f, ")")
+    }
+}
+
 impl GidSet {
     pub fn new() -> Self {
         Default::default()

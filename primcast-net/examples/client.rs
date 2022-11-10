@@ -204,7 +204,7 @@ fn main() {
         println!("# ORDER\tLATENCY\tSEND_AT\tDLEN");
         for (latency_us, sent_at_us, dest) in stats {
             count += 1;
-            println!("{count}\t{latency_us}\t{sent_at_us}\t{dest:?}");
+            println!("{count}\t{latency_us}\t{sent_at_us}\t{dest}");
         }
     })
 }
