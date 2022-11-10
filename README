@@ -25,11 +25,15 @@ The primary seems to benefit from being multithreaded under high load, and it is
 
 ## Checking the protocol for replica consistency
 
-1) Go to root project folder
-2) Run `scripts/tmux-open_loop.sh` or `scripts/tmux-closed_loop.sh` with the `--check` option
-3) Let it run for a bit. Kill the processes.
+1) Go to root project folder.
+2) Build with `cargo build --release --examples`
+3) Run `scripts/tmux-open_loop.sh` or `scripts/tmux-closed_loop.sh` with the `--release` and `--check` option. For example:
+
+    ./scripts/tmux-open_loop.sh --globals 0.5 -m 1000 --release --check
+
+4) Let it run for a bit. Kill the processes.
    One `out_GID_PID.txt` file will be created per process.
    Deliveries will be printed one per line in order (grep for DELIVERY).
-4) Run `scripts/check_consistency.sh`
+5) Run `scripts/check_consistency.sh`
 
 
