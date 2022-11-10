@@ -191,7 +191,7 @@ fn main() {
             }
         }
         eprintln!("printing stats...");
-        println!("# ORDER\tLATENCY\tSEND_AT\tDLEN");
+        println!("# ORDER\tLATENCY\tSEND_AT\tDEST");
         let mut count = 0;
         for (latency_us, sent_at_us, dest) in stats {
             count += 1;
