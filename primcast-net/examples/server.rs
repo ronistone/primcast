@@ -132,8 +132,13 @@ async fn propose(
 async fn deliver(
     request_map: RequestMap,
     mut delivery_rx: mpsc::Receiver<(Clock, MsgId, Bytes, GidSet)>,
+    check: bool,
 ) -> Result<(), ()> {
     while let Some((ts, id, data, dest)) = delivery_rx.recv().await {
+        if check {
+            println!("{ts} {id} {dest:?} DELIVERY");
+        }
+
         let mut request_map = request_map.lock().await;
         if let Some(reply_tx) = request_map.remove(&id) {
             if let Err(_) = reply_tx.send((ts, data, dest)) {
@@ -184,7 +189,7 @@ fn main() {
         let request_map = Arc::new(Mutex::new(HashMap::default()));
 
         tokio::spawn(propose(request_map.clone(), handle, req_rx));
-        tokio::spawn(deliver(request_map, delivery_rx));
+        tokio::spawn(deliver(request_map, delivery_rx, args.check));
 
         listen_for_clients(gid, pid, cfg, req_tx).await.unwrap()
     })
