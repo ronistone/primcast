@@ -218,8 +218,14 @@ fn main() {
             let payload: Payload = bincode::deserialize(&msg).unwrap();
             // if our msg, record latency and release another proposal
             if (gid, pid) == payload.sender {
-                let now = Instant::now() - start;
-                let lat = now - payload.amcast_at;
+                let mut now = Instant::now() - start;
+                let lat: Duration;
+                if now < payload.amcast_at {
+
+                    lat = Duration::from_micros(0);
+                } else {
+                    lat = now - payload.amcast_at;
+                }
                 let lat_usec = u64::try_from(lat.as_micros()).unwrap();
                 hist.lock().await.record(lat_usec).unwrap();
                 if dest.len() == 1 {

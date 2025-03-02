@@ -80,6 +80,18 @@ while [[ $# > 0 ]]; do
             DEBUG="--debug $2"
             shift
             ;;
+        -c|--config)
+            CONFIG=$2
+            shift
+            ;;
+        -g|--gids)
+            GIDS=$2
+            shift
+            ;;
+        -p|--pids)
+            PIDS=$2
+            shift
+            ;;
         -h|--help)
             usage
             ;;
