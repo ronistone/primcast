@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 
 use rustc_hash::FxHashMap as HashMap;
-
+use tokio::time::sleep;
 use primcast_core::config;
 use primcast_core::config::PeerConfig;
 use primcast_core::types::*;
@@ -145,38 +145,22 @@ impl PrimcastHandle {
 }
 
 impl PrimcastReplica {
-    pub fn start(gid: Gid, pid: Pid, cfg: config::Config, hybrid_clock: bool, debug: Option<u64>) -> PrimcastHandle {
+    pub async fn start(gid: Gid, pid: Pid, cfg: config::Config, hybrid_clock: bool, debug: Option<u64>) -> PrimcastHandle {
         let mut leader_election = LeaderElection::new(gid, pid, cfg.clone());
         let (ev_tx, mut election_rcv) = mpsc::unbounded_channel();
         leader_election.subscribe(ev_tx);
         tokio::spawn(leader_election.run());
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(ev) = election_rcv.recv() => {
-                        match ev {
-                            Event::InitiateEpoch(epoch) => {
-                                println!("Initiating epoch {:?}", epoch);
-                            }
-                            Event::Follow(conn, epoch) => {
-                                // TODO:
-                            }
-                            Event::ProposalIn(rx) => {
-                                // TODO:
-                            }
-                            Event::PeriodicChecks(_now) => {
-                                // TODO:
-                            }
-                            _ => unreachable!(),
 
-                        }
-                    }
-                    else => continue
-                }
+        let mut actual_epoch = Epoch::initial();
+        match election_rcv.recv().await {
+            Some(Event::InitiateEpoch(epoch)) => {
+                println!("Initiating epoch {:?}", epoch);
+                actual_epoch = epoch;
             }
+            _ => unreachable!(),
+        }
 
-        });
-        let core = GroupReplica::new(gid, pid, cfg.clone(), hybrid_clock);
+        let core = GroupReplica::new(gid, pid, actual_epoch, cfg.clone(), hybrid_clock);
         let (log_epoch, log_len) = core.log_status();
         let clock = core.clock();
 
@@ -212,6 +196,25 @@ impl PrimcastReplica {
             shared: Arc::new(RwLock::new(shared)),
             ev_rx,
         };
+
+        let leader_election_shared = s.shared.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(ev) = election_rcv.recv() => {
+                        match ev {
+                            Event::InitiateEpoch(epoch) => {
+                                println!("Initiating epoch {:?}", epoch);
+                                let mut lock = leader_election_shared.write().await;
+                                lock.core.start_new_epoch(epoch).unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    else => {}
+                }
+            }
+        });
 
         let mut gid_proposal_tx = HashMap::default();
         // create a task forwarding proposals to leader of each group
@@ -388,7 +391,11 @@ impl PrimcastReplica {
 async fn run_idle() -> Result<(), Error> {
     eprintln!("== IDLE ==");
     // TODO: become candidate on timeout here?
-    futures::future::pending().await
+
+    sleep(Duration::from_secs(1)).await;
+    eprintln!("Exiting idle...");
+
+    Ok(())
 }
 
 /// Run candidate logic:
@@ -475,7 +482,7 @@ async fn run_primary(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     let mut sync_tasks = FuturesUnordered::new();
     for p in &cfg.group(self_gid).unwrap().peers {
         // connect to higher pids only (lower pid, higher leadership priority)
-        if p.pid > self_pid {
+        if p.pid != self_pid {
             // sync them to our log
             let p = p.clone();
             let s = s.clone();

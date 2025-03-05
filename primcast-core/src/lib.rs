@@ -129,8 +129,8 @@ impl GroupReplica {
     /// New replica state for the given (gid,pid).
     /// TODO: we don't currently use persistent storage.
     /// Every replica starts at epoch Epoch::initial() with an empty log.
-    pub fn new(gid: Gid, pid: Pid, config: Config, hybrid_clock: bool) -> Self {
-        let state = if Epoch::initial().owner() == pid {
+    pub fn new(gid: Gid, pid: Pid, epoch: Epoch, config: Config, hybrid_clock: bool) -> Self {
+        let state = if epoch.owner() == pid {
             ReplicaState::Primary
         } else {
             ReplicaState::Follower
@@ -149,8 +149,8 @@ impl GroupReplica {
             })
             .collect();
 
-        let promised_epoch = Epoch::initial();
-        let current_epoch = Epoch::initial();
+        let promised_epoch = epoch;
+        let current_epoch = epoch;
         let current_epoch_acks = config
             .group_pids(gid)
             .unwrap()
@@ -177,7 +177,7 @@ impl GroupReplica {
             state,
             promised_epoch,
             log,
-            log_epochs: vec![(Epoch::initial(), 0)],
+            log_epochs: vec![(epoch, 0)],
             current_epoch_acks,
             safe_len: 0,
             msgid,
@@ -220,7 +220,7 @@ impl GroupReplica {
             self.min_clock_leader(),
             self.min_new_epoch_ts()
         );
-        eprintln!("acks: {:?}", self.current_epoch_acks);
+        eprintln!("acks: {:?} epoch: {:?}", self.current_epoch_acks, self.current_epoch());
         eprintln!("remote learners:");
         for (gid, l) in &self.remote_learners {
             eprintln!(
@@ -279,6 +279,30 @@ impl GroupReplica {
             self.proposals.clear();
             self.accepts.clear();
             let (log_epoch, log_len) = self.log_status();
+            Ok((log_epoch, log_len, self.clock()))
+        } else {
+            Err(Error::EpochTooOld {
+                promised: self.promised_epoch,
+                current: self.current_epoch(),
+            })
+        }
+    }
+
+    pub fn start_new_epoch(&mut self, epoch: Epoch) -> Result<(Epoch, u64, Clock), Error> {
+        if epoch >= self.promised_epoch {
+            self.leader_last_seen = Instant::now();
+            self.promised_epoch = epoch;
+            self.state = if epoch.owner() == self.pid {
+                ReplicaState::Primary
+            } else {
+                ReplicaState::Follower
+            };
+            self.proposals.clear();
+            self.accepts.clear();
+            let (log_epoch, log_len) = self.log_status();
+
+            self.start_epoch_accept(epoch, (log_epoch, log_len), self.clock())?;
+
             Ok((log_epoch, log_len, self.clock()))
         } else {
             Err(Error::EpochTooOld {
@@ -726,9 +750,9 @@ mod tests {
         let config = Config::new_for_test();
         let mut idgen = IdGen(0);
 
-        let mut r0 = GroupReplica::new(Gid(0), Pid(0), config.clone(), false);
-        let mut r1 = GroupReplica::new(Gid(0), Pid(1), config.clone(), false);
-        let mut r2 = GroupReplica::new(Gid(0), Pid(2), config.clone(), false);
+        let mut r0 = GroupReplica::new(Gid(0), Pid(0), Epoch::initial(), config.clone(), false);
+        let mut r1 = GroupReplica::new(Gid(0), Pid(1), Epoch::initial(), config.clone(), false);
+        let mut r2 = GroupReplica::new(Gid(0), Pid(2), Epoch::initial(), config.clone(), false);
 
         assert_eq!(r0.state, Primary);
         assert_eq!(r1.state, Follower);
@@ -784,10 +808,10 @@ mod tests {
         let config = Config::new_for_test();
         let mut idgen = IdGen(0);
 
-        let mut r0_0 = GroupReplica::new(Gid(0), Pid(0), config.clone(), false);
-        let mut r0_1 = GroupReplica::new(Gid(0), Pid(1), config.clone(), false);
-        let mut r1_0 = GroupReplica::new(Gid(1), Pid(0), config.clone(), false);
-        let mut r1_1 = GroupReplica::new(Gid(1), Pid(1), config.clone(), false);
+        let mut r0_0 = GroupReplica::new(Gid(0), Pid(0), Epoch::initial(), config.clone(), false);
+        let mut r0_1 = GroupReplica::new(Gid(0), Pid(1), Epoch::initial(), config.clone(), false);
+        let mut r1_0 = GroupReplica::new(Gid(1), Pid(0), Epoch::initial(), config.clone(), false);
+        let mut r1_1 = GroupReplica::new(Gid(1), Pid(1), Epoch::initial(), config.clone(), false);
 
         // ----- STEP 1 ------
 
