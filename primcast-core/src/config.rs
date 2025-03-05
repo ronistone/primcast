@@ -44,6 +44,7 @@ pub struct GroupConfig {
     /// kept in `pid` order, no duplicates
     pub peers: Vec<PeerConfig>,
     pub quorum: u8,
+    pub zookeeper_url: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -99,6 +100,7 @@ impl Config {
                 gid: Gid(g),
                 peers,
                 quorum: 2,
+                zookeeper_url: "".to_string(),
             });
         }
 

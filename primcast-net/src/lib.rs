@@ -29,6 +29,7 @@ pub mod codec;
 pub mod conn;
 mod messages;
 pub mod util;
+pub mod leader_election;
 
 use conn::Conn;
 use messages::Message;
@@ -37,6 +38,7 @@ use util::RoundRobinStreams;
 use util::Shutdown;
 use util::ShutdownHandle;
 use util::StreamExt2;
+use crate::leader_election::LeaderElection;
 
 const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const PROPOSAL_QUEUE: usize = 100_000;
@@ -105,6 +107,7 @@ pub struct Shared {
 enum Event {
     PeriodicChecks(Instant),
     Follow(Conn, Epoch),
+    InitiateEpoch(Epoch),
     ProposalIn(mpsc::Receiver<(MsgId, Bytes, GidSet)>),
 }
 
@@ -143,6 +146,36 @@ impl PrimcastHandle {
 
 impl PrimcastReplica {
     pub fn start(gid: Gid, pid: Pid, cfg: config::Config, hybrid_clock: bool, debug: Option<u64>) -> PrimcastHandle {
+        let mut leader_election = LeaderElection::new(gid, pid, cfg.clone());
+        let (ev_tx, mut election_rcv) = mpsc::unbounded_channel();
+        leader_election.subscribe(ev_tx);
+        tokio::spawn(leader_election.run());
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(ev) = election_rcv.recv() => {
+                        match ev {
+                            Event::InitiateEpoch(epoch) => {
+                                println!("Initiating epoch {:?}", epoch);
+                            }
+                            Event::Follow(conn, epoch) => {
+                                // TODO:
+                            }
+                            Event::ProposalIn(rx) => {
+                                // TODO:
+                            }
+                            Event::PeriodicChecks(_now) => {
+                                // TODO:
+                            }
+                            _ => unreachable!(),
+
+                        }
+                    }
+                    else => continue
+                }
+            }
+
+        });
         let core = GroupReplica::new(gid, pid, cfg.clone(), hybrid_clock);
         let (log_epoch, log_len) = core.log_status();
         let clock = core.clock();
@@ -311,6 +344,9 @@ impl PrimcastReplica {
                             }
                             Event::PeriodicChecks(_now) => {
                                 // TODO:
+                            }
+                            Event::InitiateEpoch(epoch) => {
+                                // new epoch proposal
                             }
                         }
                     }

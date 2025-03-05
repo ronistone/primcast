@@ -20,6 +20,14 @@ pub type Clock = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
 pub struct Epoch(pub u32, pub Pid);
 
+impl Pid {
+    pub fn from_str(s: &str) -> Result<Self, std::num::ParseIntError> {
+        s.parse::<u32>().map(Pid)
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_string().into_bytes()
+    }
+}
 impl Epoch {
     pub fn initial() -> Epoch {
         Epoch(0, Pid(0))
