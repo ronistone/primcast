@@ -38,7 +38,7 @@ impl LeaderElection {
 
     pub async fn publish(&self, epoch: u32, pid: Pid) {
         for tx in &self.ev_tx {
-            tx.send(Event::InitiateEpoch(Epoch(epoch, pid.clone()))).unwrap();
+            tx.send(Event::InitiateEpoch(Epoch(epoch, pid.clone()))).unwrap_or(());
         }
     }
 

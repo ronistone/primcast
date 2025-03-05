@@ -179,7 +179,7 @@ fn main() {
     };
 
     rt.block_on(async {
-        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg.clone(), args.hybrid, args.debug);
+        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg.clone(), args.hybrid, args.debug).await;
         let delivery_rx = handle.take_delivery_rx().unwrap();
 
         let (req_tx, req_rx) = mpsc::unbounded_channel();
