@@ -426,6 +426,12 @@ impl GroupReplica {
         if self.log_status() != last_entry {
             return Err(Error::InvalidReplicaState);
         }
+        self.state = if epoch.owner() == self.pid {
+            ReplicaState::Primary
+        } else {
+            ReplicaState::Follower
+        };
+
         if self.current_epoch() == epoch {
             return Ok(());
         }
@@ -611,7 +617,7 @@ impl GroupReplica {
         self.leader_last_seen = Instant::now();
         let entry_ts = entry.local_ts;
         let res = self.append_inner(idx, epoch, entry)?;
-        assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order");
+        assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order: entry_ts = {}, min_clock_leader = {}", entry_ts, self.min_clock_leader());
         // append is an ack from leader
         self.add_ack(epoch.owner(), epoch, idx + 1, entry_ts).unwrap();
 

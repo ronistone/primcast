@@ -40,7 +40,7 @@ use util::ShutdownHandle;
 use util::StreamExt2;
 use crate::leader_election::LeaderElection;
 
-const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+const RETRY_TIMEOUT: Duration = Duration::from_secs(3);
 const PROPOSAL_QUEUE: usize = 100_000;
 const DELIVERY_QUEUE: usize = 100_000;
 const BATCH_SIZE_YIELD: usize = 50;
@@ -199,6 +199,7 @@ impl PrimcastReplica {
 
         let leader_election_shared = s.shared.clone();
         tokio::spawn(async move {
+            let self_pid = pid.clone();
             loop {
                 tokio::select! {
                     Some(ev) = election_rcv.recv() => {
@@ -206,7 +207,9 @@ impl PrimcastReplica {
                             Event::InitiateEpoch(epoch) => {
                                 println!("Initiating epoch {:?}", epoch);
                                 let mut lock = leader_election_shared.write().await;
-                                lock.core.start_new_epoch(epoch).unwrap();
+                                if epoch.1 == self_pid {
+                                    lock.core.propose_new_epoch(Some(epoch)).unwrap();
+                                }
                             }
                             _ => unreachable!(),
                         }
@@ -339,6 +342,7 @@ impl PrimcastReplica {
                                 if e == epoch && (state == ReplicaState::Promised || state == ReplicaState::Follower) {
                                     fut = Box::pin(run_follower(conn, epoch, self.shared.clone()));
                                 } else {
+                                    eprintln!("=================== [ignoring follow event for epoch {:?} in state {:?}] ========================", epoch, state);
                                     fut = Box::pin(run_idle());
                                 }
                             }
@@ -418,40 +422,49 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
 
     for p in &cfg.group(self_gid).unwrap().peers {
         // connect to higher pids only (lower pid, higher leadership priority)
-        if p.pid > self_pid {
+        if p.pid != self_pid {
             let p = p.clone();
             let s = s.clone();
-            promise_reqs.push(async move {
+            promise_reqs.push(AbortHandle::spawn(async move {
                 loop {
                     match get_promise(p.clone(), e, s.clone()).await {
                         Err(err) => {
                             eprintln!("error getting promise from {:?}:{:?}: {:?}", self_gid, p.pid, err);
                             tokio::time::sleep(RETRY_TIMEOUT).await;
                         }
-                        Ok(p) => break p,
+                        Ok(p) => break p
                     }
                 }
-            });
+            }));
         }
     }
 
     // wait for quorum promises
     let mut promise_result = None;
 
-    while let Some(res) = promise_reqs.next().await {
-        let mut s = s.write().await;
-        match res {
-            Ok((pid, log_epoch, log_len, clock)) => {
-                if let Some(quorum_promise) = s.core.add_promise(e, pid, clock, log_epoch, log_len)? {
-                    promise_result = Some(quorum_promise);
-                    break;
+    while let Some(join_result) = promise_reqs.next().await {
+        match join_result {
+            Ok(res) => {
+                let mut s = s.write().await;
+                match res {
+                    Ok((pid, log_epoch, log_len, clock)) => {
+                        if let Some(quorum_promise) = s.core.add_promise(e, pid, clock, log_epoch, log_len)? {
+                            promise_result = Some(quorum_promise);
+                            break;
+                        }
+                    }
+                    Err(higher_epoch) => {
+                        s.core.new_epoch_proposal(higher_epoch).unwrap();
+                        return Ok(());
+                    }
                 }
             }
-            Err(higher_epoch) => {
-                s.core.new_epoch_proposal(higher_epoch).unwrap();
-                return Ok(());
+            Err(err) => {
+                assert!(!err.is_panic());
+                std::panic::resume_unwind(err.into_panic());
             }
         }
+
     }
 
     let (high_pid, _high_log_epoch, _high_log_len, _high_clock) = promise_result.unwrap();
@@ -460,9 +473,14 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     // TODO: retry?
     sync_with(cfg.peer(self_gid, high_pid).unwrap(), e, &s).await?;
 
-    // TODO: sync a quorum of followers
+    // TODO: sync a quorum of followers --> The sync_followers() in run_primary do that?
+    let mut state = s.write().await;
+    state.core.start_new_epoch(e).unwrap();
+    //TODO Roni now is take error to sync followers
 
-    unimplemented!();
+
+    // unimplemented!();
+    Ok(())
 }
 
 /// Run primary logic. Connect to higher pids (lower pid => leadership priority) and keep them synced with our log.
@@ -552,7 +570,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
             let task = async move {
                 loop {
                     if let Err(err) = acks_fetch(p.clone(), s.clone()).await {
-                        eprintln!("fetching acks from {:?}:{:?}: {:?}", self_gid, p.pid, err);
+                        eprintln!("error fetching acks from {:?}:{:?}: {:?}", self_gid, p.pid, err);
                         tokio::time::sleep(RETRY_TIMEOUT).await;
                     }
                 }
@@ -583,6 +601,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
 
         if msgs.len() == 0 {
             // connection to leader lost
+            eprintln!("====== connection to leader lost ======");
             break 'recv std::io::ErrorKind::ConnectionReset.into();
         }
 
@@ -596,6 +615,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                         entry_epoch,
                         entry,
                     }) => {
+                        eprintln!("appending entry {:?} to log {:?}", idx, entry_epoch);
                         ack_dests.merge(&entry.dest);
                         if entry_epoch < e {
                             s.core.start_epoch_append(e, idx, entry_epoch, entry)?;
@@ -689,9 +709,11 @@ async fn handle_connection(
         }
         Message::NewEpoch { epoch } => {
             // Incoming connection from the candidate of `epoch`
+            eprintln!("new epoch request from {:?}:{:?} =  {:?}", conn.gid(), conn.pid(), epoch);
             let res = s.write().await.core.new_epoch_proposal(epoch);
             match res {
                 Ok((log_epoch, log_len, clock)) => {
+                    eprintln!("===============promised epoch: {:?}============", epoch);
                     conn.send(Message::Promise {
                         log_epoch,
                         log_len,
@@ -700,6 +722,7 @@ async fn handle_connection(
                     .await?;
                 }
                 Err(primcast_core::Error::EpochTooOld { promised, .. }) => {
+                    eprintln!("===============promised epoch too old: {:?}============", promised);
                     conn.send(Message::NewEpoch { epoch: promised }).await?;
                 }
                 _ => unreachable!(),
@@ -711,6 +734,7 @@ async fn handle_connection(
             let res = s.write().await.core.start_epoch_check(epoch, log_epochs);
             match res {
                 Ok((log_epoch, log_len)) => {
+                    eprintln!("=== Starting Epoch Check and sending Follow ===");
                     conn.send(Message::Following { log_epoch, log_len }).await?;
                     let ev_tx = s.read().await.ev_tx.clone();
                     ev_tx
@@ -718,6 +742,7 @@ async fn handle_connection(
                         .map_err(|_| Error::ReplicaShutdown)?;
                 }
                 Err(primcast_core::Error::EpochTooOld { promised, .. }) => {
+                    eprintln!("=== [ERROR] Fail to starting Epoch Check and sending NewEpoch ===");
                     conn.send(Message::NewEpoch { epoch: promised }).await?;
                 }
                 _ => unreachable!(),
@@ -774,14 +799,21 @@ async fn get_promise(
         self_pid = s.core.pid;
     }
     let req = NewEpoch { epoch: e };
+    eprintln!("requesting promise from {:?}:{:?} to {:?} for {:?}", self_gid, self_pid, peer.pid, e);
     let mut conn = Conn::request((self_gid, self_pid), (self_gid, peer.pid), peer.addr(), req).await?;
     match conn.recv().await? {
-        NewEpoch { epoch } => Ok(Err(epoch)),
+        NewEpoch { epoch } => {
+            eprintln!("New Epoch from {:?}:{:?} to {:?} for {:?}", self_gid, peer.pid, self_pid, e);
+            Ok(Err(epoch))
+        },
         Promise {
             log_epoch,
             log_len,
             clock,
-        } => Ok(Ok((conn.pid(), log_epoch, log_len, clock))),
+        } => {
+            eprintln!("promise from {:?}:{:?} to {:?} for {:?}", self_gid, peer.pid, self_pid, e);
+            Ok(Ok((conn.pid(), log_epoch, log_len, clock)))
+        },
         m => panic!("unexpected msg {:?}", m),
     }
 }
@@ -813,7 +845,8 @@ async fn deliver_task(
 
 /// Sync state up with the given peer. Used by the candidate to sync up with the highest promised peer.
 async fn sync_with(_peer: &PeerConfig, _e: Epoch, _s: &Arc<RwLock<Shared>>) -> Result<(), Error> {
-    unimplemented!()
+    // unimplemented!()
+    Ok(())
 }
 
 /// Keeps the given peer (follower) synchronized with our state (primary).

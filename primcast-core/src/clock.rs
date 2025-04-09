@@ -91,6 +91,7 @@ impl LogicalClock {
         } else {
             // update pid clock and invalidate cached majority if needed
             let c = self.get_mut(pid);
+            eprintln!("update pid: {:?} epoch: {:?} clock: {:?}", pid, epoch, clock);
             if *c < clock {
                 *c = clock;
                 self.sorted = false;
@@ -120,7 +121,10 @@ impl LogicalClock {
     pub fn tick(&mut self) -> Clock {
         self.sorted = false;
         let hybrid = self.hybrid;
+        let self_pid = self.pid.clone();
+        let self_epoch = self.epoch.clone();
         let c = self.get_mut(self.pid);
+        eprintln!("update clock pid: {:?} epoch: {:?} clock: {:?}", self_pid, self_epoch, *c);
         if hybrid {
             // micros from UNIX_EPOCH
             let now = (chrono::Utc::now().timestamp_nanos() / 1000) as u64;
