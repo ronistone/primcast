@@ -106,7 +106,7 @@ pub struct Shared {
     shutdown: Shutdown,
 }
 
-enum Event {
+pub enum Event {
     PeriodicChecks(Instant),
     Follow(Conn, Epoch),
     InitiateEpoch(Epoch),
@@ -153,7 +153,7 @@ impl PrimcastReplica {
         leader_election.subscribe(ev_tx);
         tokio::spawn(leader_election.run());
 
-        let mut actual_epoch = Epoch::initial();
+        let actual_epoch;
         match election_rcv.recv().await {
             Some(Event::InitiateEpoch(epoch)) => {
                 timed_print!("Initiating epoch {:?}", epoch);
@@ -354,7 +354,7 @@ impl PrimcastReplica {
                             Event::PeriodicChecks(_now) => {
                                 // TODO:
                             }
-                            Event::InitiateEpoch(epoch) => {
+                            Event::InitiateEpoch(..) => {
                                 // new epoch proposal
                             }
                         }
@@ -473,7 +473,7 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
         }
     }
 
-    let (high_pid, _high_log_epoch, _high_log_len, _high_clock) = promise_result.unwrap();
+    let (_high_pid, _high_log_epoch, _high_log_len, _high_clock) = promise_result.unwrap();
 
     let cfg;
     let self_gid;
@@ -957,7 +957,6 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
     loop {
         {
             let s = s.read().await;
-            let (promised_epoch, _) = s.core.state();
             let (log_epoch, log_len) = s.core.log_status();
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
             if follower_log_len == log_len {
@@ -1061,7 +1060,6 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
     }
 
     let promised_epoch;
-    let log_epochs;
     let clock;
     {
         let s = s.read().await;
@@ -1070,7 +1068,6 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
             timed_print!("The promised epoch is different from the current epoch second");
             return Ok(()); // replica accepted higher epoch
         }
-        log_epochs = s.core.log_epochs().clone();
         clock = s.core.clock();
     }
 
@@ -1090,7 +1087,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
             timed_print!("follower changed to new epoch");
             return Err(Error::NotLeader(epoch));
         }
-        Ack { log_epoch, log_len, clock } => {
+        Ack { log_epoch, .. } => {
             {
                 let mut s = s.write().await;
                 s.core.append_accept(peer.pid, log_epoch);

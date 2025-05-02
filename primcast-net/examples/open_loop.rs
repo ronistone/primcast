@@ -218,7 +218,7 @@ fn main() {
             let payload: Payload = bincode::deserialize(&msg).unwrap();
             // if our msg, record latency and release another proposal
             if (gid, pid) == payload.sender {
-                let mut now = Instant::now() - start;
+                let now = Instant::now() - start;
                 let lat: Duration;
                 if now < payload.amcast_at {
 

@@ -130,6 +130,14 @@ impl<'a, S: Stream + Unpin> Future for NextReadyChunk<'a, S> {
 
 /// When dropped, makes the related Shutdown futures complete.
 pub struct ShutdownHandle(oneshot::Sender<()>);
+
+impl ShutdownHandle {
+    /// Manually trigger shutdown without waiting for this handle to be dropped
+    pub fn shutdown(self) {
+        let _ = self.0.send(());
+    }
+}
+
 #[derive(Clone)]
 
 /// Future that can be cloned to be waited on by multiple tasks. All copies complete when

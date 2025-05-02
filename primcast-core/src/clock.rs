@@ -91,7 +91,7 @@ impl LogicalClock {
         } else {
             // update pid clock and invalidate cached majority if needed
             let c = self.get_mut(pid);
-            eprintln!("update pid: {:?} epoch: {:?} clock: {:?}", pid, epoch, clock);
+            // eprintln!("update pid: {:?} epoch: {:?} clock: {:?}", pid, epoch, clock);
             if *c < clock {
                 *c = clock;
                 self.sorted = false;
@@ -127,7 +127,7 @@ impl LogicalClock {
         eprintln!("update clock pid: {:?} epoch: {:?} clock: {:?}", self_pid, self_epoch, *c);
         if hybrid {
             // micros from UNIX_EPOCH
-            let now = (chrono::Utc::now().timestamp_nanos() / 1000) as u64;
+            let now = (chrono::Utc::now().timestamp_nanos_opt().unwrap() / 1000) as u64;
             *c = std::cmp::max(now, *c + 1);
         } else {
             *c += 1;
