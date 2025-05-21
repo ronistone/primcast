@@ -70,8 +70,8 @@ impl LeaderElection {
             // Determine if the current node is the leader
             if let Some((index, _)) = sorted_children.iter().enumerate().find(|(_, node)| format!("{}/{}", self.base_path, node) == my_node.clone().unwrap()) {
                 if index == 0 {
-                    let epoch_value: u32 = my_node.clone().unwrap().split("n_").last().unwrap().parse().unwrap();
-                    self.publish(epoch_value, my_pid).await;
+                    // let epoch_value: u32 = my_node.clone().unwrap().split("n_").last().unwrap().parse().unwrap();
+                    self.publish(0, my_pid).await;
                     loop {
                         timed_print!("I am  the Leader: {}", my_pid.0);
                         tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;   
@@ -81,9 +81,9 @@ impl LeaderElection {
                     let data = zk.get_data(format!("{}/{}", self.base_path, leader).as_str()).await.unwrap().unwrap();
                     let data_str = std::str::from_utf8(&data.0).unwrap();
                     let leader_pid = Pid::from_str(data_str);
-                    let epoch_value: u32 = leader.split("n_").last().unwrap().parse().unwrap();
+                    // let epoch_value: u32 = leader.split("n_").last().unwrap().parse().unwrap();
 
-                    self.publish(epoch_value, leader_pid.unwrap()).await;
+                    self.publish(0, leader_pid.unwrap()).await;
 
                     let predecessor = format!("{}/{}", self.base_path, sorted_children[index - 1]);
 

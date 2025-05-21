@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::u32;
 
 use bytes::Bytes;
 
@@ -102,6 +103,8 @@ pub struct Shared {
     ack_tx: HashMap<Gid, watch::Sender<(Epoch, u64, Clock)>>,
     ack_rx: HashMap<Gid, watch::Receiver<(Epoch, u64, Clock)>>,
     ev_tx: mpsc::UnboundedSender<Event>,
+    ev_wt_tx: watch::Sender<()>,
+    ev_wt_rx: watch::Receiver<()>,
     proposal_tx: mpsc::Sender<(MsgId, Bytes, GidSet)>,
     shutdown: Shutdown,
 }
@@ -153,14 +156,7 @@ impl PrimcastReplica {
         leader_election.subscribe(ev_tx);
         tokio::spawn(leader_election.run());
 
-        let actual_epoch;
-        match election_rcv.recv().await {
-            Some(Event::InitiateEpoch(epoch)) => {
-                timed_print!("Initiating epoch {:?}", epoch);
-                actual_epoch = epoch;
-            }
-            _ => unreachable!(),
-        }
+        let actual_epoch = Epoch(0, Pid(u32::MAX));
 
         let core = GroupReplica::new(gid, pid, actual_epoch, cfg.clone(), hybrid_clock);
         let (log_epoch, log_len) = core.log_status();
@@ -179,6 +175,7 @@ impl PrimcastReplica {
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_QUEUE);
         let (delivery_tx, delivery_rx) = mpsc::channel(DELIVERY_QUEUE);
         let (shutdown, shutdown_handle) = Shutdown::new();
+        let (ev_update_tx, ev_update_rx) = watch::channel(());
 
         let shared = Shared {
             core,
@@ -187,6 +184,8 @@ impl PrimcastReplica {
             ack_tx,
             ack_rx,
             ev_tx,
+            ev_wt_tx: ev_update_tx,
+            ev_wt_rx: ev_update_rx,
             proposal_tx,
             shutdown,
         };
@@ -196,7 +195,7 @@ impl PrimcastReplica {
             pid,
             cfg: cfg.clone(),
             shared: Arc::new(RwLock::new(shared)),
-            ev_rx,
+            ev_rx,            
         };
 
         let leader_election_shared = s.shared.clone();
@@ -210,7 +209,7 @@ impl PrimcastReplica {
                                 timed_print!("Initiating epoch {:?}", epoch);
                                 let mut lock = leader_election_shared.write().await;
                                 if epoch.1 == self_pid {
-                                    lock.core.propose_new_epoch(Some(epoch)).unwrap();
+                                    lock.core.become_candidate();
                                 }
                             }
                             _ => unreachable!(),
@@ -326,7 +325,7 @@ impl PrimcastReplica {
                         let (e, state) = self.shared.read().await.core.state();
                         match state {
                             ReplicaState::Promised | ReplicaState::Follower => {
-                                fut = Box::pin(run_idle());
+                                fut = Box::pin(run_idle(self.shared.clone()));
                             }
                             ReplicaState::Candidate => {
                                 fut = Box::pin(run_candidate(e, self.shared.clone()));
@@ -345,7 +344,7 @@ impl PrimcastReplica {
                                     fut = Box::pin(run_follower(conn, epoch, self.shared.clone()));
                                 } else {
                                     timed_print!("=================== [ignoring follow event for epoch {:?} in state {:?}] ========================", epoch, state);
-                                    fut = Box::pin(run_idle());
+                                    fut = Box::pin(run_idle(self.shared.clone()));
                                 }
                             }
                             Event::ProposalIn(rx) => {
@@ -384,7 +383,7 @@ impl PrimcastReplica {
                             s.ack_tx[&gid].send((log_epoch, log_len, clock))?;
                         }
                     }
-                    _ = &mut shutdown => break 'main,
+                    // _ = &mut shutdown => break 'main,
                 }
             }
         }
@@ -396,11 +395,29 @@ impl PrimcastReplica {
 }
 
 /// Replica is waiting for a connection from the leader.
-async fn run_idle() -> Result<(), Error> {
+async fn run_idle(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     timed_print!("== IDLE ==");
     // TODO: become candidate on timeout here?
+    // let mut ev_rx;
+    // {
+    //     let s = s.read().await;
+    //     ev_rx = s.ev_wt_rx.clone();
+    // }
 
-    sleep(Duration::from_secs(1)).await;
+    // for _ in 0..1 {
+    //     tokio::select! {
+    //         e = ev_rx.changed() => {
+    //             ev_rx.borrow_and_update();
+    //             timed_print!("woken up from idle {:?}", e);
+    //         }
+    //         _ = sleep(Duration::from_secs(1)) => {
+    //             timed_print!("idle timeout");
+    //         }
+    //     }
+    // }
+
+    sleep(Duration::from_millis(5000)).await;
+
     timed_print!("Exiting idle...");
 
     Ok(())
@@ -603,18 +620,33 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
 
     // send ack back to primary
     let mut ack_rx = s.read().await.ack_rx[&self_gid].clone();
+    let (leader_tx, mut leader_rx) = tokio::sync::mpsc::unbounded_channel();
     let send_acks_task = {
         async move {
             timed_print!("sending acks to {:?}:{:?}", conn_tx.gid(), conn_tx.pid());
             loop {
-                ack_rx.changed().await?;
-                let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
-                let ack = Message::Ack {
-                    log_epoch,
-                    log_len,
-                    clock,
-                };
-                conn_tx.send(ack).await?;
+                tokio::select! {
+                    _ = ack_rx.changed() => {
+                        let (log_epoch, log_len, clock) = *ack_rx.borrow_and_update();
+                        let ack = Message::Ack {
+                            log_epoch,
+                            log_len,
+                            clock,
+                        };
+                        conn_tx.send(ack).await?;
+                    }
+                    msg = leader_rx.recv() => {
+                        match msg {
+                            Some(msg) => {
+                                conn_tx.send(msg).await?;
+                            }
+                            None => {
+                                timed_print!("leader connection closed");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }                
             }
         }
     };
@@ -677,18 +709,28 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                     }) => {
                         timed_print!("appending entry {:?} to log {:?}", idx, entry_epoch);
                         ack_dests.merge(&entry.dest);
-                        if entry_epoch < e {
+                        let (actual_epoch, _) = s.core.log_status();
+                        if entry_epoch > actual_epoch {
                             s.core.start_epoch_append(e, idx, entry_epoch, entry)?;
                         } else {
-                            s.core.append(e, idx, entry)?;
+                            s.core.append(entry_epoch, idx, entry)?;
                         }
+                    }
+                    Ok(Message::LogAppendRequest { idx, entry_epoch }) => {
+                        timed_print!("requesting log append {:?} to log {:?}", idx, entry_epoch);
+                        let (epoch, entry) = s.core.log_entry(idx).unwrap();
+                        leader_tx.send(Message::LogAppend {
+                            idx: idx,
+                            entry_epoch: epoch,
+                            entry: entry.clone(),
+                        }).unwrap();
                     }
                     Ok(Message::StartEpochAccept {
                         epoch,
                         prev_entry,
                         clock,
                     }) => {
-                        s.core.start_epoch_accept(epoch, prev_entry, clock)?;
+                        s.core.start_epoch_accept(epoch, prev_entry, clock).unwrap();
                         ack_dests.insert(self_gid);
                     }
                     Ok(Message::Ack {
@@ -794,12 +836,17 @@ async fn handle_connection(
             let res = s.write().await.core.start_epoch_check(epoch, log_epochs);
             match res {
                 Ok((log_epoch, log_len)) => {
-                    timed_print!("=== Starting Epoch Check and sending Follow ===");
+                    timed_print!("=== Starting Epoch Check and sending Follow {}, {} ===", log_epoch, log_len);
                     conn.send(Message::Following { log_epoch, log_len }).await?;
-                    let ev_tx = s.read().await.ev_tx.clone();
-                    ev_tx
-                        .send(Event::Follow(conn, epoch))
-                        .map_err(|_| Error::ReplicaShutdown)?;
+                    {
+                        let s = s.read().await;
+                        let ev_tx = s.ev_tx.clone();
+                        ev_tx
+                            .send(Event::Follow(conn, epoch))
+                            .map_err(|_| Error::ReplicaShutdown)?;
+
+                        s.ev_wt_tx.send(())?;
+                    }
                 }
                 Err(primcast_core::Error::EpochTooOld { promised, .. }) => {
                     timed_print!("=== [ERROR] Fail to starting Epoch Check and sending NewEpoch ===");
@@ -955,16 +1002,42 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
     let mut to_send = vec![];
     let mut last_clock_sent = 0;
     loop {
+        let mut ack_dests = GidSet::new();
         {
             let s = s.read().await;
             let (log_epoch, log_len) = s.core.log_status();
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
+            timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
             if follower_log_len == log_len {
                 timed_print!("follower log is up to date");
                 break;
             }
+
+            
+            while follower_log_len > log_len { // TODO infinite loop need to be fixed
+                timed_print!("follower log is higher than primary log, sync with it");
+                let (epoch, entry) = s.core.log_entry(log_len).unwrap();
+                to_send.push(LogAppendRequest {
+                    idx: log_len,
+                    entry_epoch: epoch,
+                });
+                follower_log_epoch = epoch;
+                last_clock_sent = std::cmp::max(last_clock_sent, entry.local_ts);
+                panic!("follower log is higher than primary log, and the code is broken yet");
+            }
+
+
             while follower_log_len < log_len {
                 let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
+                // if follower_log_epoch < epoch && epoch == e {
+                //     // follower synced up to primary epoch e
+                //     let clock = s.core.clock();
+                //     to_send.push(StartEpochAccept {
+                //         epoch,
+                //         prev_entry: (follower_log_epoch, follower_log_len),
+                //         clock,
+                //     });
+                // }
                 to_send.push(LogAppend {
                     idx: follower_log_len,
                     entry_epoch: epoch,
@@ -991,8 +1064,6 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
                         clock: last_clock_sent,
                     });
                 }
-
-                // TODO need to send message to mark sync end?
             }
 
         };
@@ -1009,7 +1080,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
 
         // are more entries already available? then send them
         let (new_log_epoch, new_log_len, new_clock) = *ack_rx.borrow_and_update();
-        if sync_log_epoch != new_log_epoch {
+        if sync_log_epoch < new_log_epoch {
             timed_print!("follower changed epoch to {:?} != {:?}", sync_log_epoch, new_log_epoch);
             return Ok(());
         }
@@ -1052,10 +1123,31 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
                             }
                             s.update_tx.send(())?;
                         }
+                        LogAppend {
+                            idx,
+                            entry_epoch,
+                            entry,
+                        } => {
+                            timed_print!("log append from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), entry_epoch);
+                            {
+                                ack_dests.merge(&entry.dest);
+                                let mut s = s.write().await;
+                                s.core.append(e, idx, entry)?;
+                            }
+                        }
                         m => panic!("unexpected message: {:?}", m),
                     }
                 }
             }
+        }
+        {
+            let s = s.write().await;
+            let (epoch, len) = s.core.log_status();
+            let clock = s.core.clock();
+            for gid in ack_dests.0.drain(..) {
+                s.ack_tx[&gid].send((epoch, len, clock))?;
+            }
+            s.update_tx.send(())?;
         }
     }
 
@@ -1166,15 +1258,17 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
             while follower_log_len < log_len {
                 let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
-                if follower_log_epoch < epoch && epoch == e {
-                    // follower synced up to primary epoch e
-                    let clock = s.core.clock();
-                    to_send.push(StartEpochAccept {
-                        epoch,
-                        prev_entry: (follower_log_epoch, follower_log_len),
-                        clock,
-                    });
-                }
+                // if follower_log_epoch < epoch && epoch == e {
+                //     // follower synced up to primary epoch e
+                //     let clock = s.core.clock();
+                //     to_send.push(StartEpochAccept {
+                //         epoch,
+                //         prev_entry: (follower_log_epoch, follower_log_len),
+                //         clock,
+                //     });
+                //     timed_print!("incrementing follower log epoch to {:?}", epoch);
+                // }
+                timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
                 to_send.push(LogAppend {
                     idx: follower_log_len,
                     entry_epoch: epoch,
@@ -1210,7 +1304,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
 
         // are more entries already available? then send them
         let (new_log_epoch, new_log_len, new_clock) = *ack_rx.borrow_and_update();
-        if sync_log_epoch != new_log_epoch {
+        if sync_log_epoch < new_log_epoch {
             timed_print!("follower changed epoch to {:?} != {:?}", sync_log_epoch, new_log_epoch);
             return Ok(());
         }

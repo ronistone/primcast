@@ -1,3 +1,5 @@
+use std::u32;
+
 use serde::Deserialize;
 use serde::Serialize;
 use smallvec::SmallVec;
@@ -30,7 +32,7 @@ impl Pid {
 }
 impl Epoch {
     pub fn initial() -> Epoch {
-        Epoch(0, Pid(0))
+        Epoch(0, Pid(u32::MAX))
     }
 
     /// Next epoch higher than this one, owned by the given Pid

@@ -55,7 +55,7 @@ impl RemoteLearner {
                     (
                         p,
                         RemoteInfo {
-                            epoch: Epoch::initial(),
+                            epoch: Epoch::initial(), // TODO leader information to check if must rewrite
                             log_len: 0,
                         },
                     )

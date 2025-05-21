@@ -48,6 +48,11 @@ pub enum Message {
         entry: LogEntry,
     },
 
+    LogAppendRequest {
+        idx: u64,
+        entry_epoch: Epoch,
+    },
+
     AckRequest,
     RemoteAckRequest,
     Ack {

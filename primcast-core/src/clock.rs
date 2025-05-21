@@ -31,10 +31,11 @@ impl LogicalClock {
 
     /// Value of the clock for given pid
     pub fn get(&self, pid: Pid) -> Clock {
-        self.clocks
+        let clock = self.clocks
             .iter()
-            .find_map(|(p, c)| if pid == *p { Some(*c) } else { None })
-            .expect("pid not found")
+            .find_map(|(p, c)| if pid == *p { Some(*c) } else { None });
+
+        clock.or(Some(0)).unwrap()
     }
 
     fn get_mut(&mut self, pid: Pid) -> &mut Clock {

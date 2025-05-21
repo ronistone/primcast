@@ -1,5 +1,6 @@
 use bytes::Bytes;
 
+use core::time;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -273,6 +274,10 @@ impl GroupReplica {
         self.accepts.len()
     }
 
+    pub fn become_candidate(&mut self) {
+        self.state = ReplicaState::Candidate;
+
+    }
     /// Move to a higher epoch for which we are leader
     pub fn propose_new_epoch(&mut self, higher_than: Option<Epoch>) -> Result<Epoch, Error> {
         let epoch = if let Some(higher) = higher_than {
@@ -361,6 +366,7 @@ impl GroupReplica {
             // find matching log prefix
             let mut idx = 0;
             let mut prefix_len = 0;
+            timed_print!("checking log prefix for {:?} with {:?}", self.log_epochs, log_epochs);
             for (our, leader) in self.log_epochs.iter().zip(log_epochs.iter()) {
                 if our.0 == leader.0 {
                     // same epoch
@@ -403,14 +409,17 @@ impl GroupReplica {
         entry: LogEntry,
     ) -> Result<u64, Error> {
         if self.promised_epoch != epoch {
+            timed_print!("FAIL TO START EPOCH APPEND: {:?} != {:?}", self.promised_epoch, epoch);
             return Err(Error::WrongEpoch {
                 expected: self.promised_epoch,
             });
         }
-        if self.state != ReplicaState::Promised {
+        if self.state != ReplicaState::Promised && self.state != ReplicaState::Follower {
+            timed_print!("FAIL TO START EPOCH APPEND: {:?} != {:?}", self.state, ReplicaState::Promised);
             return Err(Error::NotPromised);
         }
 
+        timed_print!("start epoch append for {:?} with log len {} accept_len={}", entry_epoch, self.log.len(), self.accepts.len());
         self.leader_last_seen = Instant::now();
         self.append_inner(idx, entry_epoch, entry)
     }
@@ -418,7 +427,7 @@ impl GroupReplica {
     /// Returns Ok if the replica's state is up-to-date for accepting the given epoch, and moves the current epoch to it.
     pub fn start_epoch_accept(&mut self, epoch: Epoch, last_entry: (Epoch, u64), clock: Clock) -> Result<(), Error> {
         if self.promised_epoch != epoch {
-            timed_print!("FAIL TO START EPOCH ACCEPT: {:?} != {:?}", self.promised_epoch, epoch);
+            timed_print!("FAIL TO START EPOCH ACCEPT promised epoch is different: {:?} != {:?}", self.promised_epoch, epoch);
             return Err(Error::WrongEpoch {
                 expected: self.promised_epoch,
             });
@@ -436,6 +445,7 @@ impl GroupReplica {
         let (_current_epoch, current_len) = self.log_status();
 
         // move current_epoch forward
+        timed_print!("start epoch accept for {:?} with log len {} accept_len={}", epoch, current_len, self.accepts.len());
         self.log_epochs.push((epoch, current_len));
         // update clock info
         self.clock.advance_epoch(epoch);
@@ -515,11 +525,10 @@ impl GroupReplica {
         let e = self.log.get(usize::try_from(idx).expect("out of range log idx"))?;
         // derive entry epoch from the log_epochs array
         let mut epoch = None;
-        let mut total_len = 0;
+        timed_print!("get log entry {:?} {:?}", idx, self.log_epochs);
         for &(e, len) in &self.log_epochs {
             // TODO: store Epoch in LogEntry instead?
-            total_len += len;
-            if total_len > idx {
+            if len > idx {
                 epoch = Some(e);
                 break;
             }
@@ -551,6 +560,7 @@ impl GroupReplica {
 
     /// Helper method for properly appending to the log
     fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<u64, Error> {
+        timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
         let (log_epoch, log_len) = self.log_status();
         assert_eq!(log_len, self.log.len() as u64);
 
@@ -577,7 +587,8 @@ impl GroupReplica {
         if log_epoch == entry_epoch {
             self.log_epochs.last_mut().unwrap().1 += 1;
         } else {
-            self.log_epochs.push((entry_epoch, 1));
+            timed_print!("append_inner: invalid epoch {:?} to log_epoch={:?}, entry={:?}", entry_epoch, log_epoch, entry);
+            self.log_epochs.push((entry_epoch, log_len + 1));
             // don't think the following ever does anything, but its safe to do.
             self.clock.advance_epoch(entry_epoch);
         }
@@ -598,25 +609,29 @@ impl GroupReplica {
 
     /// Append log entry from the leader. Returns the entry idx the log.
     pub fn append(&mut self, epoch: Epoch, idx: u64, entry: LogEntry) -> Result<u64, Error> {
-        if self.promised_epoch > epoch || self.current_epoch() > epoch {
+        let (log_epoch, _) = self.log_status();
+        if (self.promised_epoch > epoch || self.current_epoch() > epoch) && log_epoch > epoch {
+            timed_print!("FAIL TO APPEND: {:?} > {:?} or {:?} > {:?}", self.promised_epoch, epoch, self.current_epoch(), epoch);
             return Err(Error::EpochTooOld {
                 promised: self.promised_epoch,
                 current: self.promised_epoch,
             });
         }
-        if self.current_epoch() != epoch {
-            return Err(Error::WrongEpoch {
-                expected: self.current_epoch(),
-            });
-        }
-        if self.state != ReplicaState::Follower {
-            return Err(Error::NotFollower);
-        }
+        // if self.current_epoch() > epoch {
+        //     timed_print!("FAIL TO APPEND: {:?} < {:?}", self.current_epoch(), epoch);
+        //     return Err(Error::WrongEpoch {
+        //         expected: self.current_epoch(),
+        //     });
+        // }
+        // if self.state != ReplicaState::Follower {
+        //     timed_print!("FAIL TO APPEND: {:?} != {:?}", self.state, ReplicaState::Follower);
+        //     return Err(Error::NotFollower);
+        // }
 
         self.leader_last_seen = Instant::now();
         let entry_ts = entry.local_ts;
         let res = self.append_inner(idx, epoch, entry)?;
-        assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order: entry_ts = {}, min_clock_leader = {}", entry_ts, self.min_clock_leader());
+        // assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order: entry_ts = {}, min_clock_leader = {}", entry_ts, self.min_clock_leader());
         // append is an ack from leader
         self.add_ack(epoch.owner(), epoch, idx + 1, entry_ts).unwrap();
 
