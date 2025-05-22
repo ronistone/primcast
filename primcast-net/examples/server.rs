@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -183,8 +182,6 @@ fn main() {
         let delivery_rx = handle.take_delivery_rx().unwrap();
 
         let (req_tx, req_rx) = mpsc::unbounded_channel();
-
-        tokio::time::sleep(Duration::from_secs(10)).await; // wait for things to settle...
 
         let request_map = Arc::new(Mutex::new(HashMap::default()));
 

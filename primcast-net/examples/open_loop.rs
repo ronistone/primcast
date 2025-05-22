@@ -171,8 +171,6 @@ fn main() {
         let hist_locals = Arc::new(Mutex::new(Histogram::<u64>::new(3).unwrap()));
         let hist_globals = Arc::new(Mutex::new(Histogram::<u64>::new(3).unwrap()));
 
-        tokio::time::sleep(Duration::from_secs(10)).await; // wait for things to settle...
-
         // print stats
         if let Some(secs) = args.stats {
             tokio::spawn(print_stats(secs, hist.clone(), hist_locals.clone(), hist_globals.clone()));

@@ -88,12 +88,16 @@ impl LeaderElection {
                     let predecessor = format!("{}/{}", self.base_path, sorted_children[index - 1]);
 
                     // Watch the predecessor node
+                    let mut count: u8 = 0;
                     loop {
                         if zk.exists(&predecessor).await.unwrap().is_none() {
                             continue 'main;
                         }
-                        println!("Watching {}", predecessor);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        if count % 20 == 0 {
+                            println!("Watching {}", predecessor);
+                        }
+                        count += 1;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     }
                 }
             }

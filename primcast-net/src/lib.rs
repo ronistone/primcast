@@ -43,7 +43,7 @@ use util::ShutdownHandle;
 use util::StreamExt2;
 use crate::leader_election::LeaderElection;
 
-const RETRY_TIMEOUT: Duration = Duration::from_secs(3);
+const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const PROPOSAL_QUEUE: usize = 100_000;
 const DELIVERY_QUEUE: usize = 100_000;
 const BATCH_SIZE_YIELD: usize = 50;
@@ -392,26 +392,8 @@ impl PrimcastReplica {
 /// Replica is waiting for a connection from the leader.
 async fn run_idle(_: Arc<RwLock<Shared>>) -> Result<(), Error> {
     timed_print!("== IDLE ==");
-    // TODO: become candidate on timeout here?
-    // let mut ev_rx;
-    // {
-    //     let s = s.read().await;
-    //     ev_rx = s.ev_wt_rx.clone();
-    // }
 
-    // for _ in 0..1 {
-    //     tokio::select! {
-    //         e = ev_rx.changed() => {
-    //             ev_rx.borrow_and_update();
-    //             timed_print!("woken up from idle {:?}", e);
-    //         }
-    //         _ = sleep(Duration::from_secs(1)) => {
-    //             timed_print!("idle timeout");
-    //         }
-    //     }
-    // }
-
-    sleep(Duration::from_millis(5000)).await;
+    sleep(Duration::from_millis(100)).await;
 
     timed_print!("Exiting idle...");
 
@@ -546,7 +528,6 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
             break;
         }
     }
-    // tokio::time::sleep(Duration::from_millis(100)).await;
 
     {
         let s = s.read().await;
