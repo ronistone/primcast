@@ -6,8 +6,6 @@ use std::time::Instant;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHasher;
 
-use std::time::{SystemTime, UNIX_EPOCH};
-use crate::timed_print;
 use crate::types::*;
 
 /// Pending message information needed to track delivery

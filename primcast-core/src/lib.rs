@@ -1,6 +1,5 @@
 use bytes::Bytes;
 
-use core::time;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 

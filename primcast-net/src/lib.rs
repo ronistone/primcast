@@ -103,8 +103,6 @@ pub struct Shared {
     ack_tx: HashMap<Gid, watch::Sender<(Epoch, u64, Clock)>>,
     ack_rx: HashMap<Gid, watch::Receiver<(Epoch, u64, Clock)>>,
     ev_tx: mpsc::UnboundedSender<Event>,
-    ev_wt_tx: watch::Sender<()>,
-    ev_wt_rx: watch::Receiver<()>,
     proposal_tx: mpsc::Sender<(MsgId, Bytes, GidSet)>,
     shutdown: Shutdown,
 }
@@ -175,7 +173,6 @@ impl PrimcastReplica {
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_QUEUE);
         let (delivery_tx, delivery_rx) = mpsc::channel(DELIVERY_QUEUE);
         let (shutdown, shutdown_handle) = Shutdown::new();
-        let (ev_update_tx, ev_update_rx) = watch::channel(());
 
         let shared = Shared {
             core,
@@ -184,8 +181,6 @@ impl PrimcastReplica {
             ack_tx,
             ack_rx,
             ev_tx,
-            ev_wt_tx: ev_update_tx,
-            ev_wt_rx: ev_update_rx,
             proposal_tx,
             shutdown,
         };
@@ -383,7 +378,7 @@ impl PrimcastReplica {
                             s.ack_tx[&gid].send((log_epoch, log_len, clock))?;
                         }
                     }
-                    // _ = &mut shutdown => break 'main,
+                    _ = &mut shutdown => break 'main,
                 }
             }
         }
@@ -395,7 +390,7 @@ impl PrimcastReplica {
 }
 
 /// Replica is waiting for a connection from the leader.
-async fn run_idle(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
+async fn run_idle(_: Arc<RwLock<Shared>>) -> Result<(), Error> {
     timed_print!("== IDLE ==");
     // TODO: become candidate on timeout here?
     // let mut ev_rx;
@@ -844,8 +839,6 @@ async fn handle_connection(
                         ev_tx
                             .send(Event::Follow(conn, epoch))
                             .map_err(|_| Error::ReplicaShutdown)?;
-
-                        s.ev_wt_tx.send(())?;
                     }
                 }
                 Err(primcast_core::Error::EpochTooOld { promised, .. }) => {
@@ -1015,14 +1008,14 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
 
             
             while follower_log_len > log_len { // TODO infinite loop need to be fixed
-                timed_print!("follower log is higher than primary log, sync with it");
-                let (epoch, entry) = s.core.log_entry(log_len).unwrap();
-                to_send.push(LogAppendRequest {
-                    idx: log_len,
-                    entry_epoch: epoch,
-                });
-                follower_log_epoch = epoch;
-                last_clock_sent = std::cmp::max(last_clock_sent, entry.local_ts);
+                // timed_print!("follower log is higher than primary log, sync with it");
+                // let (epoch, entry) = s.core.log_entry(log_len).unwrap();
+                // to_send.push(LogAppendRequest {
+                //     idx: log_len,
+                //     entry_epoch: epoch,
+                // });
+                // follower_log_epoch = epoch;
+                // last_clock_sent = std::cmp::max(last_clock_sent, entry.local_ts);
                 panic!("follower log is higher than primary log, and the code is broken yet");
             }
 
@@ -1229,7 +1222,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
         Conn::request((self_gid, self_pid), (self_gid, peer.pid), peer.addr(), req).await?
     };
 
-    let (mut follower_log_epoch, mut follower_log_len) = match conn.recv().await? {
+    let (_, mut follower_log_len) = match conn.recv().await? {
         NewEpoch { epoch: higher_epoch } => {
             s.write().await.core.new_epoch_proposal(higher_epoch)?;
             return Ok(());
@@ -1258,23 +1251,13 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
             while follower_log_len < log_len {
                 let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
-                // if follower_log_epoch < epoch && epoch == e {
-                //     // follower synced up to primary epoch e
-                //     let clock = s.core.clock();
-                //     to_send.push(StartEpochAccept {
-                //         epoch,
-                //         prev_entry: (follower_log_epoch, follower_log_len),
-                //         clock,
-                //     });
-                //     timed_print!("incrementing follower log epoch to {:?}", epoch);
-                // }
+
                 timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
                 to_send.push(LogAppend {
                     idx: follower_log_len,
                     entry_epoch: epoch,
                     entry: entry.clone(),
                 });
-                follower_log_epoch = epoch;
                 follower_log_len += 1;
                 last_clock_sent = std::cmp::max(last_clock_sent, entry.local_ts);
                 if to_send.len() >= BATCH_SIZE_YIELD {

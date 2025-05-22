@@ -9,6 +9,7 @@ services:
     environment:
       ZOO_MY_ID: 1
       ZOO_SERVERS: server.1=zookeeper-01:2888:3888;2181 server.2=zookeeper-02:2888:3888;2181 server.3=zookeeper-03:2888:3888;2181
+      ZOO_TICK_TIME: 100
   zookeeper-02:
     image: zookeeper:3.9
     container_name: zookeeper-02
@@ -17,6 +18,7 @@ services:
     environment:
       ZOO_MY_ID: 2
       ZOO_SERVERS: server.1=zookeeper-01:2888:3888;2181 server.2=zookeeper-02:2888:3888;2181 server.3=zookeeper-03:2888:3888;2181
+      ZOO_TICK_TIME: 100
   zookeeper-03:
     image: zookeeper:3.9
     container_name: zookeeper-03
@@ -25,3 +27,4 @@ services:
     environment:
       ZOO_MY_ID: 3
       ZOO_SERVERS: server.1=zookeeper-01:2888:3888;2181 server.2=zookeeper-02:2888:3888;2181 server.3=zookeeper-03:2888:3888;2181
+      ZOO_TICK_TIME: 100
