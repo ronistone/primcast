@@ -55,7 +55,7 @@ impl RemoteLearner {
                     (
                         p,
                         RemoteInfo {
-                            epoch: Epoch::initial(),
+                            epoch: Epoch::initial(), // TODO leader information to check if must rewrite
                             log_len: 0,
                         },
                     )
@@ -106,7 +106,7 @@ impl RemoteLearner {
     /// Update remote replica info, for tracking safe log entries.
     pub fn add_remote_ack(&mut self, gid: Gid, pid: Pid, log_epoch: Epoch, log_len: u64) -> Result<(), Error> {
         assert_eq!(self.remote_gid, gid);
-        let mut info = self.remote_info.get_mut(&pid).expect("pid should be present");
+        let info = self.remote_info.get_mut(&pid).expect("pid should be present");
         if (log_epoch, log_len) > (info.epoch, info.log_len) {
             info.epoch = log_epoch;
             info.log_len = log_len;

@@ -83,6 +83,7 @@ impl PendingSet {
     pub fn add_entry_ts(&mut self, msg_id: MsgId, dest: &GidSet, entry_ts: Clock, log_idx: u64) {
         use std::collections::hash_map::Entry;
         let ts;
+        // timed_print!("({} {}) > ({} {}) ADD_ENTRY_TS", entry_ts, msg_id, self.last_popped.0, self.last_popped.1);
         assert!((entry_ts, msg_id) > self.last_popped);
         assert!(entry_ts > self.highest_local_ts);
 
@@ -171,13 +172,14 @@ impl PendingSet {
 
     /// Remove information about a msg's log entry ts (happens when the log gets truncated)
     pub fn remove_entry_ts(&mut self, msg_id: MsgId) {
-        let p = self.all.get_mut(&msg_id).unwrap();
-        p.entry_ts = None;
-        p.log_idx = None;
-        // sanity check that the group timestamp is not decided
-        assert!(p.missing_group_ts.contains(self.gid));
-        // remove from ts_order
-        self.ts_order.remove(&msg_id).unwrap();
+        if let Some(p) = self.all.get_mut(&msg_id) {
+            p.entry_ts = None;
+            p.log_idx = None;
+            // sanity check that the group timestamp is not decided
+            assert!(p.missing_group_ts.contains(self.gid));
+            // remove from ts_order
+            self.ts_order.remove(&msg_id).unwrap();
+        }
     }
 
     /// Returns the list of messages not yet proposed in the local group

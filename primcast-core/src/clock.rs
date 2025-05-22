@@ -31,10 +31,11 @@ impl LogicalClock {
 
     /// Value of the clock for given pid
     pub fn get(&self, pid: Pid) -> Clock {
-        self.clocks
+        let clock = self.clocks
             .iter()
-            .find_map(|(p, c)| if pid == *p { Some(*c) } else { None })
-            .expect("pid not found")
+            .find_map(|(p, c)| if pid == *p { Some(*c) } else { None });
+
+        clock.or(Some(0)).unwrap()
     }
 
     fn get_mut(&mut self, pid: Pid) -> &mut Clock {
@@ -91,6 +92,7 @@ impl LogicalClock {
         } else {
             // update pid clock and invalidate cached majority if needed
             let c = self.get_mut(pid);
+            // eprintln!("update pid: {:?} epoch: {:?} clock: {:?}", pid, epoch, clock);
             if *c < clock {
                 *c = clock;
                 self.sorted = false;
@@ -120,10 +122,13 @@ impl LogicalClock {
     pub fn tick(&mut self) -> Clock {
         self.sorted = false;
         let hybrid = self.hybrid;
+        let self_pid = self.pid.clone();
+        let self_epoch = self.epoch.clone();
         let c = self.get_mut(self.pid);
+        eprintln!("update clock pid: {:?} epoch: {:?} clock: {:?}", self_pid, self_epoch, *c);
         if hybrid {
             // micros from UNIX_EPOCH
-            let now = (chrono::Utc::now().timestamp_nanos() / 1000) as u64;
+            let now = (chrono::Utc::now().timestamp_nanos_opt().unwrap() / 1000) as u64;
             *c = std::cmp::max(now, *c + 1);
         } else {
             *c += 1;

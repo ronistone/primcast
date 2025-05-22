@@ -164,7 +164,7 @@ fn main() {
     };
 
     rt.block_on(async {
-        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, args.hybrid, args.debug);
+        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, args.hybrid, args.debug).await;
         let mut delivery_rx = handle.take_delivery_rx().unwrap();
 
         let hist = Arc::new(Mutex::new(Histogram::<u64>::new(3).unwrap()));
@@ -218,7 +218,7 @@ fn main() {
             let payload: Payload = bincode::deserialize(&msg).unwrap();
             // if our msg, record latency and release another proposal
             if (gid, pid) == payload.sender {
-                let mut now = Instant::now() - start;
+                let now = Instant::now() - start;
                 let lat: Duration;
                 if now < payload.amcast_at {
 

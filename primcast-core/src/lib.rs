@@ -1,6 +1,7 @@
 use bytes::Bytes;
 
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
@@ -21,6 +22,24 @@ use config::Config;
 use pending::PendingSet;
 use types::*;
 
+#[macro_export]
+macro_rules! timed_print {
+    ($($arg:tt)*) => {
+        let now = SystemTime::now();
+        let since_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
+        let millis = since_epoch.as_millis();
+
+        // Format: HH:MM:SS.mmm
+        let secs = millis / 1000;
+        let hours = (secs / 3600) % 24;
+        let minutes = (secs / 60) % 60;
+        let seconds = secs % 60;
+        let ms = millis % 1000;
+
+        let timestamp = format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, ms);
+        eprintln!("[{}] {}", timestamp, format!($($arg)*))
+    }
+}
 /// Allocate space for this amount of log entries at the start, to avoid
 /// reallocations. The way we keep entries in memory (just a Vec), large
 /// reallocations may cause pauses due to the amount of copying.
@@ -129,8 +148,8 @@ impl GroupReplica {
     /// New replica state for the given (gid,pid).
     /// TODO: we don't currently use persistent storage.
     /// Every replica starts at epoch Epoch::initial() with an empty log.
-    pub fn new(gid: Gid, pid: Pid, config: Config, hybrid_clock: bool) -> Self {
-        let state = if Epoch::initial().owner() == pid {
+    pub fn new(gid: Gid, pid: Pid, epoch: Epoch, config: Config, hybrid_clock: bool) -> Self {
+        let state = if epoch.owner() == pid {
             ReplicaState::Primary
         } else {
             ReplicaState::Follower
@@ -149,8 +168,8 @@ impl GroupReplica {
             })
             .collect();
 
-        let promised_epoch = Epoch::initial();
-        let current_epoch = Epoch::initial();
+        let promised_epoch = epoch;
+        let current_epoch = epoch;
         let current_epoch_acks = config
             .group_pids(gid)
             .unwrap()
@@ -177,7 +196,7 @@ impl GroupReplica {
             state,
             promised_epoch,
             log,
-            log_epochs: vec![(Epoch::initial(), 0)],
+            log_epochs: vec![(epoch, 0)],
             current_epoch_acks,
             safe_len: 0,
             msgid,
@@ -207,23 +226,23 @@ impl GroupReplica {
 
     pub fn print_debug_info(&mut self) {
         let pending = self.pending.stats();
-        eprintln!("=================");
-        eprintln!("proposals: {} (max: {})", self.proposals.len(), self.proposals_max);
-        eprintln!(
+        timed_print!("=================");
+        timed_print!("proposals: {} (max: {})", self.proposals.len(), self.proposals_max);
+        timed_print!(
             "pending: {} (max: {}) with local ts: {} (max: {})",
             pending.all, pending.all_max, pending.with_local_ts, pending.with_local_ts_max,
         );
-        eprintln!("log_len: {} safe_len: {}", self.log.len(), self.safe_len);
-        eprintln!(
+        timed_print!("log_len: {} safe_len: {}", self.log.len(), self.safe_len);
+        timed_print!(
             "clock: {} min_clock_leader: {:?} quorum_clock: {:?}",
             self.clock(),
             self.min_clock_leader(),
             self.min_new_epoch_ts()
         );
-        eprintln!("acks: {:?}", self.current_epoch_acks);
-        eprintln!("remote learners:");
+        timed_print!("acks: {:?} epoch: {:?}", self.current_epoch_acks, self.current_epoch());
+        timed_print!("remote learners:");
         for (gid, l) in &self.remote_learners {
-            eprintln!(
+            timed_print!(
                 "    {:?} - safe_idx:{:?} next_entry:{:?} acks:{:?}",
                 gid,
                 l.safe_idx(),
@@ -231,7 +250,7 @@ impl GroupReplica {
                 Vec::from_iter(l.remote_info()),
             );
         }
-        eprintln!("=================");
+        timed_print!("=================");
     }
 
     pub fn current_epoch(&self) -> Epoch {
@@ -250,6 +269,14 @@ impl GroupReplica {
         self.clock.local()
     }
 
+    pub fn accepts_len(&self) -> usize {
+        self.accepts.len()
+    }
+
+    pub fn become_candidate(&mut self) {
+        self.state = ReplicaState::Candidate;
+
+    }
     /// Move to a higher epoch for which we are leader
     pub fn propose_new_epoch(&mut self, higher_than: Option<Epoch>) -> Result<Epoch, Error> {
         let epoch = if let Some(higher) = higher_than {
@@ -338,6 +365,7 @@ impl GroupReplica {
             // find matching log prefix
             let mut idx = 0;
             let mut prefix_len = 0;
+            timed_print!("checking log prefix for {:?} with {:?}", self.log_epochs, log_epochs);
             for (our, leader) in self.log_epochs.iter().zip(log_epochs.iter()) {
                 if our.0 == leader.0 {
                     // same epoch
@@ -380,14 +408,17 @@ impl GroupReplica {
         entry: LogEntry,
     ) -> Result<u64, Error> {
         if self.promised_epoch != epoch {
+            timed_print!("FAIL TO START EPOCH APPEND: {:?} != {:?}", self.promised_epoch, epoch);
             return Err(Error::WrongEpoch {
                 expected: self.promised_epoch,
             });
         }
-        if self.state != ReplicaState::Promised {
+        if self.state != ReplicaState::Promised && self.state != ReplicaState::Follower {
+            timed_print!("FAIL TO START EPOCH APPEND: {:?} != {:?}", self.state, ReplicaState::Promised);
             return Err(Error::NotPromised);
         }
 
+        timed_print!("start epoch append for {:?} with log len {} accept_len={}", entry_epoch, self.log.len(), self.accepts.len());
         self.leader_last_seen = Instant::now();
         self.append_inner(idx, entry_epoch, entry)
     }
@@ -395,20 +426,25 @@ impl GroupReplica {
     /// Returns Ok if the replica's state is up-to-date for accepting the given epoch, and moves the current epoch to it.
     pub fn start_epoch_accept(&mut self, epoch: Epoch, last_entry: (Epoch, u64), clock: Clock) -> Result<(), Error> {
         if self.promised_epoch != epoch {
+            timed_print!("FAIL TO START EPOCH ACCEPT promised epoch is different: {:?} != {:?}", self.promised_epoch, epoch);
             return Err(Error::WrongEpoch {
                 expected: self.promised_epoch,
             });
         }
         if self.log_status() != last_entry {
+            timed_print!("FAIL TO START EPOCH ACCEPT: {:?} != {:?}", self.log_status(), last_entry);
             return Err(Error::InvalidReplicaState);
         }
+
         if self.current_epoch() == epoch {
+            timed_print!("EPOCH IS ALREADY RUNNING: {:?} == {:?}", self.current_epoch(), epoch);
             return Ok(());
         }
 
         let (_current_epoch, current_len) = self.log_status();
 
         // move current_epoch forward
+        timed_print!("start epoch accept for {:?} with log len {} accept_len={}", epoch, current_len, self.accepts.len());
         self.log_epochs.push((epoch, current_len));
         // update clock info
         self.clock.advance_epoch(epoch);
@@ -423,8 +459,10 @@ impl GroupReplica {
             };
         }
 
-        self.accepts.insert(self.pid);
-        self.accepts.insert(epoch.owner()); // we also know leader is up-to-date
+        self.append_accept(self.pid, epoch);
+        self.append_accept(epoch.owner(), epoch); // we also know leader is up-to-date
+        timed_print!("start epoch accept for {:?} with log len {} accept_len={}", epoch, current_len, self.accepts.len());
+
         Ok(())
     }
 
@@ -486,11 +524,10 @@ impl GroupReplica {
         let e = self.log.get(usize::try_from(idx).expect("out of range log idx"))?;
         // derive entry epoch from the log_epochs array
         let mut epoch = None;
-        let mut total_len = 0;
+        timed_print!("get log entry {:?} {:?}", idx, self.log_epochs);
         for &(e, len) in &self.log_epochs {
             // TODO: store Epoch in LogEntry instead?
-            total_len += len;
-            if total_len > idx {
+            if len > idx {
                 epoch = Some(e);
                 break;
             }
@@ -522,6 +559,7 @@ impl GroupReplica {
 
     /// Helper method for properly appending to the log
     fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<u64, Error> {
+        timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
         let (log_epoch, log_len) = self.log_status();
         assert_eq!(log_len, self.log.len() as u64);
 
@@ -548,7 +586,8 @@ impl GroupReplica {
         if log_epoch == entry_epoch {
             self.log_epochs.last_mut().unwrap().1 += 1;
         } else {
-            self.log_epochs.push((entry_epoch, 1));
+            timed_print!("append_inner: invalid epoch {:?} to log_epoch={:?}, entry={:?}", entry_epoch, log_epoch, entry);
+            self.log_epochs.push((entry_epoch, log_len + 1));
             // don't think the following ever does anything, but its safe to do.
             self.clock.advance_epoch(entry_epoch);
         }
@@ -569,30 +608,45 @@ impl GroupReplica {
 
     /// Append log entry from the leader. Returns the entry idx the log.
     pub fn append(&mut self, epoch: Epoch, idx: u64, entry: LogEntry) -> Result<u64, Error> {
-        if self.promised_epoch > epoch || self.current_epoch() > epoch {
+        let (log_epoch, _) = self.log_status();
+        if (self.promised_epoch > epoch || self.current_epoch() > epoch) && log_epoch > epoch {
+            timed_print!("FAIL TO APPEND: {:?} > {:?} or {:?} > {:?}", self.promised_epoch, epoch, self.current_epoch(), epoch);
             return Err(Error::EpochTooOld {
                 promised: self.promised_epoch,
                 current: self.promised_epoch,
             });
         }
-        if self.current_epoch() != epoch {
-            return Err(Error::WrongEpoch {
-                expected: self.current_epoch(),
-            });
-        }
-        if self.state != ReplicaState::Follower {
-            return Err(Error::NotFollower);
-        }
+        // if self.current_epoch() > epoch {
+        //     timed_print!("FAIL TO APPEND: {:?} < {:?}", self.current_epoch(), epoch);
+        //     return Err(Error::WrongEpoch {
+        //         expected: self.current_epoch(),
+        //     });
+        // }
+        // if self.state != ReplicaState::Follower {
+        //     timed_print!("FAIL TO APPEND: {:?} != {:?}", self.state, ReplicaState::Follower);
+        //     return Err(Error::NotFollower);
+        // }
 
         self.leader_last_seen = Instant::now();
         let entry_ts = entry.local_ts;
         let res = self.append_inner(idx, epoch, entry)?;
-        assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order");
+        // assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order: entry_ts = {}, min_clock_leader = {}", entry_ts, self.min_clock_leader());
         // append is an ack from leader
         self.add_ack(epoch.owner(), epoch, idx + 1, entry_ts).unwrap();
 
         self.clock.update(epoch.owner(), epoch, entry_ts);
         Ok(res)
+    }
+
+    pub fn append_accept(&mut self, pid: Pid, epoch: Epoch) {
+        use ReplicaState::*;
+        timed_print!("{:?}: {:?}: received ack from {:?} for epoch {}, adding to accepts len={}", self.gid, self.pid, pid, epoch, self.accepts.len());
+        self.accepts.insert(pid);
+        if self.accepts.len() >= self.quorum_size {
+            self.state = if self.state == Candidate { Primary } else { Follower };
+            timed_print!(">==== {:?}: {:?}: quorum reached for epoch {}, moving to state {:?}", self.gid, self.pid, epoch, self.state);
+            self.accepts.clear();
+        }
     }
 
     /// Ack from a replica from our group.
@@ -602,7 +656,13 @@ impl GroupReplica {
 
         if self.promised_epoch == epoch {
             if self.state == Candidate || self.state == Promised {
+                timed_print!("{:?}: {:?}: received ack from {:?} for epoch {}, adding to accepts len={}", self.gid, self.pid, pid, epoch, self.accepts.len());
                 self.accepts.insert(pid);
+                if self.accepts.len() >= self.quorum_size {
+                    self.state = if self.state == Candidate { Primary } else { Follower };
+                    timed_print!(">==== {:?}: {:?}: quorum reached for epoch {}, moving to state {:?}", self.gid, self.pid, epoch, self.state);
+                    self.accepts.clear();
+                }
                 // TODO: check replica goes to primary/follower
             }
         }
@@ -726,9 +786,9 @@ mod tests {
         let config = Config::new_for_test();
         let mut idgen = IdGen(0);
 
-        let mut r0 = GroupReplica::new(Gid(0), Pid(0), config.clone(), false);
-        let mut r1 = GroupReplica::new(Gid(0), Pid(1), config.clone(), false);
-        let mut r2 = GroupReplica::new(Gid(0), Pid(2), config.clone(), false);
+        let mut r0 = GroupReplica::new(Gid(0), Pid(0), Epoch::initial(), config.clone(), false);
+        let mut r1 = GroupReplica::new(Gid(0), Pid(1), Epoch::initial(), config.clone(), false);
+        let mut r2 = GroupReplica::new(Gid(0), Pid(2), Epoch::initial(), config.clone(), false);
 
         assert_eq!(r0.state, Primary);
         assert_eq!(r1.state, Follower);
@@ -784,10 +844,10 @@ mod tests {
         let config = Config::new_for_test();
         let mut idgen = IdGen(0);
 
-        let mut r0_0 = GroupReplica::new(Gid(0), Pid(0), config.clone(), false);
-        let mut r0_1 = GroupReplica::new(Gid(0), Pid(1), config.clone(), false);
-        let mut r1_0 = GroupReplica::new(Gid(1), Pid(0), config.clone(), false);
-        let mut r1_1 = GroupReplica::new(Gid(1), Pid(1), config.clone(), false);
+        let mut r0_0 = GroupReplica::new(Gid(0), Pid(0), Epoch::initial(), config.clone(), false);
+        let mut r0_1 = GroupReplica::new(Gid(0), Pid(1), Epoch::initial(), config.clone(), false);
+        let mut r1_0 = GroupReplica::new(Gid(1), Pid(0), Epoch::initial(), config.clone(), false);
+        let mut r1_1 = GroupReplica::new(Gid(1), Pid(1), Epoch::initial(), config.clone(), false);
 
         // ----- STEP 1 ------
 

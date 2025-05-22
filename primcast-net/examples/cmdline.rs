@@ -68,7 +68,7 @@ fn main() {
     });
 
     rt.block_on(async {
-        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, false, None);
+        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, false, None).await;
         tokio::time::sleep(Duration::from_secs(2)).await; // wait for things to settle...
 
         let mut rx = handle.take_delivery_rx().unwrap();
