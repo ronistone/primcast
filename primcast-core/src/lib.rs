@@ -21,23 +21,44 @@ use clock::LogicalClock;
 use config::Config;
 use pending::PendingSet;
 use types::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Add this global toggle
+static TIMED_PRINT_ENABLED: AtomicBool = AtomicBool::new(true);
+
+// Add helper functions to control the toggle
+pub fn enable_timed_print() {
+    TIMED_PRINT_ENABLED.store(true, Ordering::Relaxed);
+}
+
+pub fn disable_timed_print() {
+    TIMED_PRINT_ENABLED.store(false, Ordering::Relaxed);
+}
+
+pub fn is_timed_print_enabled() -> bool {
+    TIMED_PRINT_ENABLED.load(Ordering::Relaxed)
+}
+
+
 
 #[macro_export]
 macro_rules! timed_print {
     ($($arg:tt)*) => {
-        let now = SystemTime::now();
-        let since_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
-        let millis = since_epoch.as_millis();
+        if $crate::is_timed_print_enabled() {
+            let now = SystemTime::now();
+            let since_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
+            let millis = since_epoch.as_millis();
 
-        // Format: HH:MM:SS.mmm
-        let secs = millis / 1000;
-        let hours = (secs / 3600) % 24;
-        let minutes = (secs / 60) % 60;
-        let seconds = secs % 60;
-        let ms = millis % 1000;
+            // Format: HH:MM:SS.mmm
+            let secs = millis / 1000;
+            let hours = (secs / 3600) % 24;
+            let minutes = (secs / 60) % 60;
+            let seconds = secs % 60;
+            let ms = millis % 1000;
 
-        let timestamp = format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, ms);
-        eprintln!("[{}] {}", timestamp, format!($($arg)*))
+            let timestamp = format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, ms);
+            eprintln!("[{}] {}", timestamp, format!($($arg)*))
+        }
     }
 }
 /// Allocate space for this amount of log entries at the start, to avoid

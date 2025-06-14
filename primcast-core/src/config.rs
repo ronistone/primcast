@@ -53,6 +53,7 @@ pub struct Config {
     pub groups: Vec<GroupConfig>,
     pub leader_timeout_secs: usize,
     pub reconnect_timeout_secs: usize,
+    pub log_enabled: bool,
 }
 
 impl GroupConfig {
@@ -66,6 +67,7 @@ impl Config {
         let settings = ParseConfig::builder()
             .set_default("leader_timeout_secs", 2 as u16)?
             .set_default("reconnect_timeout_secs", 2 as u16)?
+            .set_default("log_enabled", true)?
             .add_source(parse_config::File::new(conf_file, parse_config::FileFormat::Yaml))
             .build()?;
 
@@ -108,6 +110,7 @@ impl Config {
             groups,
             leader_timeout_secs: 2,
             reconnect_timeout_secs: 2,
+            log_enabled: true,
         }
     }
 

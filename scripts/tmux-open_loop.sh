@@ -4,15 +4,15 @@ STATS_SECS=1
 BUILD="target/debug"
 OPT="$@"
 MSGS_SEC=1
-GLOBAL_DESTS=2
+GLOBAL_DESTS=1
 GLOBALS=0.0
 THREADS=""
 CHECK=0
 DEBUG=""
 HYBRID=""
 
-CONFIG="example_3_groups.yaml"
-GIDS=3
+CONFIG="example_1_groups.yaml"
+GIDS=1
 PIDS=3
 
 
@@ -34,9 +34,10 @@ tmux_test ()  {
                       --global-dests $GLOBAL_DESTS --globals $GLOBALS \
                       -m $MSGS_SEC --stats $STATS_SECS $THREADS $HYBRID $DEBUG"
             if (( CHECK != 0 )); then
-                CMD="$CMD --check > out_${g}_${i}.txt"
+                CMD="$CMD --check"
             fi
-            tmux send-keys -t $(( $g * $GIDS + $i + $FIRST_PANE_NUMBER )) "$CMD" C-m
+            CMD="$CMD  > out_${g}_${i}.txt 2> log_out_${g}_${i}.txt"
+            tmux send-keys -t $(( $g * $PIDS + $i + $FIRST_PANE_NUMBER )) "$CMD" C-m
         done
     done
 

@@ -1,5 +1,6 @@
 leader_timeout_secs: 2
 reconnect_timeout_secs: 2
+log_enabled: false
 groups:
   - gid: 0
     quorum: 2

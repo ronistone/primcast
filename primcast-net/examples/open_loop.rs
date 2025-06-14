@@ -125,6 +125,13 @@ fn main() {
             cmd.error(clap::ErrorKind::InvalidValue, "stats can't be 0").exit()
         }
     }
+
+    if !cfg.log_enabled {
+        primcast_core::disable_timed_print();
+    } else {
+        primcast_core::enable_timed_print();
+    }
+
     let msgs_per_millis = args.msgs_per_sec as f64 / 1000.0;
 
     let gid = Gid(args.gid);
@@ -218,13 +225,15 @@ fn main() {
             if (gid, pid) == payload.sender {
                 let now = Instant::now() - start;
                 let lat: Duration;
-                if now < payload.amcast_at {
+                // if now < payload.amcast_at {
 
-                    lat = Duration::from_micros(0);
-                } else {
+                //     lat = Duration::from_micros(0);
+                // } else {
+                //     lat = now - payload.amcast_at;
                     lat = now - payload.amcast_at;
-                }
+                // }
                 let lat_usec = u64::try_from(lat.as_micros()).unwrap();
+                eprintln!("{ts} {id} {dest:?} DELIVERED in {lat_usec} us");
                 hist.lock().await.record(lat_usec).unwrap();
                 if dest.len() == 1 {
                     hist_locals.lock().await.record(lat_usec).unwrap();
