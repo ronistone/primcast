@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 thiserror = "1.0"
 rand = "0.8"
+clap = { version = "3.2", features = ["derive"] }
 
 rustc-hash = "1.1.0"
 # fnv = "1.0"
@@ -17,3 +18,9 @@ parse-config = { version = "0.12", package = "config" }
 serde = { version = "1", features = ["derive", "rc"] }
 bytes = { version = "1.1", features = ["serde"] }
 chrono = "0.4"
+tokio = { version = "1.19", features = ["full", "parking_lot"] }
+
+lmdb = { version = "0.8"}
+rocksdb = { version = "0.23" }
+sled = { version = "0.34" }
+bincode = "1.3"

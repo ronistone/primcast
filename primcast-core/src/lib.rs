@@ -16,6 +16,7 @@ pub mod config;
 mod pending;
 pub mod remote_learner;
 pub mod types;
+pub mod persistence;
 
 use clock::LogicalClock;
 use config::Config;
