@@ -54,6 +54,8 @@ pub struct Config {
     pub leader_timeout_secs: usize,
     pub reconnect_timeout_secs: usize,
     pub log_enabled: bool,
+    pub persistence_backend: String,
+    pub persistence_database: String,
 }
 
 impl GroupConfig {
@@ -68,6 +70,8 @@ impl Config {
             .set_default("leader_timeout_secs", 2 as u16)?
             .set_default("reconnect_timeout_secs", 2 as u16)?
             .set_default("log_enabled", true)?
+            .set_default("persistence_backend", "lmdb")?
+            .set_default("persistence_database", "primcast.db")?
             .add_source(parse_config::File::new(conf_file, parse_config::FileFormat::Yaml))
             .build()?;
 
@@ -111,6 +115,8 @@ impl Config {
             leader_timeout_secs: 2,
             reconnect_timeout_secs: 2,
             log_enabled: true,
+            persistence_backend: "lmdb".to_string(),
+            persistence_database: "primcast.db".to_string(),
         }
     }
 

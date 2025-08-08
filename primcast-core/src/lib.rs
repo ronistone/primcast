@@ -1,5 +1,6 @@
 use bytes::Bytes;
 
+use core::time;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,8 @@ use config::Config;
 use pending::PendingSet;
 use types::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::persistence::{LMDBPersistence, PersistenceLayer, RocksDBPersistence, SledPersistence};
 
 // Add this global toggle
 static TIMED_PRINT_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -142,6 +145,8 @@ pub struct GroupReplica {
     proposals_max: usize,
     promises: HashMap<Pid, (Epoch, u64, Clock)>,
     accepts: HashSet<Pid>,
+
+    persistence: Box<dyn PersistenceLayer>,
 }
 
 #[derive(Debug)]
@@ -158,6 +163,7 @@ pub enum Error {
     IdAlreadyUsed,
     GroupNotInDest,
     RemoteLearner(remote_learner::Error),
+    InvalidPersistence,
 }
 
 impl From<remote_learner::Error> for Error {
@@ -206,6 +212,7 @@ impl GroupReplica {
         log.reserve(INITIAL_CAP);
         let mut msgid = HashMap::default();
         msgid.reserve(MSGID_LOW_MASK as usize);
+        let persistence = get_persistence(&config.persistence_backend, &config.persistence_database).unwrap();
 
         GroupReplica {
             gid,
@@ -230,6 +237,7 @@ impl GroupReplica {
             promises: Default::default(),
             accepts: Default::default(),
             remote_learners,
+            persistence,
         }
     }
 
@@ -272,6 +280,15 @@ impl GroupReplica {
                 Vec::from_iter(l.remote_info()),
             );
         }
+
+        let mut count = 0;
+        for _ in self.persistence.as_ref().list_log_entries().unwrap() {
+            count += 1;
+        }
+        timed_print!(
+            "persistence: {} entries in log",
+            count
+        );
         timed_print!("=================");
     }
 
@@ -618,6 +635,9 @@ impl GroupReplica {
             self.log.last().is_none() || self.log.last().unwrap().local_ts < entry.local_ts,
             "log append out of ts order"
         );
+        self.persistence
+        .put_log_entry(entry_epoch, idx, &entry)
+        .expect("failed to append log entry to persistence");
         self.log.push(entry);
 
         // update own ack
@@ -787,6 +807,28 @@ impl GroupReplica {
         debug_assert!(log_entry.local_ts <= final_ts);
         log_entry.final_ts = Some(final_ts);
         return Some(log_entry);
+    }
+}
+
+
+fn get_persistence(backend: &str, database: &str) -> Result<Box<dyn PersistenceLayer>, Error> {
+    match backend {
+        "lmdb" => {
+            LMDBPersistence::new(&database)
+                .map(|p| Box::new(p) as Box<dyn PersistenceLayer>)
+                .map_err(|_| Error::InvalidPersistence)
+        }
+        "rocksdb" => {
+            RocksDBPersistence::new(&database)
+                .map(|p| Box::new(p) as Box<dyn PersistenceLayer>)
+                .map_err(|_| Error::InvalidPersistence)
+        }
+        "sled" => {
+            SledPersistence::new(&database)
+                .map(|p| Box::new(p) as Box<dyn PersistenceLayer>)
+                .map_err(|_| Error::InvalidPersistence)
+        }
+        _ => Err(Error::InvalidPersistence),
     }
 }
 
