@@ -159,6 +159,7 @@ impl PrimcastReplica {
         let core = GroupReplica::new(gid, pid, actual_epoch, cfg.clone(), hybrid_clock);
         let (log_epoch, log_len) = core.log_status();
         let clock = core.clock();
+        eprintln!("Replica {:?}:{:?} log status: epoch={}, len={}, clock={}", gid, pid, log_epoch, log_len, clock);
 
         let mut ack_tx = HashMap::default();
         let mut ack_rx = HashMap::default();

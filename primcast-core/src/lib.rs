@@ -214,7 +214,9 @@ impl GroupReplica {
         msgid.reserve(MSGID_LOW_MASK as usize);
         let persistence = get_persistence(&config.persistence_backend, &config.persistence_database).unwrap();
 
-        GroupReplica {
+        let log_persisted = persistence.list_log_entries().unwrap();
+
+        let mut result = GroupReplica {
             gid,
             pid,
             clock: LogicalClock::new(pid, current_epoch, config.group_pids(gid).unwrap(), hybrid_clock),
@@ -238,7 +240,13 @@ impl GroupReplica {
             accepts: Default::default(),
             remote_learners,
             persistence,
-        }
+        };
+
+        log_persisted.iter().for_each(|e| {
+            result.append(e.epoch, e.idx, e.entry.clone()).unwrap();
+        });
+
+        return result
     }
 
     /// helper for getting the entry for pid in current_epoch_acks
@@ -629,6 +637,7 @@ impl GroupReplica {
             self.log_epochs.push((entry_epoch, log_len + 1));
             // don't think the following ever does anything, but its safe to do.
             self.clock.advance_epoch(entry_epoch);
+            self.promised_epoch = entry_epoch;
         }
 
         assert!(

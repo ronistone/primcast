@@ -225,13 +225,13 @@ fn main() {
             if (gid, pid) == payload.sender {
                 let now = Instant::now() - start;
                 let lat: Duration;
-                // if now < payload.amcast_at {
+                if now < payload.amcast_at {
 
-                //     lat = Duration::from_micros(0);
-                // } else {
-                //     lat = now - payload.amcast_at;
+                    lat = Duration::from_micros(0);
+                } else {
                     lat = now - payload.amcast_at;
-                // }
+                    // lat = now - payload.amcast_at;
+                }
                 let lat_usec = u64::try_from(lat.as_micros()).unwrap();
                 eprintln!("{ts} {id} {dest:?} DELIVERED in {lat_usec} us");
                 hist.lock().await.record(lat_usec).unwrap();
