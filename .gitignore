@@ -4,3 +4,4 @@ Cargo.lock
 out_*_*.txt
 log_out_*_*.txt
 .idea
+db/

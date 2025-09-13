@@ -26,6 +26,7 @@ pub struct PeerConfig {
     pub ip: IpAddr,
     pub port: u16,
     pub client_port: u16,
+    pub persistence_database: String,
 }
 
 impl PeerConfig {
@@ -55,7 +56,6 @@ pub struct Config {
     pub reconnect_timeout_secs: usize,
     pub log_enabled: bool,
     pub persistence_backend: String,
-    pub persistence_database: String,
 }
 
 impl GroupConfig {
@@ -99,6 +99,7 @@ impl Config {
                     ip: "127.0.0.1".parse().unwrap(),
                     port: 10000 + port,
                     client_port: 20000 + port,
+                    persistence_database: format!("db/primcast.0{}", p),
                 });
                 port += 1;
             }
@@ -116,7 +117,6 @@ impl Config {
             reconnect_timeout_secs: 2,
             log_enabled: true,
             persistence_backend: "lmdb".to_string(),
-            persistence_database: "primcast.db".to_string(),
         }
     }
 

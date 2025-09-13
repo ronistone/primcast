@@ -212,7 +212,8 @@ impl GroupReplica {
         log.reserve(INITIAL_CAP);
         let mut msgid = HashMap::default();
         msgid.reserve(MSGID_LOW_MASK as usize);
-        let persistence = get_persistence(&config.persistence_backend, &config.persistence_database).unwrap();
+        let persistence_path = config.peer(gid, pid).unwrap().persistence_database.clone();
+        let persistence = get_persistence(&config.persistence_backend, &persistence_path).unwrap();
 
         let log_persisted = persistence.list_log_entries().unwrap();
 
