@@ -221,7 +221,8 @@ impl GroupReplica {
         timed_print!("Loaded {} log entries from persistence", log_persisted.len());
         timed_print!("Loaded metadata from persistence: {:?}", metadate_persisted);
         let (promised_epoch, log_epochs, safe_len, _) = if let Some(m) = metadate_persisted {
-            (m.promised_epoch, m.log_epochs, m.safe_len, m.clock)
+            // (m.promised_epoch, m.log_epochs, m.safe_len, m.clock)
+            (promised_epoch, vec![(epoch, 0)], 0, 0)
         } else {
             (promised_epoch, vec![(epoch, 0)], 0, 0)
         };
@@ -260,10 +261,67 @@ impl GroupReplica {
     }
 
     fn get_log(&self, idx: u64) -> Result<LogEntry, Error> {
-        if idx >= self.log.len() as u64 {
-            return Err(Error::InvalidIndex { len: self.log.len() as u64 });
+        if idx >= self.log_actual_len() {
+            return Err(Error::InvalidIndex { len: self.log_actual_len() });
         }
         Ok(self.log[idx as usize].clone())
+    }
+
+    // === Log Access Abstraction Methods ===
+    // These methods provide controlled access to the log for future persistence integration.
+    // All direct self.log access should go through these methods.
+    
+    /// Get log entry by index (returns a reference)
+    fn get_log_ref(&self, idx: u64) -> Result<&LogEntry, Error> {
+        if idx >= self.log_actual_len() {
+            return Err(Error::InvalidIndex { len: self.log_actual_len() });
+        }
+        Ok(&self.log[idx as usize])
+    }
+    
+    /// Get mutable log entry by index
+    fn get_log_mut(&mut self, idx: u64) -> Result<&mut LogEntry, Error> {
+        if idx >= self.log_actual_len() {
+            return Err(Error::InvalidIndex { len: self.log_actual_len() });
+        }
+        Ok(&mut self.log[idx as usize])
+    }
+    
+    /// Get actual log length (different from log_len which uses log_epochs)
+    fn log_actual_len(&self) -> u64 {
+        self.log.len() as u64
+    }
+    
+    /// Push entry to log
+    fn push_log(&mut self, entry: LogEntry) {
+        self.log.push(entry);
+    }
+    
+    /// Pop last entry from log
+    fn pop_log(&mut self) -> Option<LogEntry> {
+        self.log.pop()
+    }
+    
+    /// Get last log entry reference
+    fn last_log(&self) -> Option<&LogEntry> {
+        self.log.last()
+    }
+    
+    /// Find log entry in range for destination
+    fn find_log_for_dest(&self, start_idx: u64, gid: Gid) -> Option<&LogEntry> {
+        let idx = usize::try_from(start_idx).expect("out of range log idx");
+        self.log[idx..].iter().find(|it| it.dest.contains(gid))
+    }
+    
+    /// Check if log is empty
+    fn is_log_empty(&self) -> bool {
+        self.log.is_empty()
+    }
+    
+    /// Clear all log entries (for testing/reset purposes)
+    #[allow(dead_code)]
+    fn clear_log(&mut self) {
+        self.log.clear();
     }
 
     /// helper for getting the entry for pid in current_epoch_acks
@@ -447,9 +505,11 @@ impl GroupReplica {
             // truncate the log and remove invalid msgid mappings
             self.log_epochs.truncate(idx + 1);
             let last_entry = self.log_epochs.last_mut().unwrap();
-            let log_len = last_entry.1;
             last_entry.1 = prefix_len;
-            while log_len > prefix_len {
+            
+            // TODO: This needs to be abstracted when persistence is fully implemented
+            // Using direct access to avoid borrow checker issues during transition
+            while self.log.len() as u64 > prefix_len {
                 let entry = self.log.pop().unwrap();
                 let id_low = (entry.msg_id & MSGID_LOW_MASK) as u16;
                 let id_set = self.msgid.get_mut(&id_low).expect("msgid should be present");
@@ -487,7 +547,7 @@ impl GroupReplica {
             return Err(Error::NotPromised);
         }
 
-        timed_print!("start epoch append for {:?} with log len {} accept_len={}", entry_epoch, self.log.len(), self.accepts.len());
+        timed_print!("start epoch append for {:?} with log len {} accept_len={}", entry_epoch, self.log_actual_len(), self.accepts.len());
         self.leader_last_seen = Instant::now();
         self.append_inner(idx, entry_epoch, entry)
     }
@@ -590,7 +650,7 @@ impl GroupReplica {
 
     /// Get the entry at a given log position.
     pub fn log_entry(&self, idx: u64) -> Option<(Epoch, &LogEntry)> {
-        let e = self.log.get(usize::try_from(idx).expect("out of range log idx"))?;
+        let e = self.get_log_ref(idx).expect("out of range log idx");
         // derive entry epoch from the log_epochs array
         let mut epoch = None;
         timed_print!("get log entry {:?} {:?}", idx, self.log_epochs);
@@ -605,7 +665,7 @@ impl GroupReplica {
     }
 
     fn log_entry_mut(&mut self, idx: u64) -> Option<&mut LogEntry> {
-        self.get_log(usize::try_from(idx).expect("out of range log idx")).unwrap()
+        self.get_log_mut(idx).ok()
     }
 
     pub fn log_entry_for_remote(&self, idx: u64) -> Option<RemoteEntry> {
@@ -622,8 +682,7 @@ impl GroupReplica {
     /// Get the next log entry destined for to a given Gid, starting at idx.
     /// Needed by replicas from remote groups to fetch relevant log entries.
     pub fn next_log_entry_for_dest(&self, start_idx: u64, gid: Gid) -> Option<&LogEntry> {
-        let idx = usize::try_from(start_idx).expect("out of range log idx");
-        self.log[idx..].iter().find(|it| it.dest.contains(gid))
+        self.find_log_for_dest(start_idx, gid)
     }
 
     /// Helper method for properly appending to the log
@@ -670,13 +729,13 @@ impl GroupReplica {
         }
 
         assert!(
-            self.log.last().is_none() || self.log.last().unwrap().local_ts < entry.local_ts,
+            self.last_log().is_none() || self.last_log().unwrap().local_ts < entry.local_ts,
             "log append out of ts order"
         );
         self.persistence
         .put_log_entry(entry_epoch, idx, &entry)
         .expect("failed to append log entry to persistence");
-        self.log.push(entry);
+        self.push_log(entry);
 
         // update own ack
         let len = self.log_len() as u64;
