@@ -217,6 +217,15 @@ impl GroupReplica {
 
         let log_persisted = persistence.list_log_entries().unwrap();
 
+        let metadate_persisted = persistence.get_metadata().unwrap();
+        timed_print!("Loaded {} log entries from persistence", log_persisted.len());
+        timed_print!("Loaded metadata from persistence: {:?}", metadate_persisted);
+        let (promised_epoch, log_epochs, safe_len, _) = if let Some(m) = metadate_persisted {
+            (m.promised_epoch, m.log_epochs, m.safe_len, m.clock)
+        } else {
+            (promised_epoch, vec![(epoch, 0)], 0, 0)
+        };
+
         let mut result = GroupReplica {
             gid,
             pid,
@@ -228,9 +237,9 @@ impl GroupReplica {
             state,
             promised_epoch,
             log,
-            log_epochs: vec![(epoch, 0)],
+            log_epochs: log_epochs,
             current_epoch_acks,
-            safe_len: 0,
+            safe_len: safe_len,
             msgid,
             pending: PendingSet::new(gid),
 
@@ -243,11 +252,18 @@ impl GroupReplica {
             persistence,
         };
 
-        log_persisted.iter().for_each(|e| {
-            result.append(e.epoch, e.idx, e.entry.clone()).unwrap();
-        });
+        // log_persisted.iter().for_each(|e| {
+        //     result.append(e.epoch, e.idx, e.entry.clone()).unwrap();
+        // });
 
         return result
+    }
+
+    fn get_log(&self, idx: u64) -> Result<LogEntry, Error> {
+        if idx >= self.log.len() as u64 {
+            return Err(Error::InvalidIndex { len: self.log.len() as u64 });
+        }
+        Ok(self.log[idx as usize].clone())
     }
 
     /// helper for getting the entry for pid in current_epoch_acks
@@ -271,7 +287,7 @@ impl GroupReplica {
             "pending: {} (max: {}) with local ts: {} (max: {})",
             pending.all, pending.all_max, pending.with_local_ts, pending.with_local_ts_max,
         );
-        timed_print!("log_len: {} safe_len: {}", self.log.len(), self.safe_len);
+        timed_print!("log_len: {} safe_len: {}", self.log_len(), self.safe_len);
         timed_print!(
             "clock: {} min_clock_leader: {:?} quorum_clock: {:?}",
             self.clock(),
@@ -319,6 +335,10 @@ impl GroupReplica {
 
     pub fn accepts_len(&self) -> usize {
         self.accepts.len()
+    }
+
+    pub fn log_len(&self) -> u64 {
+        self.log_epochs.last().unwrap().1
     }
 
     pub fn become_candidate(&mut self) {
@@ -427,8 +447,9 @@ impl GroupReplica {
             // truncate the log and remove invalid msgid mappings
             self.log_epochs.truncate(idx + 1);
             let last_entry = self.log_epochs.last_mut().unwrap();
+            let log_len = last_entry.1;
             last_entry.1 = prefix_len;
-            while u64::try_from(self.log.len()).unwrap() > prefix_len {
+            while log_len > prefix_len {
                 let entry = self.log.pop().unwrap();
                 let id_low = (entry.msg_id & MSGID_LOW_MASK) as u16;
                 let id_set = self.msgid.get_mut(&id_low).expect("msgid should be present");
@@ -584,7 +605,7 @@ impl GroupReplica {
     }
 
     fn log_entry_mut(&mut self, idx: u64) -> Option<&mut LogEntry> {
-        self.log.get_mut(usize::try_from(idx).expect("out of range log idx"))
+        self.get_log(usize::try_from(idx).expect("out of range log idx")).unwrap()
     }
 
     pub fn log_entry_for_remote(&self, idx: u64) -> Option<RemoteEntry> {
@@ -609,7 +630,6 @@ impl GroupReplica {
     fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<u64, Error> {
         timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
         let (log_epoch, log_len) = self.log_status();
-        assert_eq!(log_len, self.log.len() as u64);
 
         if log_len != idx {
             return Err(Error::InvalidIndex { len: log_len });
@@ -628,7 +648,7 @@ impl GroupReplica {
             }
         }
         self.pending
-            .add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts, self.log.len() as u64);
+            .add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts, self.log_len() as u64);
 
         // add to log_epochs
         if log_epoch == entry_epoch {
@@ -639,6 +659,14 @@ impl GroupReplica {
             // don't think the following ever does anything, but its safe to do.
             self.clock.advance_epoch(entry_epoch);
             self.promised_epoch = entry_epoch;
+            self.persistence.put_metadata(&persistence::ReplicaMetadata { 
+                gid: self.gid, 
+                pid: self.pid,
+                promised_epoch: self.promised_epoch.clone(),
+                log_epochs: self.log_epochs.clone(),
+                safe_len: self.safe_len.clone(),
+                clock: self.clock.get(self.pid),
+            }).expect("failed to update metadata in persistence");
         }
 
         assert!(
@@ -651,7 +679,7 @@ impl GroupReplica {
         self.log.push(entry);
 
         // update own ack
-        let len = self.log.len() as u64;
+        let len = self.log_len() as u64;
         let ack = self.get_ack_mut(self.pid);
         *ack = std::cmp::max(*ack, len);
 
@@ -773,8 +801,9 @@ impl GroupReplica {
         // update safe len
         self.current_epoch_acks.sort(); // sort by acked log len
         let safe_len_from_acks = self.current_epoch_acks[self.group_size - self.quorum_size].0;
-        let safe_len = std::cmp::min(std::cmp::max(self.safe_len, safe_len_from_acks), self.log.len() as u64);
-        for entry in &mut self.log[self.safe_len as usize..safe_len as usize] {
+        let safe_len = std::cmp::min(std::cmp::max(self.safe_len, safe_len_from_acks), self.log_len() as u64);
+        for idx in self.safe_len as usize..safe_len as usize {
+            let entry = self.get_log(idx as u64).unwrap();
             self.pending
                 .add_group_ts(entry.msg_id, &entry.dest, self.gid, entry.local_ts);
         }
