@@ -65,12 +65,6 @@ macro_rules! timed_print {
         }
     }
 }
-/// Allocate space for this amount of log entries at the start, to avoid
-/// reallocations. The way we keep entries in memory (just a Vec), large
-/// reallocations may cause pauses due to the amount of copying.
-// TODO: handle this issue
-const INITIAL_CAP: usize = 50_000_000;
-
 /// Split msgid set into multiple hashsets to prevent large reallocations
 const MSGID_LOW_MASK: MsgId = 0xff;
 
@@ -123,8 +117,10 @@ pub struct GroupReplica {
     state: ReplicaState,
     promised_epoch: Epoch,
 
-    /// The replica log
-    log: Vec<LogEntry>,
+    /// The replica log - cached entries indexed by log position
+    log: HashMap<u64, LogEntry>,
+    /// Current log length (highest index + 1)
+    log_len_cached: u64,
     /// Epochs stored in the log and the size of the log for each.
     log_epochs: Vec<(Epoch, u64)>,
     /// Log length acknowledged by group replicas in the current_epoch only (i.e., last epoch in log_epochs).
@@ -208,8 +204,6 @@ impl GroupReplica {
         let group_size = current_epoch_acks.len();
         let quorum_size = config.quorum_size(gid).unwrap();
 
-        let mut log = Vec::new();
-        log.reserve(INITIAL_CAP);
         let mut msgid = HashMap::default();
         msgid.reserve(MSGID_LOW_MASK as usize);
         let persistence_path = config.peer(gid, pid).unwrap().persistence_database.clone();
@@ -221,8 +215,8 @@ impl GroupReplica {
         timed_print!("Loaded {} log entries from persistence", log_persisted.len());
         timed_print!("Loaded metadata from persistence: {:?}", metadate_persisted);
         let (promised_epoch, log_epochs, safe_len, _) = if let Some(m) = metadate_persisted {
-            // (m.promised_epoch, m.log_epochs, m.safe_len, m.clock)
-            (promised_epoch, vec![(epoch, 0)], 0, 0)
+            (m.promised_epoch, m.log_epochs, m.safe_len, m.clock)
+            // (promised_epoch, vec![(epoch, 0)], 0, 0)
         } else {
             (promised_epoch, vec![(epoch, 0)], 0, 0)
         };
@@ -237,7 +231,8 @@ impl GroupReplica {
 
             state,
             promised_epoch,
-            log,
+            log: HashMap::default(),
+            log_len_cached: 0,
             log_epochs: log_epochs,
             current_epoch_acks,
             safe_len: safe_len,
@@ -253,7 +248,7 @@ impl GroupReplica {
             persistence,
         };
 
-        // log_persisted.iter().for_each(|e| {
+        // log_persisted.iter().for_each(|e| { // This code load all log in memory
         //     result.append(e.epoch, e.idx, e.entry.clone()).unwrap();
         // });
 
@@ -261,10 +256,18 @@ impl GroupReplica {
     }
 
     fn get_log(&self, idx: u64) -> Result<LogEntry, Error> {
-        if idx >= self.log_actual_len() {
-            return Err(Error::InvalidIndex { len: self.log_actual_len() });
+        
+        // Try cache first
+        if let Some(entry) = self.log.get(&idx) {
+            return Ok(entry.clone());
         }
-        Ok(self.log[idx as usize].clone())
+
+        let result = self.persistence.as_ref().get_log_entry(idx);
+        if let Ok(Some((_, entry))) = &result {
+            return Ok(entry.clone());
+        }
+
+        Err(Error::InvalidIndex { len: self.log_actual_len() })
     }
 
     // === Log Access Abstraction Methods ===
@@ -272,45 +275,80 @@ impl GroupReplica {
     // All direct self.log access should go through these methods.
     
     /// Get log entry by index (returns a reference)
-    fn get_log_ref(&self, idx: u64) -> Result<&LogEntry, Error> {
-        if idx >= self.log_actual_len() {
-            return Err(Error::InvalidIndex { len: self.log_actual_len() });
+    // fn get_log_ref(&self, idx: u64) -> Result<LogEntry, Error> {
+    //     if idx >= self.log_actual_len() {
+    //         return Err(Error::InvalidIndex { len: self.log_actual_len() });
+    //     }
+        
+    //     // Try cache first
+    //     if let Some(entry) = self.log.get(&idx) {
+    //         return Ok(entry);
+    //     }
+
+    //     let result = self.persistence.as_ref().get_log_entry(idx);
+    //     if let Ok(Some((_, entry))) = &result {
+    //         return Ok(entry.clone());
+    //     }
+        
+    //     Err(Error::InvalidIndex { len: self.log_actual_len() })
+    // }
+
+    fn update_log_ts(&mut self, idx: u64, final_ts: Clock) -> Result<(), Error> {
+        let mut entry = self.persistence.as_mut().get_log_entry(idx);
+        if let Ok(e) = &mut entry {
+            if e.is_none() {
+                return Err(Error::InvalidIndex { len: self.log_actual_len() });
+            }
+            let (epoch, log) = e.as_mut().unwrap();
+            log.final_ts = Some(final_ts);
+            self.persistence.as_mut().put_log_entry(*epoch, idx, log).unwrap();
+            self.log.insert(idx, log.clone());
         }
-        Ok(&self.log[idx as usize])
+
+        
+        Ok(())
     }
-    
-    /// Get mutable log entry by index
-    fn get_log_mut(&mut self, idx: u64) -> Result<&mut LogEntry, Error> {
-        if idx >= self.log_actual_len() {
-            return Err(Error::InvalidIndex { len: self.log_actual_len() });
-        }
-        Ok(&mut self.log[idx as usize])
-    }
-    
+
     /// Get actual log length (different from log_len which uses log_epochs)
     fn log_actual_len(&self) -> u64 {
-        self.log.len() as u64
+        self.log_len_cached
     }
     
     /// Push entry to log
     fn push_log(&mut self, entry: LogEntry) {
-        self.log.push(entry);
+        let idx = self.log_len_cached;
+        self.log.insert(idx, entry);
+        self.log_len_cached += 1;
     }
     
     /// Pop last entry from log
     fn pop_log(&mut self) -> Option<LogEntry> {
-        self.log.pop()
+        if self.log_len_cached == 0 {
+            return None;
+        }
+        self.log_len_cached -= 1;
+        self.log.remove(&self.log_len_cached)
     }
     
     /// Get last log entry reference
     fn last_log(&self) -> Option<&LogEntry> {
-        self.log.last()
+        if self.log_len_cached == 0 {
+            return None;
+        }
+        self.log.get(&(self.log_len_cached - 1))
     }
     
     /// Find log entry in range for destination
     fn find_log_for_dest(&self, start_idx: u64, gid: Gid) -> Option<&LogEntry> {
-        let idx = usize::try_from(start_idx).expect("out of range log idx");
-        self.log[idx..].iter().find(|it| it.dest.contains(gid))
+        for idx in start_idx..self.log_len_cached {
+            if let Some(entry) = self.log.get(&idx) {
+                if entry.dest.contains(gid) {
+                    return Some(entry);
+                }
+            }
+            // TODO: If not in cache, check persistence
+        }
+        None
     }
     
     /// Check if log is empty
@@ -322,6 +360,7 @@ impl GroupReplica {
     #[allow(dead_code)]
     fn clear_log(&mut self) {
         self.log.clear();
+        self.log_len_cached = 0;
     }
 
     /// helper for getting the entry for pid in current_epoch_acks
@@ -504,20 +543,31 @@ impl GroupReplica {
 
             // truncate the log and remove invalid msgid mappings
             self.log_epochs.truncate(idx + 1);
-            let last_entry = self.log_epochs.last_mut().unwrap();
-            last_entry.1 = prefix_len;
+            {
+                let last_entry = self.log_epochs.last_mut().unwrap();
+                last_entry.1 = prefix_len;
+            }
             
             // TODO: This needs to be abstracted when persistence is fully implemented
-            // Using direct access to avoid borrow checker issues during transition
-            while self.log.len() as u64 > prefix_len {
-                let entry = self.log.pop().unwrap();
+            // Collect entries to remove first to avoid multiple mutable borrows
+            let mut entries_to_remove = Vec::new();
+            while self.log_len_cached > prefix_len {
+                if let Some(entry) = self.pop_log() {
+                    entries_to_remove.push(entry);
+                } else {
+                    break;
+                }
+            }
+            
+            // Process removed entries
+            for entry in entries_to_remove {
                 let id_low = (entry.msg_id & MSGID_LOW_MASK) as u16;
                 let id_set = self.msgid.get_mut(&id_low).expect("msgid should be present");
                 assert!(id_set.remove(&entry.msg_id), "msgid should be present");
                 self.pending.remove_entry_ts(entry.msg_id);
             }
 
-            assert!(*last_entry <= *log_epochs.last().unwrap());
+            assert!(self.log_epochs.last().unwrap() <= log_epochs.last().unwrap());
             Ok(self.log_status())
         } else {
             Err(Error::EpochTooOld {
@@ -649,8 +699,8 @@ impl GroupReplica {
     }
 
     /// Get the entry at a given log position.
-    pub fn log_entry(&self, idx: u64) -> Option<(Epoch, &LogEntry)> {
-        let e = self.get_log_ref(idx).expect("out of range log idx");
+    pub fn log_entry(&self, idx: u64) -> Option<(Epoch, LogEntry)> {
+        let e = self.get_log(idx).expect("out of range log idx");
         // derive entry epoch from the log_epochs array
         let mut epoch = None;
         timed_print!("get log entry {:?} {:?}", idx, self.log_epochs);
@@ -662,10 +712,6 @@ impl GroupReplica {
             }
         }
         Some((epoch.unwrap(), e))
-    }
-
-    fn log_entry_mut(&mut self, idx: u64) -> Option<&mut LogEntry> {
-        self.get_log_mut(idx).ok()
     }
 
     pub fn log_entry_for_remote(&self, idx: u64) -> Option<RemoteEntry> {
@@ -895,14 +941,15 @@ impl GroupReplica {
     }
 
     /// Returns the next delivery (if any) in final timestamp order
-    pub fn next_delivery(&mut self) -> Option<&LogEntry> {
+    pub fn next_delivery(&mut self) -> Option<LogEntry> {
         let min_new_epoch_ts = self.min_new_epoch_ts();
         let min_clock_leader = self.min_clock_leader();
         let min_new_proposal = std::cmp::min(min_new_epoch_ts, Some(min_clock_leader + 1))?;
         let (final_ts, id, idx) = self.pending.pop_next_smallest(min_new_proposal)?;
-        let log_entry = self.log_entry_mut(idx).unwrap();
+        let mut log_entry = self.get_log(idx).unwrap();
         debug_assert_eq!(id, log_entry.msg_id);
         debug_assert!(log_entry.local_ts <= final_ts);
+        self.update_log_ts(idx, final_ts).unwrap();
         log_entry.final_ts = Some(final_ts);
         return Some(log_entry);
     }
