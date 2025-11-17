@@ -1,5 +1,3 @@
-use crate::timed_print;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 use sled::{Db, Tree};

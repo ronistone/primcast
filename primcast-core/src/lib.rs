@@ -1,6 +1,5 @@
 use bytes::Bytes;
 
-use core::time;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -221,7 +220,7 @@ impl GroupReplica {
             (promised_epoch, vec![(epoch, 0)], 0, 0)
         };
 
-        let mut result = GroupReplica {
+        let result = GroupReplica {
             gid,
             pid,
             clock: LogicalClock::new(pid, current_epoch, config.group_pids(gid).unwrap(), hybrid_clock),

@@ -1,9 +1,7 @@
-use crate::timed_print;
 
 use super::*;
 use lmdb::{Environment, Database, Transaction, WriteFlags, Cursor};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct LMDBPersistence {
     env: Environment,
