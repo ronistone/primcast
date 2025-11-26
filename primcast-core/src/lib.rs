@@ -220,7 +220,7 @@ impl GroupReplica {
             (promised_epoch, vec![(epoch, 0)], 0, 0)
         };
 
-        let result = GroupReplica {
+        let mut result = GroupReplica {
             gid,
             pid,
             clock: LogicalClock::new(pid, current_epoch, config.group_pids(gid).unwrap(), hybrid_clock),
@@ -247,9 +247,13 @@ impl GroupReplica {
             persistence,
         };
 
-        // log_persisted.iter().for_each(|e| { // This code load all log in memory
-        //     result.append(e.epoch, e.idx, e.entry.clone()).unwrap();
-        // });
+        log_persisted.iter().for_each(|e| { // This code load all log in memory
+            let (actual_epoch, _) = result.log_status();
+            if e.epoch < actual_epoch || e.idx < safe_len {
+                return; // skip entries from old epochs
+            }
+            result.append(e.epoch, e.idx, e.entry.clone()).unwrap();
+        });
 
         return result
     }
@@ -314,8 +318,7 @@ impl GroupReplica {
     }
     
     /// Push entry to log
-    fn push_log(&mut self, entry: LogEntry) {
-        let idx = self.log_len_cached;
+    fn push_log(&mut self, idx: u64, entry: LogEntry) {
         self.log.insert(idx, entry);
         self.log_len_cached += 1;
     }
@@ -348,11 +351,6 @@ impl GroupReplica {
             // TODO: If not in cache, check persistence
         }
         None
-    }
-    
-    /// Check if log is empty
-    fn is_log_empty(&self) -> bool {
-        self.log.is_empty()
     }
     
     /// Clear all log entries (for testing/reset purposes)
@@ -732,7 +730,12 @@ impl GroupReplica {
 
     /// Helper method for properly appending to the log
     fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<u64, Error> {
-        timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
+        self.append_inner_internal(idx, entry_epoch, entry, false)
+    }
+
+    /// Helper method for properly appending to the log
+    fn append_inner_internal(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry, from_storage: bool) -> Result<u64, Error> {
+        // timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
         let (log_epoch, log_len) = self.log_status();
 
         if log_len != idx {
@@ -751,8 +754,11 @@ impl GroupReplica {
                 s.insert(entry.msg_id);
             }
         }
-        self.pending
-            .add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts, self.log_len() as u64);
+
+        if !from_storage {
+            self.pending
+                .add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts, self.log_len() as u64);
+        }
 
         // add to log_epochs
         if log_epoch == entry_epoch {
@@ -780,7 +786,7 @@ impl GroupReplica {
         self.persistence
         .put_log_entry(entry_epoch, idx, &entry)
         .expect("failed to append log entry to persistence");
-        self.push_log(entry);
+        self.push_log(idx, entry);
 
         // update own ack
         let len = self.log_len() as u64;
@@ -815,6 +821,28 @@ impl GroupReplica {
         let entry_ts = entry.local_ts;
         let res = self.append_inner(idx, epoch, entry)?;
         // assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order: entry_ts = {}, min_clock_leader = {}", entry_ts, self.min_clock_leader());
+        // append is an ack from leader
+        self.add_ack(epoch.owner(), epoch, idx + 1, entry_ts).unwrap();
+
+        self.clock.update(epoch.owner(), epoch, entry_ts);
+        Ok(res)
+    }
+
+        /// Append log entry from the leader. Returns the entry idx the log.
+    pub fn append_load_storage(&mut self, epoch: Epoch, idx: u64, entry: LogEntry) -> Result<u64, Error> {
+        let (log_epoch, _) = self.log_status();
+        if (self.promised_epoch > epoch || self.current_epoch() > epoch) && log_epoch > epoch {
+            timed_print!("FAIL TO APPEND: {:?} > {:?} or {:?} > {:?}", self.promised_epoch, epoch, self.current_epoch(), epoch);
+            return Err(Error::EpochTooOld {
+                promised: self.promised_epoch,
+                current: self.promised_epoch,
+            });
+        }
+
+        self.leader_last_seen = Instant::now();
+        let entry_ts = entry.local_ts;
+        let res = self.append_inner_internal(idx, epoch, entry, true)?;
+
         // append is an ack from leader
         self.add_ack(epoch.owner(), epoch, idx + 1, entry_ts).unwrap();
 
@@ -908,6 +936,7 @@ impl GroupReplica {
         let safe_len = std::cmp::min(std::cmp::max(self.safe_len, safe_len_from_acks), self.log_len() as u64);
         for idx in self.safe_len as usize..safe_len as usize {
             let entry = self.get_log(idx as u64).unwrap();
+            // timed_print!("index: {}, to safe_len {}", idx, safe_len);
             self.pending
                 .add_group_ts(entry.msg_id, &entry.dest, self.gid, entry.local_ts);
         }
@@ -917,9 +946,18 @@ impl GroupReplica {
         for (gid, l) in &mut self.remote_learners {
             l.update();
             while let Some((msg_id, dest, ts)) = l.next_delivery() {
+                timed_print!("msg_id: {}, to timestamp: {}", msg_id, ts);
                 self.pending.add_group_ts(msg_id, &dest, *gid, ts);
             }
         }
+        self.persistence.put_metadata(&persistence::ReplicaMetadata { 
+                gid: self.gid, 
+                pid: self.pid,
+                promised_epoch: self.promised_epoch.clone(),
+                log_epochs: self.log_epochs.clone(),
+                safe_len: self.safe_len.clone(),
+                clock: self.clock.get(self.pid),
+            }).expect("failed to update metadata in persistence");
     }
 
     /// Returns the list of messages with some decided remote timestamp but not proposed locally yet.

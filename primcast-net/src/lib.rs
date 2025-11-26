@@ -908,6 +908,7 @@ async fn deliver_task(
     let mut update_rx = s.read().await.update_rx.clone();
     let mut deliveries = vec![];
     let mut last_delivery = (0, 0);
+    // sleep(Duration::from_millis(15000)).await; // wait for initial state
     loop {
         update_rx.changed().await?;
         let mut s = s.write().await;

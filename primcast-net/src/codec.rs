@@ -85,18 +85,17 @@ where
     (r, w)
 }
 
-#[cfg(allow_unused)]
-pub fn bincode_unsplit<RM, WM, IO>(rx: BincodeReader<RM, IO>, tx: BincodeWriter<WM, IO>) -> Option<IO>
-where
-    WM: Serialize + DeserializeOwned,
-    RM: Serialize + DeserializeOwned,
-    IO: AsyncRead + AsyncWrite,
-{
-    let rx = rx.into_inner();
-    let tx = tx.into_inner();
-    if rx.is_pair_of(&tx) {
-        Some(rx.unsplit(tx))
-    } else {
-        None
-    }
-}
+// pub fn bincode_unsplit<RM, WM, IO>(rx: BincodeReader<RM, IO>, tx: BincodeWriter<WM, IO>) -> Option<IO>
+// where
+//     WM: Serialize + DeserializeOwned,
+//     RM: Serialize + DeserializeOwned,
+//     IO: AsyncRead + AsyncWrite,
+// {
+//     let rx = rx.into_inner();
+//     let tx = tx.into_inner();
+//     if rx.is_pair_of(&tx) {
+//         Some(rx.unsplit(tx))
+//     } else {
+//         None
+//     }
+// }

@@ -16,7 +16,7 @@ pub trait StreamExt2: Stream {
     /// Read the next (up to `max_items`) ready items into buf.
     /// It will block util at least one item is returned by the stream.
     /// Returns the number of items read (0 means the stream returned None).
-    fn next_ready_chunk<'a>(&'a mut self, max_items: usize, buf: &'a mut Vec<Self::Item>) -> NextReadyChunk<Self>
+    fn next_ready_chunk<'a>(&'a mut self, max_items: usize, buf: &'a mut Vec<Self::Item>) -> NextReadyChunk<'a, Self>
     where
         Self: Sized + Unpin;
 }
@@ -35,7 +35,7 @@ impl<S: Stream> StreamExt2 for S {
         }
     }
 
-    fn next_ready_chunk<'a>(&'a mut self, max_items: usize, buf: &'a mut Vec<S::Item>) -> NextReadyChunk<Self>
+    fn next_ready_chunk<'a>(&'a mut self, max_items: usize, buf: &'a mut Vec<S::Item>) -> NextReadyChunk<'a, Self>
     where
         Self: Sized + Unpin,
     {

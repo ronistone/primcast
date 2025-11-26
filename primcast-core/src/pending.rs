@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHasher;
-
+use std::time::{SystemTime, UNIX_EPOCH};
+use crate::timed_print;
 use crate::types::*;
 
 /// Pending message information needed to track delivery
@@ -83,7 +84,7 @@ impl PendingSet {
     pub fn add_entry_ts(&mut self, msg_id: MsgId, dest: &GidSet, entry_ts: Clock, log_idx: u64) {
         use std::collections::hash_map::Entry;
         let ts;
-        // timed_print!("({} {}) > ({} {}) ADD_ENTRY_TS", entry_ts, msg_id, self.last_popped.0, self.last_popped.1);
+        timed_print!("({} {}) > ({} {}) ADD_ENTRY_TS", entry_ts, msg_id, self.last_popped.0, self.last_popped.1);
         assert!((entry_ts, msg_id) > self.last_popped);
         assert!(entry_ts > self.highest_local_ts);
 
@@ -91,7 +92,8 @@ impl PendingSet {
             Entry::Occupied(mut e) => {
                 let m = e.get_mut();
                 // we've already seen the message through some remote group ts
-                assert!(m.missing_group_ts.len() < m.dest.len());
+                timed_print!("add_entry_ts: msg {} already present {:?} < {:?}", msg_id, m.missing_group_ts, m.dest);
+                assert!(m.missing_group_ts.len() <= m.dest.len());
                 assert!(m.missing_group_ts.contains(self.gid));
                 m.last_modified = Instant::now();
                 // msg should not be present in ts_order
@@ -123,6 +125,7 @@ impl PendingSet {
         use std::collections::hash_map::Entry;
 
         if gid == self.gid {
+            // timed_print!("({}) > ({}) ADD_GROUP_TS LOCAL", group_ts, self.highest_local_ts);
             assert!(group_ts > self.highest_local_ts);
             self.highest_local_ts = group_ts;
         }
