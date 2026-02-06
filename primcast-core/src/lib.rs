@@ -81,6 +81,18 @@ pub enum ReplicaState {
     // remote acks though, so maybe it's simpler to just keep it.
     Promised,
     Follower,
+    Recovering,  // Node is recovering from persistent storage
+}
+
+/// State loaded from persistent storage for recovery
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PersistedState {
+    pub promised_epoch: Epoch,
+    pub log: Vec<LogEntry>,
+    pub log_epochs: Vec<(Epoch, u64)>,
+    pub clock_value: Clock,
+    pub safe_len: u64,
+    pub delivery_watermark: (Clock, MsgId),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -172,11 +184,12 @@ impl GroupReplica {
     /// TODO: we don't currently use persistent storage.
     /// Every replica starts at epoch Epoch::initial() with an empty log.
     pub fn new(gid: Gid, pid: Pid, epoch: Epoch, config: Config, hybrid_clock: bool) -> Self {
-        let state = if epoch.owner() == pid {
-            ReplicaState::Primary
-        } else {
-            ReplicaState::Follower
-        };
+        // let state = if epoch.owner() == pid {
+        //     ReplicaState::Primary
+        // } else {
+        //     ReplicaState::Follower
+        // };
+        let state = ReplicaState::Recovering;
 
         let remote_learners = config
             .groups
@@ -433,6 +446,68 @@ impl GroupReplica {
 
     pub fn log_len(&self) -> u64 {
         self.log_epochs.last().unwrap().1
+    }
+    /// Append a batch of log entries during recovery.
+    /// Entries MUST be sorted by idx (ascending) and contiguous starting from self.log.len().
+    /// The replica must be in Recovering state.
+    pub fn recovery_append_batch(
+        &mut self,
+        entries: Vec<(u64, Epoch, LogEntry)>,
+    ) -> Result<(), Error> {
+        if self.state != ReplicaState::Recovering {
+            return Err(Error::InvalidReplicaState);
+        }
+
+        for (idx, entry_epoch, entry) in entries {
+            // Validate contiguity
+            let log_len = self.log.len() as u64;
+            if idx != log_len {
+                return Err(Error::InvalidIndex { len: log_len });
+            }
+
+            // Use the existing append_inner which handles:
+            // - msgid index update
+            // - pending.add_entry_ts
+            // - log_epochs tracking
+            // - log.push
+            // - own ack update
+            self.append_inner(idx, entry_epoch, entry)?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the replica's current status for the recovery protocol.
+    pub fn recovery_status(&self) -> (Epoch, Epoch, u64, Clock, Vec<(Epoch, u64)>) {
+        let (log_epoch, log_len) = self.log_status();
+        (
+            self.promised_epoch,
+            log_epoch,
+            log_len,
+            self.clock.local(),
+            self.log_epochs.clone(),
+        )
+    }
+
+    /// Finalize recovery: transition from Recovering to Promised.
+    /// After this, the node can join the normal epoch flow.
+    pub fn finalize_recovery(&mut self, epoch: Epoch, clock: Clock) -> Result<(), Error> {
+        if self.state != ReplicaState::Recovering {
+            return Err(Error::InvalidReplicaState);
+        }
+
+        self.promised_epoch = epoch;
+        self.state = ReplicaState::Promised;
+        self.clock.advance_epoch(epoch);
+        self.clock.update(self.pid, epoch, clock);
+
+        // Reset ack tracking for the new epoch
+        let log_len = self.log.len() as u64;
+        for (len, pid) in self.current_epoch_acks.iter_mut() {
+            *len = if *pid == self.pid { log_len } else { 0 };
+        }
+
+        Ok(())
     }
 
     pub fn become_candidate(&mut self) {
@@ -1201,4 +1276,109 @@ mod tests {
             assert!(r.next_delivery().is_none());
         }
     }
-}
+
+    #[test]
+    fn recovery_append_batch_basic() {
+        let config = Config::new_for_test();
+
+        // Create source log entries to be recovered
+        let mut source_entries = Vec::new();
+        source_entries.push(LogEntry {
+            local_ts: 1,
+            msg_id: 1,
+            msg: "a".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+        source_entries.push(LogEntry {
+            local_ts: 2,
+            msg_id: 2,
+            msg: "b".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+        source_entries.push(LogEntry {
+            local_ts: 3,
+            msg_id: 3,
+            msg: "c".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+
+        // Create entries to pass to recovery_append_batch
+        let entries = vec![
+            (0u64, Epoch::initial(), source_entries[0].clone()),
+            (1u64, Epoch::initial(), source_entries[1].clone()),
+            (2u64, Epoch::initial(), source_entries[2].clone()),
+        ];
+
+        // Create a fresh replica
+        let mut replica = GroupReplica::new(Gid(0), Pid(1), Epoch::initial(), config.clone(), false);
+        // Must be in Recovering state to use recovery_append_batch
+        replica.state = ReplicaState::Recovering;
+
+        // Apply batch of entries
+        assert!(replica.recovery_append_batch(entries).is_ok());
+        assert_eq!(replica.log.len(), 3);
+
+        // Verify entries were applied
+        assert_eq!(replica.log_entry(0).unwrap().1.msg_id, 1);
+        assert_eq!(replica.log_entry(1).unwrap().1.msg_id, 2);
+        assert_eq!(replica.log_entry(2).unwrap().1.msg_id, 3);
+    }
+
+    #[test]
+    fn recovery_status_and_finalize() {
+        let config = Config::new_for_test();
+
+        // Create replica in Recovering state
+        let mut replica = GroupReplica::new(Gid(0), Pid(0), Epoch::initial(), config.clone(), false);
+        replica.state = ReplicaState::Recovering;
+
+        // Check recovery status - returns (promised_epoch, log_epoch, log_len, clock, log_epochs)
+        let (promised_epoch, log_epoch, log_len, _clock, log_epochs) = replica.recovery_status();
+        assert_eq!(promised_epoch, Epoch::initial());
+        assert_eq!(log_epoch, Epoch::initial());
+        assert_eq!(log_len, 0);
+        assert_eq!(log_epochs.len(), 1); // At least the initial epoch
+
+        // Create log entries manually
+        let mut dest = GidSet::new();
+        dest.insert(Gid(0));
+        
+        replica.log.push(LogEntry {
+            local_ts: 1,
+            msg_id: 1,
+            msg: "x".into(),
+            dest: dest.clone(),
+            final_ts: None,
+        });
+        replica.log.push(LogEntry {
+            local_ts: 2,
+            msg_id: 2,
+            msg: "y".into(),
+            dest: dest.clone(),
+            final_ts: None,
+        });
+
+        // Finalize recovery with an epoch and clock
+        let new_epoch = Epoch(1, Pid(0));
+        let new_clock = 5;
+        assert!(replica.finalize_recovery(new_epoch, new_clock).is_ok());
+        assert_eq!(replica.state, ReplicaState::Promised);
+
+        // After finalization, log should be preserved
+        assert_eq!(replica.log.len(), 2);
+    }}

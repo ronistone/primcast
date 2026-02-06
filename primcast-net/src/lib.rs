@@ -33,6 +33,7 @@ pub mod conn;
 mod messages;
 pub mod util;
 pub mod leader_election;
+pub mod recovery;
 
 use conn::Conn;
 use messages::Message;
@@ -148,12 +149,14 @@ impl PrimcastHandle {
 }
 
 impl PrimcastReplica {
-    pub async fn start(gid: Gid, pid: Pid, cfg: config::Config, hybrid_clock: bool, debug: Option<u64>) -> PrimcastHandle {
-        let mut leader_election = LeaderElection::new(gid, pid, cfg.clone());
-        let (ev_tx, mut election_rcv) = mpsc::unbounded_channel();
-        leader_election.subscribe(ev_tx);
-        tokio::spawn(leader_election.run());
-
+    pub async fn start(
+        gid: Gid,
+        pid: Pid,
+        cfg: config::Config,
+        hybrid_clock: bool,
+        debug: Option<u64>,
+        persisted: Option<primcast_core::PersistedState>,
+    ) -> PrimcastHandle {
         let actual_epoch = Epoch(0, Pid(u32::MAX));
 
         let core = GroupReplica::new(gid, pid, actual_epoch, cfg.clone(), hybrid_clock);
@@ -193,6 +196,47 @@ impl PrimcastReplica {
             shared: Arc::new(RwLock::new(shared)),
             ev_rx,            
         };
+
+        // Check if we need to run recovery (persisted state was loaded)
+        let needs_recovery = {
+            let shared = s.shared.read().await;
+            shared.core.state().1 == ReplicaState::Recovering
+        };
+
+        if needs_recovery {
+            // Start acceptor first so peers can connect to us for recovery
+            let addr = s
+                .cfg
+                .peer(gid, pid)
+                .expect("gid/pid not in config")
+                .addr();
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("failed to bind acceptor: {:?}", e);
+                    return PrimcastHandle {
+                        _shutdown: shutdown_handle,
+                        delivery_rx: Some(delivery_rx),
+                        gid_proposal_tx: HashMap::default(),
+                    };
+                }
+            };
+
+            let acceptor_task = acceptor_task(listener, s.shared.clone());
+            tokio::spawn(acceptor_task);
+
+            // Run collaborative recovery
+            if let Err(e) = recovery::run_recovery_with_retry(s.shared.clone()).await {
+                eprintln!("recovery failed: {:?}", e);
+                // Fall back to waiting for leader sync
+            }
+        }
+
+        // NOW start leader election (after recovery is complete)
+        let mut leader_election = LeaderElection::new(gid, pid, cfg.clone());
+        let (le_ev_tx, mut election_rcv) = mpsc::unbounded_channel();
+        leader_election.subscribe(le_ev_tx);
+        tokio::spawn(leader_election.run());
 
         let leader_election_shared = s.shared.clone();
         tokio::spawn(async move {
@@ -328,6 +372,10 @@ impl PrimcastReplica {
                             }
                             ReplicaState::Primary => {
                                 fut = Box::pin(run_primary(e, self.shared.clone()));
+                            }
+                            ReplicaState::Recovering => {
+                                // Stay in recovery state; the recovery task will transition to Promised
+                                fut = Box::pin(run_idle(self.shared.clone()));
                             }
                         }
                     },
@@ -858,6 +906,43 @@ async fn handle_connection(
                     }
                 }
                 tokio::task::yield_now().await;
+            }
+        }
+
+        Message::RecoveryRequest {
+            gid: req_gid,
+            pid: req_pid,
+            promised_epoch: _,
+            log_epoch: _,
+            log_len: _req_log_len,
+            log_epochs: _req_log_epochs,
+        } => {
+            // Respond with our status
+            let (current_epoch, total_log_len, our_log_epochs, leader_pid) = {
+                let shared = s.read().await;
+                let (_log_epoch, log_len) = shared.core.log_status();
+                let (epoch, _state) = shared.core.state();
+                let log_epochs = shared.core.log_epochs().clone();
+                (epoch, log_len, log_epochs, epoch.owner())
+            };
+
+            timed_print!("recovery: received request from {:?}:{:?}, our log_len = {}", req_gid, req_pid, total_log_len);
+
+            conn.send(Message::RecoveryResponse {
+                current_epoch,
+                leader_pid,
+                total_log_len,
+                log_epochs: our_log_epochs,
+            })
+            .await?;
+
+            // Wait for range assignment
+            match conn.recv().await? {
+                Message::RecoveryRangeAssign { from_idx, to_idx } => {
+                    timed_print!("recovery: sending range [{}, {}) to {:?}:{:?}", from_idx, to_idx, req_gid, req_pid);
+                    recovery_send_range(conn, from_idx, to_idx, s.clone()).await?;
+                }
+                m => panic!("unexpected message after RecoveryResponse: {:?}", m),
             }
         }
 
@@ -1471,6 +1556,56 @@ async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>, send_bump: bool) -> Re
         }
         ack_rx.changed().await?;
     }
+}
+
+/// Send a range of log entries to a recovering peer during collaborative recovery.
+async fn recovery_send_range(
+    mut conn: Conn,
+    from_idx: u64,
+    to_idx: u64,
+    s: Arc<RwLock<Shared>>,
+) -> Result<(), Error> {
+    use Message::*;
+
+    let batch_size = BATCH_SIZE_YIELD;
+    let mut idx = from_idx;
+
+    timed_print!("recovery_send_range: sending entries [{}, {}) to {:?}:{:?}", from_idx, to_idx, conn.gid(), conn.pid());
+
+    while idx < to_idx {
+        let mut entries = Vec::new();
+        {
+            let shared = s.read().await;
+            let batch_end = std::cmp::min(idx + batch_size as u64, to_idx);
+            while idx < batch_end {
+                match shared.core.log_entry(idx) {
+                    Some((epoch, entry)) => {
+                        entries.push((idx, epoch, entry.clone()));
+                        idx += 1;
+                    }
+                    None => {
+                        // Our log doesn't extend this far
+                        break;
+                    }
+                }
+            }
+        }
+
+        let is_last = idx >= to_idx || entries.is_empty();
+        conn.send(RecoveryLogChunk {
+            entries,
+            is_last,
+        })
+        .await?;
+
+        if is_last {
+            break;
+        }
+
+        tokio::task::yield_now().await;
+    }
+
+    Ok(())
 }
 
 /// Send relevant log entries to a replica in another group.
