@@ -84,6 +84,18 @@ pub enum ReplicaState {
     // remote acks though, so maybe it's simpler to just keep it.
     Promised,
     Follower,
+    Recovering,  // Node is recovering from persistent storage
+}
+
+/// State loaded from persistent storage for recovery
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PersistedState {
+    pub promised_epoch: Epoch,
+    pub log: Vec<LogEntry>,
+    pub log_epochs: Vec<(Epoch, u64)>,
+    pub clock_value: Clock,
+    pub safe_len: u64,
+    pub delivery_watermark: (Clock, MsgId),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -232,6 +244,98 @@ impl GroupReplica {
         }
     }
 
+    /// Create a replica from persisted state loaded from DB.
+    /// The replica will be in Recovering state until finalize_recovery() is called.
+    pub fn new_from_persisted(
+        gid: Gid,
+        pid: Pid,
+        config: Config,
+        hybrid_clock: bool,
+        promised_epoch: Epoch,
+        log: Vec<LogEntry>,
+        log_epochs: Vec<(Epoch, u64)>,
+        clock_value: Clock,
+        safe_len: u64,
+        delivery_watermark: (Clock, MsgId),
+    ) -> Self {
+        // 1. Rebuild msgid index by scanning the log
+        let mut msgid: HashMap<u16, HashSet<MsgId>> = HashMap::default();
+        for entry in &log {
+            let id_low = (entry.msg_id & MSGID_LOW_MASK) as u16;
+            msgid.entry(id_low).or_default().insert(entry.msg_id);
+        }
+
+        // 2. Rebuild pending set from the log
+        let mut pending = PendingSet::new_with_watermark(gid, delivery_watermark);
+        for (idx, entry) in log.iter().enumerate() {
+            // Only add entries that were not yet delivered
+            if (entry.local_ts, entry.msg_id) > delivery_watermark {
+                pending.add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts, idx as u64);
+                // If the entry has a final_ts, also add the group timestamps
+                if entry.final_ts.is_some() {
+                    pending.add_group_ts(entry.msg_id, &entry.dest, gid, entry.local_ts);
+                }
+            }
+        }
+
+        // 3. Initialize remote learners (they will catch up via remote_log_fetch)
+        let remote_learners = config
+            .groups
+            .iter()
+            .filter(|g| g.gid != gid)
+            .map(|g| {
+                let pids = g.peers.iter().map(|p| p.pid);
+                let quorum_size = config.quorum_size(g.gid).unwrap();
+                (g.gid, RemoteLearner::new(g.gid, pids, 0, quorum_size))
+            })
+            .collect();
+
+        // 4. Initialize clock
+        let current_epoch = log_epochs.last().map(|(e, _)| *e).unwrap_or(promised_epoch);
+        let mut clock = LogicalClock::new(
+            pid,
+            current_epoch,
+            config.group_pids(gid).unwrap(),
+            hybrid_clock,
+        );
+        clock.update(pid, current_epoch, clock_value);
+
+        // 5. Initialize current_epoch_acks (will be properly set during epoch join)
+        let current_epoch_acks = config
+            .group(gid)
+            .unwrap()
+            .peers
+            .iter()
+            .map(|p| (0u64, p.pid))
+            .collect();
+
+        let group_size = config.group(gid).unwrap().peers.len();
+        let quorum_size = config.quorum_size(gid).unwrap();
+
+        GroupReplica {
+            gid,
+            pid,
+            config,
+            group_size,
+            quorum_size,
+            clock,
+            state: ReplicaState::Recovering,
+            promised_epoch,
+            log,
+            log_epochs,
+            current_epoch_acks,
+            safe_len,
+            msgid,
+            pending,
+            remote_learners,
+            leader_last_seen: Instant::now(),
+            proposals: Vec::new(),
+            proposals_max: 0,
+            promises: HashMap::default(),
+            accepts: HashSet::default(),
+        }
+    }
+
     /// helper for getting the entry for pid in current_epoch_acks
     fn get_ack_mut(&mut self, pid: Pid) -> &mut u64 {
         self.current_epoch_acks
@@ -292,6 +396,69 @@ impl GroupReplica {
 
     pub fn accepts_len(&self) -> usize {
         self.accepts.len()
+    }
+
+    /// Append a batch of log entries during recovery.
+    /// Entries MUST be sorted by idx (ascending) and contiguous starting from self.log.len().
+    /// The replica must be in Recovering state.
+    pub fn recovery_append_batch(
+        &mut self,
+        entries: Vec<(u64, Epoch, LogEntry)>,
+    ) -> Result<(), Error> {
+        if self.state != ReplicaState::Recovering {
+            return Err(Error::InvalidReplicaState);
+        }
+
+        for (idx, entry_epoch, entry) in entries {
+            // Validate contiguity
+            let log_len = self.log.len() as u64;
+            if idx != log_len {
+                return Err(Error::InvalidIndex { len: log_len });
+            }
+
+            // Use the existing append_inner which handles:
+            // - msgid index update
+            // - pending.add_entry_ts
+            // - log_epochs tracking
+            // - log.push
+            // - own ack update
+            self.append_inner(idx, entry_epoch, entry)?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the replica's current status for the recovery protocol.
+    pub fn recovery_status(&self) -> (Epoch, Epoch, u64, Clock, Vec<(Epoch, u64)>) {
+        let (log_epoch, log_len) = self.log_status();
+        (
+            self.promised_epoch,
+            log_epoch,
+            log_len,
+            self.clock.local(),
+            self.log_epochs.clone(),
+        )
+    }
+
+    /// Finalize recovery: transition from Recovering to Promised.
+    /// After this, the node can join the normal epoch flow.
+    pub fn finalize_recovery(&mut self, epoch: Epoch, clock: Clock) -> Result<(), Error> {
+        if self.state != ReplicaState::Recovering {
+            return Err(Error::InvalidReplicaState);
+        }
+
+        self.promised_epoch = epoch;
+        self.state = ReplicaState::Promised;
+        self.clock.advance_epoch(epoch);
+        self.clock.update(self.pid, epoch, clock);
+
+        // Reset ack tracking for the new epoch
+        let log_len = self.log.len() as u64;
+        for (len, pid) in self.current_epoch_acks.iter_mut() {
+            *len = if *pid == self.pid { log_len } else { 0 };
+        }
+
+        Ok(())
     }
 
     pub fn become_candidate(&mut self) {
@@ -976,4 +1143,109 @@ mod tests {
             assert!(r.next_delivery().is_none());
         }
     }
-}
+
+    #[test]
+    fn recovery_append_batch_basic() {
+        let config = Config::new_for_test();
+
+        // Create source log entries to be recovered
+        let mut source_entries = Vec::new();
+        source_entries.push(LogEntry {
+            local_ts: 1,
+            msg_id: 1,
+            msg: "a".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+        source_entries.push(LogEntry {
+            local_ts: 2,
+            msg_id: 2,
+            msg: "b".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+        source_entries.push(LogEntry {
+            local_ts: 3,
+            msg_id: 3,
+            msg: "c".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+
+        // Create entries to pass to recovery_append_batch
+        let entries = vec![
+            (0u64, Epoch::initial(), source_entries[0].clone()),
+            (1u64, Epoch::initial(), source_entries[1].clone()),
+            (2u64, Epoch::initial(), source_entries[2].clone()),
+        ];
+
+        // Create a fresh replica
+        let mut replica = GroupReplica::new(Gid(0), Pid(1), Epoch::initial(), config.clone(), false);
+        // Must be in Recovering state to use recovery_append_batch
+        replica.state = ReplicaState::Recovering;
+
+        // Apply batch of entries
+        assert!(replica.recovery_append_batch(entries).is_ok());
+        assert_eq!(replica.log.len(), 3);
+
+        // Verify entries were applied
+        assert_eq!(replica.log_entry(0).unwrap().1.msg_id, 1);
+        assert_eq!(replica.log_entry(1).unwrap().1.msg_id, 2);
+        assert_eq!(replica.log_entry(2).unwrap().1.msg_id, 3);
+    }
+
+    #[test]
+    fn recovery_status_and_finalize() {
+        let config = Config::new_for_test();
+
+        // Create replica in Recovering state
+        let mut replica = GroupReplica::new(Gid(0), Pid(0), Epoch::initial(), config.clone(), false);
+        replica.state = ReplicaState::Recovering;
+
+        // Check recovery status - returns (promised_epoch, log_epoch, log_len, clock, log_epochs)
+        let (promised_epoch, log_epoch, log_len, _clock, log_epochs) = replica.recovery_status();
+        assert_eq!(promised_epoch, Epoch::initial());
+        assert_eq!(log_epoch, Epoch::initial());
+        assert_eq!(log_len, 0);
+        assert_eq!(log_epochs.len(), 1); // At least the initial epoch
+
+        // Create log entries manually
+        let mut dest = GidSet::new();
+        dest.insert(Gid(0));
+        
+        replica.log.push(LogEntry {
+            local_ts: 1,
+            msg_id: 1,
+            msg: "x".into(),
+            dest: dest.clone(),
+            final_ts: None,
+        });
+        replica.log.push(LogEntry {
+            local_ts: 2,
+            msg_id: 2,
+            msg: "y".into(),
+            dest: dest.clone(),
+            final_ts: None,
+        });
+
+        // Finalize recovery with an epoch and clock
+        let new_epoch = Epoch(1, Pid(0));
+        let new_clock = 5;
+        assert!(replica.finalize_recovery(new_epoch, new_clock).is_ok());
+        assert_eq!(replica.state, ReplicaState::Promised);
+
+        // After finalization, log should be preserved
+        assert_eq!(replica.log.len(), 2);
+    }}
