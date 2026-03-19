@@ -16,12 +16,15 @@ pub mod config;
 mod pending;
 pub mod remote_learner;
 pub mod types;
+pub mod persistence;
 
 use clock::LogicalClock;
 use config::Config;
 use pending::PendingSet;
 use types::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::persistence::{LMDBPersistence, PersistenceLayer, RocksDBPersistence, SledPersistence};
 
 // Add this global toggle
 static TIMED_PRINT_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -61,12 +64,6 @@ macro_rules! timed_print {
         }
     }
 }
-/// Allocate space for this amount of log entries at the start, to avoid
-/// reallocations. The way we keep entries in memory (just a Vec), large
-/// reallocations may cause pauses due to the amount of copying.
-// TODO: handle this issue
-const INITIAL_CAP: usize = 50_000_000;
-
 /// Split msgid set into multiple hashsets to prevent large reallocations
 const MSGID_LOW_MASK: MsgId = 0xff;
 
@@ -84,6 +81,18 @@ pub enum ReplicaState {
     // remote acks though, so maybe it's simpler to just keep it.
     Promised,
     Follower,
+    Recovering,  // Node is recovering from persistent storage
+}
+
+/// State loaded from persistent storage for recovery
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PersistedState {
+    pub promised_epoch: Epoch,
+    pub log: Vec<LogEntry>,
+    pub log_epochs: Vec<(Epoch, u64)>,
+    pub clock_value: Clock,
+    pub safe_len: u64,
+    pub delivery_watermark: (Clock, MsgId),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,8 +128,10 @@ pub struct GroupReplica {
     state: ReplicaState,
     promised_epoch: Epoch,
 
-    /// The replica log
-    log: Vec<LogEntry>,
+    /// The replica log - cached entries indexed by log position
+    log: HashMap<u64, LogEntry>,
+    /// Current log length (highest index + 1)
+    log_len_cached: u64,
     /// Epochs stored in the log and the size of the log for each.
     log_epochs: Vec<(Epoch, u64)>,
     /// Log length acknowledged by group replicas in the current_epoch only (i.e., last epoch in log_epochs).
@@ -141,6 +152,8 @@ pub struct GroupReplica {
     proposals_max: usize,
     promises: HashMap<Pid, (Epoch, u64, Clock)>,
     accepts: HashSet<Pid>,
+
+    persistence: Box<dyn PersistenceLayer>,
 }
 
 #[derive(Debug)]
@@ -157,6 +170,7 @@ pub enum Error {
     IdAlreadyUsed,
     GroupNotInDest,
     RemoteLearner(remote_learner::Error),
+    InvalidPersistence,
 }
 
 impl From<remote_learner::Error> for Error {
@@ -170,11 +184,11 @@ impl GroupReplica {
     /// TODO: we don't currently use persistent storage.
     /// Every replica starts at epoch Epoch::initial() with an empty log.
     pub fn new(gid: Gid, pid: Pid, epoch: Epoch, config: Config, hybrid_clock: bool) -> Self {
-        let state = if epoch.owner() == pid {
-            ReplicaState::Primary
-        } else {
-            ReplicaState::Follower
-        };
+        // let state = if epoch.owner() == pid {
+        //     ReplicaState::Primary
+        // } else {
+        //     ReplicaState::Follower
+        // };
 
         let remote_learners = config
             .groups
@@ -201,12 +215,29 @@ impl GroupReplica {
         let group_size = current_epoch_acks.len();
         let quorum_size = config.quorum_size(gid).unwrap();
 
-        let mut log = Vec::new();
-        log.reserve(INITIAL_CAP);
         let mut msgid = HashMap::default();
         msgid.reserve(MSGID_LOW_MASK as usize);
+        let persistence_path = config.peer(gid, pid).unwrap().persistence_database.clone();
+        let persistence = get_persistence(&config.persistence_backend, &persistence_path).unwrap();
 
-        GroupReplica {
+        let log_persisted = persistence.list_log_entries().unwrap();
+
+        let metadate_persisted = persistence.get_metadata().unwrap();
+        timed_print!("Loaded {} log entries from persistence", log_persisted.len());
+        timed_print!("Loaded metadata from persistence: {:?}", metadate_persisted);
+        
+        // Always start in Promised state. Recovery (catch-up) happens via the normal
+        // leader sync process (sync_with/sync_follower), not as a separate pre-startup phase.
+        let state = ReplicaState::Promised;
+        
+        let (promised_epoch, log_epochs, safe_len, _) = if let Some(m) = metadate_persisted {
+            (m.promised_epoch, m.log_epochs, m.safe_len, m.clock)
+            // (promised_epoch, vec![(epoch, 0)], 0, 0)
+        } else {
+            (promised_epoch, vec![(epoch, 0)], 0, 0)
+        };
+
+        let mut result = GroupReplica {
             gid,
             pid,
             clock: LogicalClock::new(pid, current_epoch, config.group_pids(gid).unwrap(), hybrid_clock),
@@ -216,10 +247,11 @@ impl GroupReplica {
 
             state,
             promised_epoch,
-            log,
-            log_epochs: vec![(epoch, 0)],
+            log: HashMap::default(),
+            log_len_cached: 0,
+            log_epochs: log_epochs,
             current_epoch_acks,
-            safe_len: 0,
+            safe_len: safe_len,
             msgid,
             pending: PendingSet::new(gid),
 
@@ -229,7 +261,120 @@ impl GroupReplica {
             promises: Default::default(),
             accepts: Default::default(),
             remote_learners,
+            persistence,
+        };
+
+        log_persisted.iter().for_each(|e| { // This code load all log in memory
+            let (actual_epoch, _) = result.log_status();
+            if e.epoch < actual_epoch || e.idx < safe_len {
+                return; // skip entries from old epochs
+            }
+            result.append(e.epoch, e.idx, e.entry.clone()).unwrap();
+        });
+
+        return result
+    }
+
+    fn get_log(&self, idx: u64) -> Result<LogEntry, Error> {
+        
+        // Try cache first
+        if let Some(entry) = self.log.get(&idx) {
+            return Ok(entry.clone());
         }
+
+        let result = self.persistence.as_ref().get_log_entry(idx);
+        if let Ok(Some((_, entry))) = &result {
+            return Ok(entry.clone());
+        }
+
+        Err(Error::InvalidIndex { len: self.log_actual_len() })
+    }
+
+    // === Log Access Abstraction Methods ===
+    // These methods provide controlled access to the log for future persistence integration.
+    // All direct self.log access should go through these methods.
+    
+    /// Get log entry by index (returns a reference)
+    // fn get_log_ref(&self, idx: u64) -> Result<LogEntry, Error> {
+    //     if idx >= self.log_actual_len() {
+    //         return Err(Error::InvalidIndex { len: self.log_actual_len() });
+    //     }
+        
+    //     // Try cache first
+    //     if let Some(entry) = self.log.get(&idx) {
+    //         return Ok(entry);
+    //     }
+
+    //     let result = self.persistence.as_ref().get_log_entry(idx);
+    //     if let Ok(Some((_, entry))) = &result {
+    //         return Ok(entry.clone());
+    //     }
+        
+    //     Err(Error::InvalidIndex { len: self.log_actual_len() })
+    // }
+
+    fn update_log_ts(&mut self, idx: u64, final_ts: Clock) -> Result<(), Error> {
+        let mut entry = self.persistence.as_mut().get_log_entry(idx);
+        if let Ok(e) = &mut entry {
+            if e.is_none() {
+                return Err(Error::InvalidIndex { len: self.log_actual_len() });
+            }
+            let (epoch, log) = e.as_mut().unwrap();
+            log.final_ts = Some(final_ts);
+            self.persistence.as_mut().put_log_entry(*epoch, idx, log).unwrap();
+            self.log.insert(idx, log.clone());
+        }
+
+        
+        Ok(())
+    }
+
+    /// Get actual log length (different from log_len which uses log_epochs)
+    fn log_actual_len(&self) -> u64 {
+        self.log_len_cached
+    }
+    
+    /// Push entry to log
+    fn push_log(&mut self, idx: u64, entry: LogEntry) {
+        self.log.insert(idx, entry);
+        self.log_len_cached += 1;
+    }
+    
+    /// Pop last entry from log
+    fn pop_log(&mut self) -> Option<LogEntry> {
+        if self.log_len_cached == 0 {
+            return None;
+        }
+        self.log_len_cached -= 1;
+        self.log.remove(&self.log_len_cached)
+    }
+    
+    /// Get last log entry reference
+    fn last_log(&self) -> Option<&LogEntry> {
+        if self.log_len_cached == 0 {
+            return None;
+        }
+        self.log.get(&(self.log_len_cached - 1))
+    }
+    
+    /// Find log entry in range for destination
+    fn find_log_for_dest(&self, start_idx: u64, gid: Gid) -> Option<&LogEntry> {
+        for idx in start_idx..self.log_len_cached {
+            if let Some(entry) = self.log.get(&idx) {
+                if entry.dest.contains(gid) {
+                    return Some(entry);
+                }
+            }
+            // TODO: If not in cache, check persistence
+        }
+        None
+    }
+    
+    /// Clear all log entries (for testing/reset purposes)
+    #[allow(dead_code)]
+    fn clear_log(&mut self) {
+        self.log.clear();
+        self.log_len_cached = 0;
     }
 
     /// helper for getting the entry for pid in current_epoch_acks
@@ -253,7 +398,7 @@ impl GroupReplica {
             "pending: {} (max: {}) with local ts: {} (max: {})",
             pending.all, pending.all_max, pending.with_local_ts, pending.with_local_ts_max,
         );
-        timed_print!("log_len: {} safe_len: {}", self.log.len(), self.safe_len);
+        timed_print!("log_len: {} safe_len: {}", self.log_len(), self.safe_len);
         timed_print!(
             "clock: {} min_clock_leader: {:?} quorum_clock: {:?}",
             self.clock(),
@@ -271,6 +416,15 @@ impl GroupReplica {
                 Vec::from_iter(l.remote_info()),
             );
         }
+
+        let mut count = 0;
+        for _ in self.persistence.as_ref().list_log_entries().unwrap() {
+            count += 1;
+        }
+        timed_print!(
+            "persistence: {} entries in log",
+            count
+        );
         timed_print!("=================");
     }
 
@@ -292,6 +446,72 @@ impl GroupReplica {
 
     pub fn accepts_len(&self) -> usize {
         self.accepts.len()
+    }
+
+    pub fn log_len(&self) -> u64 {
+        self.log_epochs.last().unwrap().1
+    }
+    /// Append a batch of log entries during recovery.
+    /// Entries MUST be sorted by idx (ascending) and contiguous starting from self.log.len().
+    /// The replica must be in Recovering state.
+    pub fn recovery_append_batch(
+        &mut self,
+        entries: Vec<(u64, Epoch, LogEntry)>,
+    ) -> Result<(), Error> {
+        if self.state != ReplicaState::Recovering {
+            return Err(Error::InvalidReplicaState);
+        }
+
+        for (idx, entry_epoch, entry) in entries {
+            // Validate contiguity
+            let log_len = self.log_actual_len();
+            if idx != log_len {
+                return Err(Error::InvalidIndex { len: log_len });
+            }
+
+            // Use the existing append_inner which handles:
+            // - msgid index update
+            // - pending.add_entry_ts
+            // - log_epochs tracking
+            // - log.push
+            // - own ack update
+            self.append_inner(idx, entry_epoch, entry)?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the replica's current status for the recovery protocol.
+    pub fn recovery_status(&self) -> (Epoch, Epoch, u64, Clock, Vec<(Epoch, u64)>) {
+        let (log_epoch, log_len) = self.log_status();
+        (
+            self.promised_epoch,
+            log_epoch,
+            log_len,
+            self.clock.local(),
+            self.log_epochs.clone(),
+        )
+    }
+
+    /// Finalize recovery: transition from Recovering to Promised.
+    /// After this, the node can join the normal epoch flow.
+    pub fn finalize_recovery(&mut self, epoch: Epoch, clock: Clock) -> Result<(), Error> {
+        if self.state != ReplicaState::Recovering {
+            return Err(Error::InvalidReplicaState);
+        }
+
+        self.promised_epoch = epoch;
+        self.state = ReplicaState::Promised;
+        self.clock.advance_epoch(epoch);
+        self.clock.update(self.pid, epoch, clock);
+
+        // Reset ack tracking for the new epoch
+        let log_len = self.log.len() as u64;
+        for (len, pid) in self.current_epoch_acks.iter_mut() {
+            *len = if *pid == self.pid { log_len } else { 0 };
+        }
+
+        Ok(())
     }
 
     pub fn become_candidate(&mut self) {
@@ -399,17 +619,31 @@ impl GroupReplica {
 
             // truncate the log and remove invalid msgid mappings
             self.log_epochs.truncate(idx + 1);
-            let last_entry = self.log_epochs.last_mut().unwrap();
-            last_entry.1 = prefix_len;
-            while u64::try_from(self.log.len()).unwrap() > prefix_len {
-                let entry = self.log.pop().unwrap();
+            {
+                let last_entry = self.log_epochs.last_mut().unwrap();
+                last_entry.1 = prefix_len;
+            }
+            
+            // TODO: This needs to be abstracted when persistence is fully implemented
+            // Collect entries to remove first to avoid multiple mutable borrows
+            let mut entries_to_remove = Vec::new();
+            while self.log_len_cached > prefix_len {
+                if let Some(entry) = self.pop_log() {
+                    entries_to_remove.push(entry);
+                } else {
+                    break;
+                }
+            }
+            
+            // Process removed entries
+            for entry in entries_to_remove {
                 let id_low = (entry.msg_id & MSGID_LOW_MASK) as u16;
                 let id_set = self.msgid.get_mut(&id_low).expect("msgid should be present");
                 assert!(id_set.remove(&entry.msg_id), "msgid should be present");
                 self.pending.remove_entry_ts(entry.msg_id);
             }
 
-            assert!(*last_entry <= *log_epochs.last().unwrap());
+            assert!(self.log_epochs.last().unwrap() <= log_epochs.last().unwrap());
             Ok(self.log_status())
         } else {
             Err(Error::EpochTooOld {
@@ -439,7 +673,7 @@ impl GroupReplica {
             return Err(Error::NotPromised);
         }
 
-        timed_print!("start epoch append for {:?} with log len {} accept_len={}", entry_epoch, self.log.len(), self.accepts.len());
+        timed_print!("start epoch append for {:?} with log len {} accept_len={}", entry_epoch, self.log_actual_len(), self.accepts.len());
         self.leader_last_seen = Instant::now();
         self.append_inner(idx, entry_epoch, entry)
     }
@@ -541,8 +775,8 @@ impl GroupReplica {
     }
 
     /// Get the entry at a given log position.
-    pub fn log_entry(&self, idx: u64) -> Option<(Epoch, &LogEntry)> {
-        let e = self.log.get(usize::try_from(idx).expect("out of range log idx"))?;
+    pub fn log_entry(&self, idx: u64) -> Option<(Epoch, LogEntry)> {
+        let e = self.get_log(idx).expect("out of range log idx");
         // derive entry epoch from the log_epochs array
         let mut epoch = None;
         timed_print!("get log entry {:?} {:?}", idx, self.log_epochs);
@@ -554,10 +788,6 @@ impl GroupReplica {
             }
         }
         Some((epoch.unwrap(), e))
-    }
-
-    fn log_entry_mut(&mut self, idx: u64) -> Option<&mut LogEntry> {
-        self.log.get_mut(usize::try_from(idx).expect("out of range log idx"))
     }
 
     pub fn log_entry_for_remote(&self, idx: u64) -> Option<RemoteEntry> {
@@ -574,15 +804,18 @@ impl GroupReplica {
     /// Get the next log entry destined for to a given Gid, starting at idx.
     /// Needed by replicas from remote groups to fetch relevant log entries.
     pub fn next_log_entry_for_dest(&self, start_idx: u64, gid: Gid) -> Option<&LogEntry> {
-        let idx = usize::try_from(start_idx).expect("out of range log idx");
-        self.log[idx..].iter().find(|it| it.dest.contains(gid))
+        self.find_log_for_dest(start_idx, gid)
     }
 
     /// Helper method for properly appending to the log
     fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<u64, Error> {
-        timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
+        self.append_inner_internal(idx, entry_epoch, entry, false)
+    }
+
+    /// Helper method for properly appending to the log
+    fn append_inner_internal(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry, from_storage: bool) -> Result<u64, Error> {
+        // timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
         let (log_epoch, log_len) = self.log_status();
-        assert_eq!(log_len, self.log.len() as u64);
 
         if log_len != idx {
             return Err(Error::InvalidIndex { len: log_len });
@@ -600,8 +833,11 @@ impl GroupReplica {
                 s.insert(entry.msg_id);
             }
         }
-        self.pending
-            .add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts, self.log.len() as u64);
+
+        if !from_storage {
+            self.pending
+                .add_entry_ts(entry.msg_id, &entry.dest, entry.local_ts, self.log_len() as u64);
+        }
 
         // add to log_epochs
         if log_epoch == entry_epoch {
@@ -611,16 +847,28 @@ impl GroupReplica {
             self.log_epochs.push((entry_epoch, log_len + 1));
             // don't think the following ever does anything, but its safe to do.
             self.clock.advance_epoch(entry_epoch);
+            self.promised_epoch = entry_epoch;
+            self.persistence.put_metadata(&persistence::ReplicaMetadata { 
+                gid: self.gid, 
+                pid: self.pid,
+                promised_epoch: self.promised_epoch.clone(),
+                log_epochs: self.log_epochs.clone(),
+                safe_len: self.safe_len.clone(),
+                clock: self.clock.get(self.pid),
+            }).expect("failed to update metadata in persistence");
         }
 
         assert!(
-            self.log.last().is_none() || self.log.last().unwrap().local_ts < entry.local_ts,
+            self.last_log().is_none() || self.last_log().unwrap().local_ts < entry.local_ts,
             "log append out of ts order"
         );
-        self.log.push(entry);
+        self.persistence
+        .put_log_entry(entry_epoch, idx, &entry)
+        .expect("failed to append log entry to persistence");
+        self.push_log(idx, entry);
 
         // update own ack
-        let len = self.log.len() as u64;
+        let len = self.log_len() as u64;
         let ack = self.get_ack_mut(self.pid);
         *ack = std::cmp::max(*ack, len);
 
@@ -652,6 +900,28 @@ impl GroupReplica {
         let entry_ts = entry.local_ts;
         let res = self.append_inner(idx, epoch, entry)?;
         // assert!(entry_ts > self.min_clock_leader(), "info from leader out of ts order: entry_ts = {}, min_clock_leader = {}", entry_ts, self.min_clock_leader());
+        // append is an ack from leader
+        self.add_ack(epoch.owner(), epoch, idx + 1, entry_ts).unwrap();
+
+        self.clock.update(epoch.owner(), epoch, entry_ts);
+        Ok(res)
+    }
+
+        /// Append log entry from the leader. Returns the entry idx the log.
+    pub fn append_load_storage(&mut self, epoch: Epoch, idx: u64, entry: LogEntry) -> Result<u64, Error> {
+        let (log_epoch, _) = self.log_status();
+        if (self.promised_epoch > epoch || self.current_epoch() > epoch) && log_epoch > epoch {
+            timed_print!("FAIL TO APPEND: {:?} > {:?} or {:?} > {:?}", self.promised_epoch, epoch, self.current_epoch(), epoch);
+            return Err(Error::EpochTooOld {
+                promised: self.promised_epoch,
+                current: self.promised_epoch,
+            });
+        }
+
+        self.leader_last_seen = Instant::now();
+        let entry_ts = entry.local_ts;
+        let res = self.append_inner_internal(idx, epoch, entry, true)?;
+
         // append is an ack from leader
         self.add_ack(epoch.owner(), epoch, idx + 1, entry_ts).unwrap();
 
@@ -742,8 +1012,10 @@ impl GroupReplica {
         // update safe len
         self.current_epoch_acks.sort(); // sort by acked log len
         let safe_len_from_acks = self.current_epoch_acks[self.group_size - self.quorum_size].0;
-        let safe_len = std::cmp::min(std::cmp::max(self.safe_len, safe_len_from_acks), self.log.len() as u64);
-        for entry in &mut self.log[self.safe_len as usize..safe_len as usize] {
+        let safe_len = std::cmp::min(std::cmp::max(self.safe_len, safe_len_from_acks), self.log_len() as u64);
+        for idx in self.safe_len as usize..safe_len as usize {
+            let entry = self.get_log(idx as u64).unwrap();
+            // timed_print!("index: {}, to safe_len {}", idx, safe_len);
             self.pending
                 .add_group_ts(entry.msg_id, &entry.dest, self.gid, entry.local_ts);
         }
@@ -753,9 +1025,18 @@ impl GroupReplica {
         for (gid, l) in &mut self.remote_learners {
             l.update();
             while let Some((msg_id, dest, ts)) = l.next_delivery() {
+                timed_print!("msg_id: {}, to timestamp: {}", msg_id, ts);
                 self.pending.add_group_ts(msg_id, &dest, *gid, ts);
             }
         }
+        self.persistence.put_metadata(&persistence::ReplicaMetadata { 
+                gid: self.gid, 
+                pid: self.pid,
+                promised_epoch: self.promised_epoch.clone(),
+                log_epochs: self.log_epochs.clone(),
+                safe_len: self.safe_len.clone(),
+                clock: self.clock.get(self.pid),
+            }).expect("failed to update metadata in persistence");
     }
 
     /// Returns the list of messages with some decided remote timestamp but not proposed locally yet.
@@ -776,16 +1057,39 @@ impl GroupReplica {
     }
 
     /// Returns the next delivery (if any) in final timestamp order
-    pub fn next_delivery(&mut self) -> Option<&LogEntry> {
+    pub fn next_delivery(&mut self) -> Option<LogEntry> {
         let min_new_epoch_ts = self.min_new_epoch_ts();
         let min_clock_leader = self.min_clock_leader();
         let min_new_proposal = std::cmp::min(min_new_epoch_ts, Some(min_clock_leader + 1))?;
         let (final_ts, id, idx) = self.pending.pop_next_smallest(min_new_proposal)?;
-        let log_entry = self.log_entry_mut(idx).unwrap();
+        let mut log_entry = self.get_log(idx).unwrap();
         debug_assert_eq!(id, log_entry.msg_id);
         debug_assert!(log_entry.local_ts <= final_ts);
+        self.update_log_ts(idx, final_ts).unwrap();
         log_entry.final_ts = Some(final_ts);
         return Some(log_entry);
+    }
+}
+
+
+fn get_persistence(backend: &str, database: &str) -> Result<Box<dyn PersistenceLayer>, Error> {
+    match backend {
+        "lmdb" => {
+            LMDBPersistence::new(&database)
+                .map(|p| Box::new(p) as Box<dyn PersistenceLayer>)
+                .map_err(|_| Error::InvalidPersistence)
+        }
+        "rocksdb" => {
+            RocksDBPersistence::new(&database)
+                .map(|p| Box::new(p) as Box<dyn PersistenceLayer>)
+                .map_err(|_| Error::InvalidPersistence)
+        }
+        "sled" => {
+            SledPersistence::new(&database)
+                .map(|p| Box::new(p) as Box<dyn PersistenceLayer>)
+                .map_err(|_| Error::InvalidPersistence)
+        }
+        _ => Err(Error::InvalidPersistence),
     }
 }
 
@@ -976,4 +1280,109 @@ mod tests {
             assert!(r.next_delivery().is_none());
         }
     }
-}
+
+    #[test]
+    fn recovery_append_batch_basic() {
+        let config = Config::new_for_test();
+
+        // Create source log entries to be recovered
+        let mut source_entries = Vec::new();
+        source_entries.push(LogEntry {
+            local_ts: 1,
+            msg_id: 1,
+            msg: "a".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+        source_entries.push(LogEntry {
+            local_ts: 2,
+            msg_id: 2,
+            msg: "b".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+        source_entries.push(LogEntry {
+            local_ts: 3,
+            msg_id: 3,
+            msg: "c".into(),
+            dest: {
+                let mut s = GidSet::new();
+                s.insert(Gid(0));
+                s
+            },
+            final_ts: None,
+        });
+
+        // Create entries to pass to recovery_append_batch
+        let entries = vec![
+            (0u64, Epoch::initial(), source_entries[0].clone()),
+            (1u64, Epoch::initial(), source_entries[1].clone()),
+            (2u64, Epoch::initial(), source_entries[2].clone()),
+        ];
+
+        // Create a fresh replica
+        let mut replica = GroupReplica::new(Gid(0), Pid(1), Epoch::initial(), config.clone(), false);
+        // Must be in Recovering state to use recovery_append_batch
+        replica.state = ReplicaState::Recovering;
+
+        // Apply batch of entries
+        assert!(replica.recovery_append_batch(entries).is_ok());
+        assert_eq!(replica.log.len(), 3);
+
+        // Verify entries were applied
+        assert_eq!(replica.log_entry(0).unwrap().1.msg_id, 1);
+        assert_eq!(replica.log_entry(1).unwrap().1.msg_id, 2);
+        assert_eq!(replica.log_entry(2).unwrap().1.msg_id, 3);
+    }
+
+    #[test]
+    fn recovery_status_and_finalize() {
+        let config = Config::new_for_test();
+
+        // Create replica in Recovering state
+        let mut replica = GroupReplica::new(Gid(0), Pid(0), Epoch::initial(), config.clone(), false);
+        replica.state = ReplicaState::Recovering;
+
+        // Check recovery status - returns (promised_epoch, log_epoch, log_len, clock, log_epochs)
+        let (promised_epoch, log_epoch, log_len, _clock, log_epochs) = replica.recovery_status();
+        assert_eq!(promised_epoch, Epoch::initial());
+        assert_eq!(log_epoch, Epoch::initial());
+        assert_eq!(log_len, 0);
+        assert_eq!(log_epochs.len(), 1); // At least the initial epoch
+
+        // Create log entries manually
+        let mut dest = GidSet::new();
+        dest.insert(Gid(0));
+        
+        replica.log.push(LogEntry {
+            local_ts: 1,
+            msg_id: 1,
+            msg: "x".into(),
+            dest: dest.clone(),
+            final_ts: None,
+        });
+        replica.log.push(LogEntry {
+            local_ts: 2,
+            msg_id: 2,
+            msg: "y".into(),
+            dest: dest.clone(),
+            final_ts: None,
+        });
+
+        // Finalize recovery with an epoch and clock
+        let new_epoch = Epoch(1, Pid(0));
+        let new_clock = 5;
+        assert!(replica.finalize_recovery(new_epoch, new_clock).is_ok());
+        assert_eq!(replica.state, ReplicaState::Promised);
+
+        // After finalization, log should be preserved
+        assert_eq!(replica.log.len(), 2);
+    }}

@@ -5,20 +5,20 @@ persistence_backend: "lmdb"
 groups:
   - gid: 0
     quorum: 2
-    zookeeper_url: 127.0.0.1:2181
+    zookeeper_url: 192.168.2.19:2181
     peers:
       - pid: 0
-        ip: 127.0.0.1
+        ip: 192.168.2.18
         port: 10000
         client_port: 20000
         persistence_database: "db/primcast.00"
       - pid: 1
-        ip: 127.0.0.1
+        ip: 192.168.2.17
         port: 10001
         client_port: 20001
         persistence_database: "db/primcast.01"
       - pid: 2
-        ip: 127.0.0.1
+        ip: 192.168.2.19
         port: 10002
         client_port: 20002
         persistence_database: "db/primcast.02"

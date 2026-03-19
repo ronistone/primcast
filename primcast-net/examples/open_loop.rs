@@ -171,7 +171,7 @@ fn main() {
     };
 
     rt.block_on(async {
-        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, args.hybrid, args.debug).await;
+        let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg, args.hybrid, args.debug, None).await;
         let mut delivery_rx = handle.take_delivery_rx().unwrap();
 
         let hist = Arc::new(Mutex::new(Histogram::<u64>::new(3).unwrap()));
@@ -225,13 +225,13 @@ fn main() {
             if (gid, pid) == payload.sender {
                 let now = Instant::now() - start;
                 let lat: Duration;
-                // if now < payload.amcast_at {
+                if now < payload.amcast_at {
 
-                //     lat = Duration::from_micros(0);
-                // } else {
-                //     lat = now - payload.amcast_at;
+                    lat = Duration::from_micros(0);
+                } else {
                     lat = now - payload.amcast_at;
-                // }
+                    // lat = now - payload.amcast_at;
+                }
                 let lat_usec = u64::try_from(lat.as_micros()).unwrap();
                 eprintln!("{ts} {id} {dest:?} DELIVERED in {lat_usec} us");
                 hist.lock().await.record(lat_usec).unwrap();

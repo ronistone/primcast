@@ -1,0 +1,23 @@
+# ZooKeeper single-node configuration for each server
+# Each server runs ONE ZooKeeper instance that connects to peers on other machines
+version: '3.8'
+
+services:
+  zookeeper:
+    image: zookeeper:3.9
+    container_name: zookeeper
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ZOO_MY_ID: ${ZOO_MY_ID}
+      ZOO_SERVERS: server.1=192.168.2.18:2888:3888;2181 server.2=192.168.2.17:2888:3888;2181 server.3=192.168.2.19:2888:3888;2181
+      ZOO_TICK_TIME: 2000
+      ZOO_INIT_LIMIT: 5
+      ZOO_SYNC_LIMIT: 2
+    volumes:
+      - zookeeper_data:/data
+      - zookeeper_datalog:/datalog
+
+volumes:
+  zookeeper_data:
+  zookeeper_datalog:

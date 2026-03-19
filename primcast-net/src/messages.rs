@@ -70,6 +70,48 @@ pub enum Message {
         log_epoch: Epoch,
     },
     RemoteLogAppend(RemoteEntry),
+
+    // Recovery protocol messages
+    RecoveryRequest {
+        gid: Gid,
+        pid: Pid,
+        promised_epoch: Epoch,
+        log_epoch: Epoch,
+        log_len: u64,
+        log_epochs: Vec<(Epoch, u64)>,
+    },
+
+    RecoveryResponse {
+        current_epoch: Epoch,
+        leader_pid: Pid,
+        total_log_len: u64,
+        log_epochs: Vec<(Epoch, u64)>,
+    },
+
+    RecoveryRangeAssign {
+        from_idx: u64,
+        to_idx: u64,
+    },
+
+    RecoveryLogChunk {
+        entries: Vec<(u64, Epoch, LogEntry)>,
+        is_last: bool,
+    },
+
+    RecoveryComplete,
+
+    // Leader instructs follower to fetch a log range from peers (collaborative catch-up)
+    CollaborativeRecoveryStart {
+        from_idx: u64,
+        to_idx: u64,
+    },
+
+    // Follower requests a specific log range from a peer
+    LogRangeRequest {
+        gid: Gid,
+        from_idx: u64,
+        to_idx: u64,
+    },
 }
 
 // #[derive(Debug, Serialize, Deserialize)]

@@ -33,6 +33,7 @@ pub mod conn;
 mod messages;
 pub mod util;
 pub mod leader_election;
+pub mod recovery;
 
 use conn::Conn;
 use messages::Message;
@@ -46,7 +47,7 @@ use crate::leader_election::LeaderElection;
 const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const PROPOSAL_QUEUE: usize = 100_000;
 const DELIVERY_QUEUE: usize = 100_000;
-const BATCH_SIZE_YIELD: usize = 50;
+const BATCH_SIZE_YIELD: usize = 1;
 
 #[derive(Debug)]
 pub enum Error {
@@ -148,17 +149,20 @@ impl PrimcastHandle {
 }
 
 impl PrimcastReplica {
-    pub async fn start(gid: Gid, pid: Pid, cfg: config::Config, hybrid_clock: bool, debug: Option<u64>) -> PrimcastHandle {
-        let mut leader_election = LeaderElection::new(gid, pid, cfg.clone());
-        let (ev_tx, mut election_rcv) = mpsc::unbounded_channel();
-        leader_election.subscribe(ev_tx);
-        tokio::spawn(leader_election.run());
-
+    pub async fn start(
+        gid: Gid,
+        pid: Pid,
+        cfg: config::Config,
+        hybrid_clock: bool,
+        debug: Option<u64>,
+        _persisted: Option<primcast_core::PersistedState>,
+    ) -> PrimcastHandle {
         let actual_epoch = Epoch(0, Pid(u32::MAX));
 
         let core = GroupReplica::new(gid, pid, actual_epoch, cfg.clone(), hybrid_clock);
         let (log_epoch, log_len) = core.log_status();
         let clock = core.clock();
+        eprintln!("Replica {:?}:{:?} log status: epoch={}, len={}, clock={}", gid, pid, log_epoch, log_len, clock);
 
         let mut ack_tx = HashMap::default();
         let mut ack_rx = HashMap::default();
@@ -192,6 +196,15 @@ impl PrimcastReplica {
             shared: Arc::new(RwLock::new(shared)),
             ev_rx,            
         };
+
+        // No separate recovery phase. Catch-up from persisted state happens via the normal
+        // leader sync process (sync_with/sync_follower) after leader election.
+
+        // NOW start leader election immediately
+        let mut leader_election = LeaderElection::new(gid, pid, cfg.clone());
+        let (le_ev_tx, mut election_rcv) = mpsc::unbounded_channel();
+        leader_election.subscribe(le_ev_tx);
+        tokio::spawn(leader_election.run());
 
         let leader_election_shared = s.shared.clone();
         tokio::spawn(async move {
@@ -327,6 +340,12 @@ impl PrimcastReplica {
                             }
                             ReplicaState::Primary => {
                                 fut = Box::pin(run_primary(e, self.shared.clone()));
+                            }
+                            ReplicaState::Recovering => {
+                                // Should not happen — nodes always start as Promised and recovery
+                                // happens via the leader sync process, not a separate pre-startup phase
+                                eprintln!("WARNING: Unexpected Recovering state in main loop");
+                                fut = Box::pin(run_idle(self.shared.clone()));
                             }
                         }
                     },
@@ -592,6 +611,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
         self_gid = s.core.gid;
     }
 
+    let s_arc = s.clone(); // Keep a reference to the Arc for collaborative recovery
     let (mut conn_tx, mut conn_rx) = conn.split();
 
     // send ack back to primary
@@ -700,6 +720,32 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                             entry_epoch: epoch,
                             entry: entry.clone(),
                         }).unwrap();
+                    }
+                    Ok(Message::CollaborativeRecoveryStart { from_idx, to_idx }) => {
+                        timed_print!("collaborative recovery: fetching entries [{}, {})", from_idx, to_idx);
+                        // Release write lock before doing async I/O
+                        let (epoch, len) = s.core.log_status();
+                        let clock = s.core.clock();
+                        for gid in ack_dests.0.drain(..) {
+                            s.ack_tx[&gid].send((epoch, len, clock))?;
+                        }
+                        s.update_tx.send(())?;
+                        drop(s);
+
+                        // Run collaborative recovery - fetch from all peers in the group
+                        recovery::run_follower_collaborative_recovery(
+                            from_idx, to_idx, e, &cfg, self_gid, self_pid,
+                            &s_arc,
+                        ).await?;
+
+                        // Send ack with updated log status
+                        {
+                            let shared = s_arc.read().await;
+                            let (log_epoch, log_len) = shared.core.log_status();
+                            let clock = shared.core.clock();
+                            leader_tx.send(Message::Ack { log_epoch, log_len, clock }).unwrap();
+                        }
+                        continue 'recv;
                     }
                     Ok(Message::StartEpochAccept {
                         epoch,
@@ -860,6 +906,61 @@ async fn handle_connection(
             }
         }
 
+        Message::RecoveryRequest {
+            gid: req_gid,
+            pid: req_pid,
+            promised_epoch: _,
+            log_epoch: _,
+            log_len: _req_log_len,
+            log_epochs: _req_log_epochs,
+        } => {
+            // Respond with our status
+            let (current_epoch, total_log_len, our_log_epochs, leader_pid) = {
+                let shared = s.read().await;
+                let (_log_epoch, log_len) = shared.core.log_status();
+                let (epoch, _state) = shared.core.state();
+                let log_epochs = shared.core.log_epochs().clone();
+                (epoch, log_len, log_epochs, epoch.owner())
+            };
+
+            timed_print!("recovery: received request from {:?}:{:?}, our log_len = {}", req_gid, req_pid, total_log_len);
+
+            conn.send(Message::RecoveryResponse {
+                current_epoch,
+                leader_pid,
+                total_log_len,
+                log_epochs: our_log_epochs,
+            })
+            .await?;
+
+            // Wait for range assignment with timeout to avoid hanging
+            let timeout_duration = Duration::from_secs(10);
+            match tokio::time::timeout(timeout_duration, conn.recv()).await {
+                Ok(Ok(Message::RecoveryRangeAssign { from_idx, to_idx })) => {
+                    timed_print!("recovery: sending range [{}, {}) to {:?}:{:?}", from_idx, to_idx, req_gid, req_pid);
+                    recovery_send_range(conn, from_idx, to_idx, s.clone()).await?;
+                }
+                Ok(Ok(m)) => {
+                    eprintln!("unexpected message after RecoveryResponse: {:?}", m);
+                    // Connection will close naturally
+                }
+                Ok(Err(e)) => {
+                    eprintln!("error receiving RecoveryRangeAssign: {:?}", e);
+                    // Connection will close naturally
+                }
+                Err(_) => {
+                    eprintln!("timeout waiting for RecoveryRangeAssign from {:?}:{:?}", req_gid, req_pid);
+                    // Gracefully close connection instead of panicking
+                    return Ok(());
+                }
+            }
+        }
+
+        Message::LogRangeRequest { gid: _req_gid, from_idx, to_idx } => {
+            timed_print!("log range request [{}, {}) from {:?}:{:?}", from_idx, to_idx, conn.gid(), conn.pid());
+            recovery_send_range(conn, from_idx, to_idx, s.clone()).await?;
+        }
+
         m => panic!("unexpected message: {:?}", m),
     }
     Ok(())
@@ -907,6 +1008,7 @@ async fn deliver_task(
     let mut update_rx = s.read().await.update_rx.clone();
     let mut deliveries = vec![];
     let mut last_delivery = (0, 0);
+    // sleep(Duration::from_millis(15000)).await; // wait for initial state
     loop {
         update_rx.changed().await?;
         let mut s = s.write().await;
@@ -975,11 +1077,12 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
     let mut ack_rx = s.read().await.ack_rx[&self_gid].clone();
     let mut to_send = vec![];
     let mut last_clock_sent = 0;
+    let s_arc = s.clone(); // Keep original Arc for later write access
     loop {
         let mut ack_dests = GidSet::new();
         {
-            let s = s.read().await;
-            let (log_epoch, log_len) = s.core.log_status();
+            let s_guard = s.read().await;
+            let (log_epoch, log_len) = s_guard.core.log_status();
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
             timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
             if follower_log_len == log_len {
@@ -990,7 +1093,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
             
             while follower_log_len > log_len { // TODO infinite loop need to be fixed
                 // timed_print!("follower log is higher than primary log, sync with it");
-                // let (epoch, entry) = s.core.log_entry(log_len).unwrap();
+                // let (epoch, entry) = s_guard.core.log_entry(log_len).unwrap();
                 // to_send.push(LogAppendRequest {
                 //     idx: log_len,
                 //     entry_epoch: epoch,
@@ -1000,12 +1103,14 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
                 panic!("follower log is higher than primary log, and the code is broken yet");
             }
 
+            // For small gaps, gather entries to send directly
+            // (no collaborative recovery during candidate sync)
 
             while follower_log_len < log_len {
-                let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
+                let (epoch, entry) = s_guard.core.log_entry(follower_log_len).unwrap();
                 // if follower_log_epoch < epoch && epoch == e {
                 //     // follower synced up to primary epoch e
-                //     let clock = s.core.clock();
+                //     let clock = s_guard.core.clock();
                 //     to_send.push(StartEpochAccept {
                 //         epoch,
                 //         prev_entry: (follower_log_epoch, follower_log_len),
@@ -1030,8 +1135,8 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
             // with smaller clock value.
             if follower_log_len == log_len {
 
-                if s.core.clock() >= last_clock_sent {
-                    last_clock_sent = s.core.clock();
+                if s_guard.core.clock() >= last_clock_sent {
+                    last_clock_sent = s_guard.core.clock();
                     to_send.push(Ack {
                         log_epoch,
                         log_len,
@@ -1089,13 +1194,13 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
                         }
                         Ack { log_epoch, log_len, clock } => {
                             timed_print!("ack from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), log_epoch);
-                            let mut s = s.write().await;
-                            let old_clock = s.core.clock();
-                            s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
+                            let mut s_write = s_arc.write().await;
+                            let old_clock = s_write.core.clock();
+                            s_write.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
                             if clock > old_clock {
-                                s.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = s.core.clock());
+                                s_write.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = s_write.core.clock());
                             }
-                            s.update_tx.send(())?;
+                            s_write.update_tx.send(())?;
                         }
                         LogAppend {
                             idx,
@@ -1105,8 +1210,8 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
                             timed_print!("log append from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), entry_epoch);
                             {
                                 ack_dests.merge(&entry.dest);
-                                let mut s = s.write().await;
-                                s.core.append(e, idx, entry)?;
+                                let mut s_write = s_arc.write().await;
+                                s_write.core.append(e, idx, entry)?;
                             }
                         }
                         m => panic!("unexpected message: {:?}", m),
@@ -1115,26 +1220,26 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
             }
         }
         {
-            let s = s.write().await;
-            let (epoch, len) = s.core.log_status();
-            let clock = s.core.clock();
+            let s_final = s_arc.write().await;
+            let (epoch, len) = s_final.core.log_status();
+            let clock = s_final.core.clock();
             for gid in ack_dests.0.drain(..) {
-                s.ack_tx[&gid].send((epoch, len, clock))?;
+                s_final.ack_tx[&gid].send((epoch, len, clock))?;
             }
-            s.update_tx.send(())?;
+            s_final.update_tx.send(())?;
         }
     }
 
     let promised_epoch;
     let clock;
     {
-        let s = s.read().await;
-        (promised_epoch, _) = s.core.state();
+        let s_read = s_arc.read().await;
+        (promised_epoch, _) = s_read.core.state();
         if promised_epoch != e {
             timed_print!("The promised epoch is different from the current epoch second");
             return Ok(()); // replica accepted higher epoch
         }
-        clock = s.core.clock();
+        clock = s_read.core.clock();
     }
 
     conn.feed(StartEpochAccept {
@@ -1229,6 +1334,45 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                 timed_print!("follower changed epoch to {:?} != {:?} or log epoch to {:?} != {:?}", promised_epoch, e, log_epoch, sync_log_epoch);
                 return Ok(());
             }
+            
+            // Check for large gap and trigger collaborative recovery
+            let gap = log_len - follower_log_len;
+            if gap > BATCH_SIZE_YIELD as u64 * 10 {
+                timed_print!("large gap ({}) for follower {:?}:{:?}, triggering collaborative recovery", 
+                    gap, conn.gid(), conn.pid());
+                drop(s); // release read lock before sending
+
+                conn.send(Message::CollaborativeRecoveryStart {
+                    from_idx: follower_log_len,
+                    to_idx: log_len,
+                }).await?;
+
+                // Wait for follower to complete collaborative recovery
+                loop {
+                    match conn.recv().await? {
+                        Message::Ack { log_epoch: _, log_len: ack_ll, clock: _ } => {
+                            timed_print!("follower completed collaborative recovery, log_len = {}", ack_ll);
+                            follower_log_len = ack_ll;
+                            break;
+                        }
+                        Message::NewEpoch { epoch } => {
+                            if epoch > sync_log_epoch {
+                                timed_print!("follower changed to new epoch {:?}", epoch);
+                                return Ok(());
+                            }
+                        }
+                        m => {
+                            timed_print!("unexpected message during collaborative recovery wait: {:?}", m);
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("unexpected message: {:?}", m),
+                            )));
+                        }
+                    }
+                }
+                continue; // Re-check gap
+            }
+            
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
             while follower_log_len < log_len {
                 let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
@@ -1303,6 +1447,12 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                         }
                         Ack { log_epoch, log_len, clock } => {
                             timed_print!("ack from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), log_epoch);
+                            // Check if this is from collaborative recovery (log_len changed significantly)
+                            if log_len > follower_log_len {
+                                timed_print!("follower updated to log_len = {} from collaborative recovery", log_len);
+                                follower_log_len = log_len;
+                                break 'wait; // break wait loop and re-check gap
+                            }
                             let mut s = s.write().await;
                             let old_clock = s.core.clock();
                             s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
@@ -1469,6 +1619,56 @@ async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>, send_bump: bool) -> Re
         }
         ack_rx.changed().await?;
     }
+}
+
+/// Send a range of log entries to a recovering peer during collaborative recovery.
+async fn recovery_send_range(
+    mut conn: Conn,
+    from_idx: u64,
+    to_idx: u64,
+    s: Arc<RwLock<Shared>>,
+) -> Result<(), Error> {
+    use Message::*;
+
+    let batch_size = BATCH_SIZE_YIELD;
+    let mut idx = from_idx;
+
+    timed_print!("recovery_send_range: sending entries [{}, {}) to {:?}:{:?}", from_idx, to_idx, conn.gid(), conn.pid());
+
+    while idx < to_idx {
+        let mut entries = Vec::new();
+        {
+            let shared = s.read().await;
+            let batch_end = std::cmp::min(idx + batch_size as u64, to_idx);
+            while idx < batch_end {
+                match shared.core.log_entry(idx) {
+                    Some((epoch, entry)) => {
+                        entries.push((idx, epoch, entry.clone()));
+                        idx += 1;
+                    }
+                    None => {
+                        // Our log doesn't extend this far
+                        break;
+                    }
+                }
+            }
+        }
+
+        let is_last = idx >= to_idx || entries.is_empty();
+        conn.send(RecoveryLogChunk {
+            entries,
+            is_last,
+        })
+        .await?;
+
+        if is_last {
+            break;
+        }
+
+        tokio::task::yield_now().await;
+    }
+
+    Ok(())
 }
 
 /// Send relevant log entries to a replica in another group.
