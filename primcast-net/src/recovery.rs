@@ -88,9 +88,9 @@ pub async fn run_recovery(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     }
 
     // Check if gap is small enough to skip collaborative recovery
-    let gap = {
+    let _gap = {
         let shared = s.read().await;
-        let (_, log_len) = shared.core.log_status();
+        let (_, _log_len) = shared.core.log_status();
         // For simplicity, we always run recovery. In production, add threshold: if gap < 1000 { return }
         0
     };
@@ -294,3 +294,143 @@ pub async fn run_recovery(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Run collaborative recovery as a follower during the leader sync process.
+/// The leader has told us to fetch entries [from_idx, to_idx) from peers.
+/// We contact all peers in the group, split the range, fetch in parallel, and apply.
+pub async fn run_follower_collaborative_recovery(
+    from_idx: u64,
+    to_idx: u64,
+    epoch: Epoch,
+    cfg: &Config,
+    self_gid: Gid,
+    self_pid: Pid,
+    s: &Arc<RwLock<Shared>>,
+) -> Result<(), Error> {
+    let group = cfg.group(self_gid).ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "group not found",
+        ))
+    })?;
+
+    let peers: Vec<&PeerConfig> = group
+        .peers
+        .iter()
+        .filter(|p| p.pid != self_pid)
+        .collect();
+
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    let gap = to_idx - from_idx;
+    eprintln!("[CollabRecovery] Fetching entries [{}, {}) from {} peers", from_idx, to_idx, peers.len());
+
+    // Split range among peers
+    let num_peers = peers.len();
+    let chunk_size = (gap + num_peers as u64 - 1) / num_peers as u64;
+
+    let mut chunk_futs = FuturesUnordered::new();
+
+    for (i, peer) in peers.iter().enumerate() {
+        let peer_from = from_idx + (i as u64) * chunk_size;
+        let peer_to = std::cmp::min(from_idx + ((i as u64) + 1) * chunk_size, to_idx);
+
+        if peer_from >= peer_to {
+            continue;
+        }
+
+        let peer = (*peer).clone();
+        let self_gid = self_gid;
+        let self_pid = self_pid;
+
+        eprintln!("[CollabRecovery] Assigning peer {:?} range [{}, {})", peer.pid, peer_from, peer_to);
+
+        chunk_futs.push(async move {
+            let req = Message::LogRangeRequest {
+                gid: self_gid,
+                from_idx: peer_from,
+                to_idx: peer_to,
+            };
+            let mut conn = Conn::request(
+                (self_gid, self_pid),
+                (self_gid, peer.pid),
+                peer.addr(),
+                req,
+            )
+            .await?;
+
+            // Receive chunks (reusing RecoveryLogChunk protocol)
+            let mut entries: Vec<(u64, Epoch, LogEntry)> = Vec::new();
+            loop {
+                match conn.recv().await? {
+                    Message::RecoveryLogChunk {
+                        entries: chunk_entries,
+                        is_last,
+                    } => {
+                        entries.extend(chunk_entries);
+                        if is_last {
+                            break;
+                        }
+                    }
+                    m => {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unexpected message during collaborative recovery: {:?}", m),
+                        )))
+                    }
+                }
+            }
+            Ok::<_, Error>((peer.pid, entries))
+        });
+    }
+
+    // Collect all chunks
+    let mut all_entries: Vec<(u64, Epoch, LogEntry)> = Vec::new();
+
+    while let Some(result) = chunk_futs.next().await {
+        match result {
+            Ok((_pid, entries)) => {
+                all_entries.extend(entries);
+            }
+            Err(e) => {
+                eprintln!("[CollabRecovery] error receiving chunk: {:?}", e);
+                return Err(e);
+            }
+        }
+    }
+
+    // Sort by idx for correct application order
+    all_entries.sort_by_key(|(idx, _, _)| *idx);
+
+    // Validate contiguity
+    for (i, (idx, _, _)) in all_entries.iter().enumerate() {
+        let expected = from_idx + i as u64;
+        if *idx != expected {
+            return Err(Error::Core(primcast_core::Error::InvalidIndex {
+                len: expected,
+            }));
+        }
+    }
+
+    eprintln!("[CollabRecovery] Applying {} entries", all_entries.len());
+
+    // Apply entries using start_epoch_append / append (same as run_follower does for LogAppend)
+    {
+        let mut shared = s.write().await;
+        for (idx, entry_epoch, entry) in all_entries {
+            let (actual_epoch, _) = shared.core.log_status();
+            if entry_epoch > actual_epoch {
+                shared.core.start_epoch_append(epoch, idx, entry_epoch, entry)?;
+            } else {
+                shared.core.append(entry_epoch, idx, entry)?;
+            }
+        }
+        shared.update_tx.send(()).ok();
+    }
+
+    eprintln!("[CollabRecovery] Done");
+    Ok(())
+}
+

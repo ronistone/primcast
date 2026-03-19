@@ -99,6 +99,19 @@ pub enum Message {
     },
 
     RecoveryComplete,
+
+    // Leader instructs follower to fetch a log range from peers (collaborative catch-up)
+    CollaborativeRecoveryStart {
+        from_idx: u64,
+        to_idx: u64,
+    },
+
+    // Follower requests a specific log range from a peer
+    LogRangeRequest {
+        gid: Gid,
+        from_idx: u64,
+        to_idx: u64,
+    },
 }
 
 // #[derive(Debug, Serialize, Deserialize)]

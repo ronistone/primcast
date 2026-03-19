@@ -189,7 +189,6 @@ impl GroupReplica {
         // } else {
         //     ReplicaState::Follower
         // };
-        let state = ReplicaState::Recovering;
 
         let remote_learners = config
             .groups
@@ -226,6 +225,11 @@ impl GroupReplica {
         let metadate_persisted = persistence.get_metadata().unwrap();
         timed_print!("Loaded {} log entries from persistence", log_persisted.len());
         timed_print!("Loaded metadata from persistence: {:?}", metadate_persisted);
+        
+        // Always start in Promised state. Recovery (catch-up) happens via the normal
+        // leader sync process (sync_with/sync_follower), not as a separate pre-startup phase.
+        let state = ReplicaState::Promised;
+        
         let (promised_epoch, log_epochs, safe_len, _) = if let Some(m) = metadate_persisted {
             (m.promised_epoch, m.log_epochs, m.safe_len, m.clock)
             // (promised_epoch, vec![(epoch, 0)], 0, 0)
@@ -460,7 +464,7 @@ impl GroupReplica {
 
         for (idx, entry_epoch, entry) in entries {
             // Validate contiguity
-            let log_len = self.log.len() as u64;
+            let log_len = self.log_actual_len();
             if idx != log_len {
                 return Err(Error::InvalidIndex { len: log_len });
             }
