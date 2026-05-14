@@ -47,7 +47,7 @@ use crate::leader_election::LeaderElection;
 const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const PROPOSAL_QUEUE: usize = 100_000;
 const DELIVERY_QUEUE: usize = 100_000;
-const BATCH_SIZE_YIELD: usize = 1;
+const BATCH_SIZE_YIELD: usize = 1_000;
 
 #[derive(Debug)]
 pub enum Error {
@@ -320,6 +320,9 @@ impl PrimcastReplica {
         let mut shutdown = self.shared.read().await.shutdown.clone();
         timed_print!("starting main loop...");
         let mut proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
+        // Proposals that failed add_proposal with NotLeader (leadership changed mid-flight).
+        // Re-injected into rr_proposals_rx when this replica next becomes Primary.
+        let mut overflow_proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
         let mut rr_proposals_rx = RoundRobinStreams::new();
         rr_proposals_rx.push(ReceiverStream::new(proposal_rx));
         'main: loop {
@@ -339,6 +342,26 @@ impl PrimcastReplica {
                                 fut = Box::pin(run_candidate(e, self.shared.clone()));
                             }
                             ReplicaState::Primary => {
+                                // Commit any proposals that accumulated in core.proposals
+                                // during Candidate state (add_proposal succeeded but
+                                // propose() couldn't run because state wasn't Primary yet).
+                                {
+                                    let mut s = self.shared.write().await;
+                                    if let Err(err) = s.core.propose() {
+                                        timed_print!("error flushing queued proposals on primary transition: {err:?}");
+                                    }
+                                }
+                                // Re-inject proposals that previously failed add_proposal
+                                // with NotLeader so they are retried under the new epoch.
+                                if !overflow_proposals.is_empty() {
+                                    let capacity = overflow_proposals.len();
+                                    let (tx, rx) = mpsc::channel(capacity);
+                                    for p in overflow_proposals.drain(..) {
+                                        // capacity == len, so try_send never fails here
+                                        let _ = tx.try_send(p);
+                                    }
+                                    rr_proposals_rx.push(ReceiverStream::new(rx));
+                                }
                                 fut = Box::pin(run_primary(e, self.shared.clone()));
                             }
                             ReplicaState::Recovering => {
@@ -381,8 +404,22 @@ impl PrimcastReplica {
                         let mut s = self.shared.write().await;
                         for (msg_id, msg, dest) in proposals.drain(..) {
                             ack_dests.merge(&dest);
+                            // Clone msg/dest before moving into add_proposal so we can
+                            // preserve them in overflow_proposals on NotLeader failure.
+                            let msg_copy = msg.clone();
+                            let dest_copy = dest.clone();
                             match s.core.add_proposal(msg_id, msg, dest) {
                                 Ok(_) => (),
+                                Err(primcast_core::Error::NotLeader { .. }) => {
+                                    // Leadership changed while proposal was in flight.
+                                    // Save it so it can be re-injected when this replica
+                                    // (or another) next becomes Primary.
+                                    timed_print!("proposal {msg_id} rejected (not leader), buffering for retry");
+                                    overflow_proposals.push((msg_id, msg_copy, dest_copy));
+                                }
+                                Err(primcast_core::Error::IdAlreadyUsed) => {
+                                    // Already committed by a previous leader; delivery will arrive.
+                                }
                                 Err(err) => {
                                     timed_print!("error queuing proposal {msg_id}: {err:?}");
                                 },
@@ -1736,6 +1773,10 @@ async fn proposal_sender(
 ) -> Result<(), Error> {
     let peers = cfg.peers(to_gid).unwrap();
     let mut rx = ReceiverStream::new(rx);
+    // Proposals consumed from `rx` but not yet confirmed received by the leader.
+    // Preserved across reconnects so they are retried with the new leader.
+    let mut pending: Vec<(MsgId, Bytes, GidSet)> = vec![];
+    let mut proposals = vec![];
     'connect: loop {
         // TODO: better remote leader selection?
         // connect to everyone and see who is the leader
@@ -1769,12 +1810,15 @@ async fn proposal_sender(
         if (conn.gid(), conn.pid()) == from {
             timed_print!("forwarding proposals to itself");
             let tx = s.read().await.proposal_tx.clone();
-            let mut proposals = vec![];
             loop {
                 let (_, state) = s.read().await.core.state();
                 if state != ReplicaState::Primary && state != ReplicaState::Candidate {
                     // not group leader anymore, try connect to leader
                     continue 'connect;
+                }
+                // Re-send any proposals that were pending from a previous remote-leader connection
+                for (msg_id, msg, dest) in pending.drain(..) {
+                    tx.send((msg_id, msg, dest)).await?;
                 }
                 if 0 == rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals).await {
                     // input channel closed
@@ -1790,22 +1834,37 @@ async fn proposal_sender(
         // send it to the leader of the given group
         timed_print!("forwarding proposals to {:?}:{:?}", conn.gid(), conn.pid());
 
-        let mut proposals = vec![];
         loop {
-            if 0 == rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals).await {
-                // input channel closed
-                return Ok(());
+            // If no pending proposals, read a new batch from the channel.
+            if pending.is_empty() {
+                if 0 == rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals).await {
+                    // input channel closed
+                    return Ok(());
+                }
+                pending.append(&mut proposals);
             }
-            for (msg_id, msg, dest) in proposals.drain(..) {
-                if let Err(err) = conn.feed(Message::Proposal { msg_id, msg, dest }).await {
+
+            // Try to feed all pending proposals into the connection.
+            // Iterate by reference so pending is preserved on error.
+            let mut feed_err = false;
+            for (msg_id, msg, dest) in &pending {
+                if let Err(err) = conn.feed(Message::Proposal { msg_id: *msg_id, msg: msg.clone(), dest: dest.clone() }).await {
                     timed_print!("error forwarding proposals to {to_gid:?}: {err:?}");
+                    feed_err = true;
                     break;
                 }
             }
-            if let Err(err) = conn.flush().await {
-                timed_print!("error forwarding proposals to {to_gid:?}: {err:?}");
+            if feed_err {
+                // pending is preserved; reconnect and retry with the new leader
                 break;
             }
+            if let Err(err) = conn.flush().await {
+                timed_print!("error forwarding proposals to {to_gid:?}: {err:?}");
+                // pending is preserved; reconnect and retry with the new leader
+                break;
+            }
+            // All proposals in pending were successfully written to the TCP stream.
+            pending.clear();
             tokio::task::yield_now().await;
         }
     }

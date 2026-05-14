@@ -264,6 +264,18 @@ impl GroupReplica {
             persistence,
         };
 
+        // Reset log_epochs and log_len_cached to safe_len so the loading loop
+        // can re-append unsafe entries (idx >= safe_len) via the normal append path.
+        // Metadata stores the full persisted count; we rebuild in-memory state from safe_len.
+        let truncate_at = result.log_epochs.iter()
+            .position(|&(_, count)| count > safe_len)
+            .unwrap_or_else(|| result.log_epochs.len().saturating_sub(1));
+        result.log_epochs.truncate(truncate_at + 1);
+        if let Some(last) = result.log_epochs.last_mut() {
+            last.1 = safe_len;
+        }
+        result.log_len_cached = safe_len;
+
         log_persisted.iter().for_each(|e| { // This code load all log in memory
             let (actual_epoch, _) = result.log_status();
             if e.epoch < actual_epoch || e.idx < safe_len {
@@ -814,7 +826,7 @@ impl GroupReplica {
 
     /// Helper method for properly appending to the log
     fn append_inner_internal(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry, from_storage: bool) -> Result<u64, Error> {
-        // timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
+        timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
         let (log_epoch, log_len) = self.log_status();
 
         if log_len != idx {
@@ -1362,14 +1374,14 @@ mod tests {
         let mut dest = GidSet::new();
         dest.insert(Gid(0));
         
-        replica.log.push(LogEntry {
+        replica.log.insert(0, LogEntry {
             local_ts: 1,
             msg_id: 1,
             msg: "x".into(),
             dest: dest.clone(),
             final_ts: None,
         });
-        replica.log.push(LogEntry {
+        replica.log.insert(1, LogEntry {
             local_ts: 2,
             msg_id: 2,
             msg: "y".into(),
@@ -1385,4 +1397,58 @@ mod tests {
 
         // After finalization, log should be preserved
         assert_eq!(replica.log.len(), 2);
-    }}
+    }
+
+    #[test]
+    fn restart_with_unsafe_log_entries_does_not_panic() {
+        // Regression: when safe_len < log_len on restart, GroupReplica::new
+        // panicked with InvalidIndex because log_epochs from metadata reflected
+        // the full log length while append_inner expected log_len == idx.
+        let db_path = format!("/tmp/primcast_restart_test_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&db_path);
+
+        let initial_epoch = Epoch::initial();
+        let real_epoch = Epoch(1, Pid(0));
+        let gid = Gid(0);
+        let pid = Pid(0);
+        const TOTAL: u64 = 5;
+        const SAFE: u64 = 3;
+
+        // Build persistence state: 5 log entries, safe_len=3 (entries 3,4 are unsafe).
+        // This mirrors what update() persists after a quorum ack for only the first 3 entries.
+        {
+            let mut db = persistence::LMDBPersistence::new(&db_path).unwrap();
+            for idx in 0..TOTAL {
+                let entry = LogEntry {
+                    local_ts: idx + 1,
+                    msg_id: (idx + 1) as MsgId,
+                    msg: Bytes::from("x"),
+                    dest: [gid].into_iter().collect(),
+                    final_ts: None,
+                };
+                db.put_log_entry(real_epoch, idx, &entry).unwrap();
+            }
+            db.put_metadata(&persistence::ReplicaMetadata {
+                gid,
+                pid,
+                promised_epoch: real_epoch,
+                log_epochs: vec![(initial_epoch, 0), (real_epoch, TOTAL)],
+                safe_len: SAFE,
+                clock: TOTAL,
+            })
+            .unwrap();
+        }
+
+        let mut config = Config::new_for_test();
+        config.groups[0].peers[0].persistence_database = db_path.clone();
+
+        // Before fix: panics with InvalidIndex { len: 5 }
+        // After fix: loads without panic
+        let replica = GroupReplica::new(gid, pid, initial_epoch, config, false);
+
+        assert_eq!(replica.log_len(), TOTAL);
+        assert_eq!(replica.safe_len, SAFE);
+
+        let _ = std::fs::remove_dir_all(&db_path);
+    }
+}

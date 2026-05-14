@@ -1,10 +1,10 @@
 use tokio_zookeeper::*;
 use tokio::sync::mpsc;
-use tokio_zookeeper::error::Create;
 use primcast_core::{config, timed_print};
-use std::time::{SystemTime, UNIX_EPOCH};
 use primcast_core::types::{Epoch, Gid, Pid};
 use crate::Event;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use futures::StreamExt;
 
 pub struct LeaderElection {
     gid: Gid,
@@ -41,62 +41,80 @@ impl LeaderElection {
     }
 
     pub async fn run(self) {
-        let group_config = self.cfg.groups.iter().find(|g| g.gid == self.gid).unwrap();
-        let (zk, _) = ZooKeeper::connect(&group_config.zookeeper_url.parse().unwrap())
-            .await
-            .unwrap();
-        println!("Connected to ZooKeeper {:?}", zk);
+        loop {
+            if let Err(e) = self.run_once().await {
+                eprintln!("[LeaderElection] gid={} pid={} error: {}. Reconnecting in 1s...",
+                          self.gid.0, self.pid.0, e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 
+    async fn run_once(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let group_config = self.cfg.groups.iter()
+            .find(|g| g.gid == self.gid)
+            .ok_or("group config not found")?;
 
-        if zk.watch().exists(self.base_path.as_str()).await.unwrap().is_none() {
-            let _ = zk.create("/ELECTION", vec![], Acl::open_unsafe(), CreateMode::Persistent).await.unwrap();
-            let _ = zk.create(self.base_path.as_str(), vec![], Acl::open_unsafe(), CreateMode::Persistent).await.unwrap();
+        let (zk, watcher) = ZooKeeper::connect(&group_config.zookeeper_url.parse()?)
+            .await?;
+
+        // Drain default watcher to avoid send errors on dropped receiver
+        tokio::spawn(async move {
+            let mut w = watcher;
+            while w.next().await.is_some() {}
+        });
+
+        // Create election paths if they don't exist (no watch needed here)
+        if zk.exists(self.base_path.as_str()).await?.is_none() {
+            let _ = zk.create("/ELECTION", vec![], Acl::open_unsafe(), CreateMode::Persistent).await;
+            let _ = zk.create(self.base_path.as_str(), vec![], Acl::open_unsafe(), CreateMode::Persistent).await;
         }
 
-        let my_node: Result<String,Create>;
-        // Create an ephemeral sequential node
-        let pid = self.pid.clone();
-        my_node = zk.create(self.node_path.as_str(), pid.to_bytes(), Acl::open_unsafe(), CreateMode::EphemeralSequential).await.unwrap();
+        let my_node = zk
+            .create(
+                self.node_path.as_str(),
+                self.pid.to_bytes(),
+                Acl::open_unsafe(),
+                CreateMode::EphemeralSequential,
+            )
+            .await?
+            .map_err(|e| format!("create node failed: {e:?}"))?;
 
         'main: loop {
             let my_pid = self.pid.clone();
-            // Get the list of children nodes
-            let children = zk.get_children(self.base_path.as_str()).await.unwrap();
-
-            // Sort the children nodes
-            let mut sorted_children = children.clone().unwrap();
+            let children = zk.get_children(self.base_path.as_str()).await?
+                .ok_or("election base path missing")?;
+            let mut sorted_children = children;
             sorted_children.sort();
 
-            // Determine if the current node is the leader
-            if let Some((index, _)) = sorted_children.iter().enumerate().find(|(_, node)| format!("{}/{}", self.base_path, node) == my_node.clone().unwrap()) {
+            if let Some((index, _)) = sorted_children.iter().enumerate()
+                .find(|(_, node)| format!("{}/{}", self.base_path, node) == my_node)
+            {
                 if index == 0 {
-                    // let epoch_value: u32 = my_node.clone().unwrap().split("n_").last().unwrap().parse().unwrap();
+                    timed_print!("I am the Leader: {}", self.pid.0);
                     self.publish(0, my_pid).await;
                     loop {
-                        timed_print!("I am  the Leader: {}", my_pid.0);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;   
+                        tokio::time::sleep(Duration::from_secs(120)).await;
                     }
                 } else {
-                    let leader = sorted_children.get(0).unwrap();
-                    let data = zk.get_data(format!("{}/{}", self.base_path, leader).as_str()).await.unwrap().unwrap();
-                    let data_str = std::str::from_utf8(&data.0).unwrap();
-                    let leader_pid = Pid::from_str(data_str);
-                    // let epoch_value: u32 = leader.split("n_").last().unwrap().parse().unwrap();
-
-                    self.publish(0, leader_pid.unwrap()).await;
+                    let leader = &sorted_children[0];
+                    let data = zk
+                        .get_data(format!("{}/{}", self.base_path, leader).as_str())
+                        .await?
+                        .ok_or("leader node missing")?;
+                    let data_str = std::str::from_utf8(&data.0)?;
+                    let leader_pid = Pid::from_str(data_str)?;
+                    self.publish(0, leader_pid).await;
 
                     let predecessor = format!("{}/{}", self.base_path, sorted_children[index - 1]);
-
-                    // Watch the predecessor node
                     loop {
-                        if zk.exists(&predecessor).await.unwrap().is_none() {
+                        if zk.exists(&predecessor).await?.is_none() {
                             continue 'main;
                         }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
         }
-
     }
 }
