@@ -84,7 +84,10 @@ impl PendingSet {
     pub fn add_entry_ts(&mut self, msg_id: MsgId, dest: &GidSet, entry_ts: Clock, log_idx: u64) {
         use std::collections::hash_map::Entry;
         let ts;
-        timed_print!("({} {}) > ({} {}) ADD_ENTRY_TS", entry_ts, msg_id, self.last_popped.0, self.last_popped.1);
+
+        if entry_ts % 5 == 0 {
+            timed_print!("({} {}) > ({} {}) ADD_ENTRY_TS", entry_ts, msg_id, self.last_popped.0, self.last_popped.1);
+        }
         assert!((entry_ts, msg_id) > self.last_popped);
         assert!(entry_ts > self.highest_local_ts);
 

@@ -125,7 +125,7 @@ impl LogicalClock {
         let self_pid = self.pid.clone();
         let self_epoch = self.epoch.clone();
         let c = self.get_mut(self.pid);
-        eprintln!("update clock pid: {:?} epoch: {:?} clock: {:?}", self_pid, self_epoch, *c);
+        // eprintln!("update clock pid: {:?} epoch: {:?} clock: {:?}", self_pid, self_epoch, *c);
         if hybrid {
             // micros from UNIX_EPOCH
             let now = (chrono::Utc::now().timestamp_nanos_opt().unwrap() / 1000) as u64;

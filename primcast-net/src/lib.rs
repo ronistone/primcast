@@ -740,7 +740,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                         entry_epoch,
                         entry,
                     }) => {
-                        timed_print!("appending entry {:?} to log {:?}", idx, entry_epoch);
+                        // timed_print!("appending entry {:?} to log {:?}", idx, entry_epoch);
                         ack_dests.merge(&entry.dest);
                         let (actual_epoch, _) = s.core.log_status();
                         if entry_epoch > actual_epoch {
@@ -1121,7 +1121,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
             let s_guard = s.read().await;
             let (log_epoch, log_len) = s_guard.core.log_status();
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
-            timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
+            // timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
             if follower_log_len == log_len {
                 timed_print!("follower log is up to date");
                 break;
@@ -1230,7 +1230,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
                             }
                         }
                         Ack { log_epoch, log_len, clock } => {
-                            timed_print!("ack from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), log_epoch);
+                            // timed_print!("ack from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), log_epoch);
                             let mut s_write = s_arc.write().await;
                             let old_clock = s_write.core.clock();
                             s_write.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
@@ -1414,7 +1414,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             while follower_log_len < log_len {
                 let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
 
-                timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
+                // timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
                 to_send.push(LogAppend {
                     idx: follower_log_len,
                     entry_epoch: epoch,
@@ -1483,7 +1483,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                             }
                         }
                         Ack { log_epoch, log_len, clock } => {
-                            timed_print!("ack from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), log_epoch);
+                            // timed_print!("ack from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), log_epoch);
                             // Check if this is from collaborative recovery (log_len changed significantly)
                             if log_len > follower_log_len {
                                 timed_print!("follower updated to log_len = {} from collaborative recovery", log_len);

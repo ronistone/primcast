@@ -791,7 +791,7 @@ impl GroupReplica {
         let e = self.get_log(idx).expect("out of range log idx");
         // derive entry epoch from the log_epochs array
         let mut epoch = None;
-        timed_print!("get log entry {:?} {:?}", idx, self.log_epochs);
+        // timed_print!("get log entry {:?} {:?}", idx, self.log_epochs);
         for &(e, len) in &self.log_epochs {
             // TODO: store Epoch in LogEntry instead?
             if len > idx {
@@ -826,7 +826,7 @@ impl GroupReplica {
 
     /// Helper method for properly appending to the log
     fn append_inner_internal(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry, from_storage: bool) -> Result<u64, Error> {
-        timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
+        // timed_print!("append_inner: {:?} {:?} {:?}", entry_epoch, idx, entry);
         let (log_epoch, log_len) = self.log_status();
 
         if log_len != idx {
