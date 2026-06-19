@@ -1,10 +1,9 @@
-use tokio_zookeeper::*;
+use zookeeper_async::{Acl, CreateMode, WatchedEvent, ZooKeeper};
 use tokio::sync::mpsc;
 use primcast_core::{config, timed_print};
 use primcast_core::types::{Epoch, Gid, Pid};
 use crate::Event;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use futures::StreamExt;
 
 pub struct LeaderElection {
     gid: Gid,
@@ -55,40 +54,36 @@ impl LeaderElection {
             .find(|g| g.gid == self.gid)
             .ok_or("group config not found")?;
 
-        let (zk, watcher) = tokio::time::timeout(
+        let zk = tokio::time::timeout(
             Duration::from_secs(5),
-            ZooKeeper::connect(&group_config.zookeeper_url.parse()?)
+            ZooKeeper::connect(
+                &group_config.zookeeper_url,
+                Duration::from_secs(5),
+                |_: WatchedEvent| {},
+            )
         )
         .await
         .map_err(|_| "ZK connect timeout")?
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        // Drain default watcher to avoid send errors on dropped receiver
-        tokio::spawn(async move {
-            let mut w = watcher;
-            while w.next().await.is_some() {}
-        });
-
-        // Create election paths if they don't exist (no watch needed here)
-        if zk.exists(self.base_path.as_str()).await?.is_none() {
-            let _ = zk.create("/ELECTION", vec![], Acl::open_unsafe(), CreateMode::Persistent).await;
-            let _ = zk.create(self.base_path.as_str(), vec![], Acl::open_unsafe(), CreateMode::Persistent).await;
+        // Create election paths if they don't exist
+        if zk.exists(self.base_path.as_str(), false).await?.is_none() {
+            let _ = zk.create("/ELECTION", vec![], Acl::open_unsafe().to_vec(), CreateMode::Persistent).await;
+            let _ = zk.create(self.base_path.as_str(), vec![], Acl::open_unsafe().to_vec(), CreateMode::Persistent).await;
         }
 
         let my_node = zk
             .create(
                 self.node_path.as_str(),
                 self.pid.to_bytes(),
-                Acl::open_unsafe(),
+                Acl::open_unsafe().to_vec(),
                 CreateMode::EphemeralSequential,
             )
-            .await?
-            .map_err(|e| format!("create node failed: {e:?}"))?;
+            .await?;
 
         'main: loop {
             let my_pid = self.pid.clone();
-            let children = zk.get_children(self.base_path.as_str()).await?
-                .ok_or("election base path missing")?;
+            let children = zk.get_children(self.base_path.as_str(), false).await?;
             let mut sorted_children = children;
             sorted_children.sort();
 
@@ -100,7 +95,7 @@ impl LeaderElection {
                     self.publish(0, my_pid).await;
                     loop {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        match zk.exists(my_node.as_str()).await {
+                        match zk.exists(my_node.as_str(), false).await {
                             Ok(None) => return Err("leader node gone - session expired".into()),
                             Err(e)   => return Err(Box::new(e)),
                             Ok(Some(_)) => {}
@@ -109,16 +104,15 @@ impl LeaderElection {
                 } else {
                     let leader = &sorted_children[0];
                     let data = zk
-                        .get_data(format!("{}/{}", self.base_path, leader).as_str())
-                        .await?
-                        .ok_or("leader node missing")?;
+                        .get_data(format!("{}/{}", self.base_path, leader).as_str(), false)
+                        .await?;
                     let data_str = std::str::from_utf8(&data.0)?;
                     let leader_pid = Pid::from_str(data_str)?;
                     self.publish(0, leader_pid).await;
 
                     let predecessor = format!("{}/{}", self.base_path, sorted_children[index - 1]);
                     loop {
-                        if zk.exists(&predecessor).await?.is_none() {
+                        if zk.exists(&predecessor, false).await?.is_none() {
                             continue 'main;
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -190,7 +184,6 @@ mod tests {
     #[tokio::test]
     async fn run_once_returns_error_on_unreachable_zk() {
         // Port 1 is reserved and unreachable → error (not panic).
-        // Regression guard: before the reconnect fix, this would .unwrap() and panic.
         let le = LeaderElection::new(Gid(0), Pid(0), test_config_with_zk("127.0.0.1:1"));
         let result = le.run_once().await;
         assert!(result.is_err(), "run_once should return Err on unreachable ZK, not panic");
@@ -199,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn connect_timeout_on_unresponsive_server() {
         // TcpListener accepts the TCP connection but never speaks ZK protocol
-        // → tokio-zookeeper handshake hangs → our 5s timeout must fire
+        // → zookeeper-async handshake hangs → our 5s outer timeout must fire
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _listener = listener; // keep alive, never accept
@@ -260,14 +253,16 @@ mod tests {
         // Second client deletes all election nodes for this gid, simulating
         // the leader's ephemeral node being cleaned up by ZK on session expiry.
         let group_cfg = cfg.groups.iter().find(|g| g.gid == gid).unwrap();
-        let (zk2, _w2) = tokio_zookeeper::ZooKeeper::connect(
-            &group_cfg.zookeeper_url.parse().unwrap()
+        let zk2 = zookeeper_async::ZooKeeper::connect(
+            &group_cfg.zookeeper_url,
+            Duration::from_secs(5),
+            |_: zookeeper_async::WatchedEvent| {},
         )
         .await
         .expect("second ZK connect failed");
 
         let base = format!("/ELECTION/g_{}", gid.0);
-        if let Ok(Some(children)) = zk2.get_children(base.as_str()).await {
+        if let Ok(children) = zk2.get_children(base.as_str(), false).await {
             for child in children {
                 let _ = zk2.delete(&format!("{base}/{child}"), None).await;
             }
