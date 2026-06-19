@@ -33,6 +33,7 @@ pub mod conn;
 mod messages;
 pub mod util;
 pub mod leader_election;
+pub mod multi_group_recovery;
 pub mod recovery;
 
 use conn::Conn;
@@ -769,11 +770,22 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                         s.update_tx.send(())?;
                         drop(s);
 
-                        // Run collaborative recovery - fetch from all peers in the group
-                        recovery::run_follower_collaborative_recovery(
-                            from_idx, to_idx, e, &cfg, self_gid, self_pid,
-                            &s_arc,
-                        ).await?;
+                        // Run collaborative recovery. When multi-group recovery is
+                        // enabled, offload multi-dest payloads to co-dest groups;
+                        // otherwise use the single-group path. Both have identical
+                        // apply semantics, so this is a drop-in swap.
+                        if cfg.multi_group_recovery {
+                            let planner = multi_group_recovery::CoDestinationPlanner;
+                            multi_group_recovery::run_multi_group_recovery(
+                                from_idx, to_idx, e, &cfg, self_gid, self_pid,
+                                &planner, &s_arc,
+                            ).await?;
+                        } else {
+                            recovery::run_follower_collaborative_recovery(
+                                from_idx, to_idx, e, &cfg, self_gid, self_pid,
+                                &s_arc,
+                            ).await?;
+                        }
 
                         // Send ack with updated log status
                         {
@@ -996,6 +1008,35 @@ async fn handle_connection(
         Message::LogRangeRequest { gid: _req_gid, from_idx, to_idx } => {
             timed_print!("log range request [{}, {}) from {:?}:{:?}", from_idx, to_idx, conn.gid(), conn.pid());
             recovery_send_range(conn, from_idx, to_idx, s.clone()).await?;
+        }
+
+        // Multi-group recovery: serve the authoritative metadata skeleton (no payloads).
+        Message::RecoverySkeletonRequest { from_idx, to_idx } => {
+            const SKELETON_BATCH_SIZE: usize = 256;
+            let skeletons = {
+                let shared = s.read().await;
+                shared.core.log_skeleton_range(from_idx, to_idx)
+            };
+            timed_print!("skeleton request [{}, {}) -> {} entries", from_idx, to_idx, skeletons.len());
+            let mut chunks = skeletons.chunks(SKELETON_BATCH_SIZE).peekable();
+            if chunks.peek().is_none() {
+                conn.send(Message::RecoverySkeletonChunk { entries: vec![], is_last: true }).await?;
+            } else {
+                while let Some(chunk) = chunks.next() {
+                    let is_last = chunks.peek().is_none();
+                    conn.send(Message::RecoverySkeletonChunk { entries: chunk.to_vec(), is_last }).await?;
+                }
+            }
+        }
+
+        // Multi-group recovery: serve payloads of (multi-dest) messages by msg_id.
+        Message::CrossGroupPayloadRequest { gid: _req_gid, msg_ids } => {
+            let (payloads, missing) = {
+                let shared = s.read().await;
+                shared.core.payloads_for_msg_ids(&msg_ids)
+            };
+            timed_print!("cross-group payload request: {} found, {} missing", payloads.len(), missing.len());
+            conn.send(Message::CrossGroupPayloadResponse { payloads, missing }).await?;
         }
 
         m => panic!("unexpected message: {:?}", m),
