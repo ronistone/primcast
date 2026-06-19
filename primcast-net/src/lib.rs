@@ -281,29 +281,56 @@ impl PrimcastReplica {
             if gid == self.gid {
                 continue;
             }
-            for p in g.peers.iter().cloned() {
-                let pid = p.pid;
-                if p.pid == self.pid {
-                    let shared = self.shared.clone();
-                    abort_handles.push(AbortHandle::spawn(async move {
-                        loop {
-                            if let Err(err) = remote_log_fetch(gid, p.clone(), shared.clone()).await {
+
+            // Remote LOG entries only need to come from a single up-to-date replica
+            // of the remote group, but that source must fail over if the peer dies,
+            // otherwise this node stops learning the remote group's timestamps and
+            // global deliveries stall behind them (head-of-line). Rotate through the
+            // remote group's peers, starting at our own pid to spread load while all
+            // nodes are healthy. Any replica can serve the log (see remote_log_send).
+            let peers: Vec<PeerConfig> = g.peers.iter().cloned().collect();
+            // start the rotation at the same-pid peer when present
+            let start = peers.iter().position(|p| p.pid == self.pid).unwrap_or(0);
+            {
+                let shared = self.shared.clone();
+                let peers = peers.clone();
+                abort_handles.push(AbortHandle::spawn(async move {
+                    let mut i = start;
+                    loop {
+                        let p = peers[i % peers.len()].clone();
+                        let pid = p.pid;
+                        match remote_log_fetch(gid, p, shared.clone()).await {
+                            // returns Ok on epoch change (retry same peer to refollow)
+                            // or Err on connection loss (fail over to the next peer)
+                            Ok(()) => {}
+                            Err(err) => {
                                 timed_print!("error fetching remote logs from {gid:?}{pid:?}: {err:?}");
-                                tokio::time::sleep(RETRY_TIMEOUT).await;
+                                i += 1; // fail over to the next peer
+                                if i % peers.len() == start % peers.len() {
+                                    // swept all peers without progress; back off before retrying
+                                    tokio::time::sleep(RETRY_TIMEOUT).await;
+                                }
                             }
                         }
-                    }));
-                } else {
-                    let shared = self.shared.clone();
-                    abort_handles.push(AbortHandle::spawn(async move {
-                        loop {
-                            if let Err(err) = remote_acks_fetch(gid, p.clone(), shared.clone()).await {
-                                timed_print!("error fetching remote acks from {gid:?}{pid:?}: {err:?}");
-                                tokio::time::sleep(RETRY_TIMEOUT).await;
-                            }
+                    }
+                }));
+            }
+
+            // Fetch acks from every peer of the remote group (including same-pid) so a
+            // quorum of remote acks is covered regardless of which peer currently
+            // serves the log. add_remote_ack takes the max, so overlapping acks (the
+            // log-fetch peer also acks) are idempotent.
+            for p in peers {
+                let pid = p.pid;
+                let shared = self.shared.clone();
+                abort_handles.push(AbortHandle::spawn(async move {
+                    loop {
+                        if let Err(err) = remote_acks_fetch(gid, p.clone(), shared.clone()).await {
+                            timed_print!("error fetching remote acks from {gid:?}{pid:?}: {err:?}");
+                            tokio::time::sleep(RETRY_TIMEOUT).await;
                         }
-                    }));
-                }
+                    }
+                }));
             }
         }
 
