@@ -72,21 +72,6 @@ impl PendingSet {
         }
     }
 
-    /// Create a PendingSet with a known delivery watermark (for recovery).
-    /// All entries added must have (ts, msg_id) > watermark.
-    pub fn new_with_watermark(gid: Gid, watermark: (Clock, MsgId)) -> Self {
-        Self {
-            gid,
-            all: Default::default(),
-            all_max: 0,
-            ts_order: Default::default(),
-            ts_order_max: 0,
-            last_popped: watermark,
-            min_new_proposal: watermark.0,
-            highest_local_ts: watermark.0,
-        }
-    }
-
     pub fn stats(&self) -> Stats {
         Stats {
             all: self.all.len(),
@@ -99,7 +84,10 @@ impl PendingSet {
     pub fn add_entry_ts(&mut self, msg_id: MsgId, dest: &GidSet, entry_ts: Clock, log_idx: u64) {
         use std::collections::hash_map::Entry;
         let ts;
-        timed_print!("({} {}) > ({} {}) ADD_ENTRY_TS", entry_ts, msg_id, self.last_popped.0, self.last_popped.1);
+
+        if entry_ts % 5 == 0 {
+            timed_print!("({} {}) > ({} {}) ADD_ENTRY_TS", entry_ts, msg_id, self.last_popped.0, self.last_popped.1);
+        }
         assert!((entry_ts, msg_id) > self.last_popped);
         assert!(entry_ts > self.highest_local_ts);
 

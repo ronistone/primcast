@@ -12,7 +12,6 @@ use crate::conn::Conn;
 use crate::messages::Message;
 use crate::{Error, Shared};
 
-const RECOVERY_BATCH_SIZE: usize = 50;
 const RECOVERY_MAX_RETRIES: usize = 5;
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
