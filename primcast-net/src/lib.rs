@@ -224,9 +224,12 @@ impl PrimcastReplica {
                             _ => unreachable!(),
                         }
                     }
-                    else => {}
+                    else => {
+                        eprintln!("Leader Election task quits!!! this will broke the leader election");
+                    }
                 }
             }
+            eprintln!("Leader Election task quits!!! this will broke the leader election");
         });
 
         let mut gid_proposal_tx = HashMap::default();
@@ -361,7 +364,12 @@ impl PrimcastReplica {
                     // biased;
                     _ = &mut fut => {
                         // when the main task resolves, become idle
-                        let (e, state) = self.shared.read().await.core.state();
+                        let e;
+                        let state;
+                        {
+                            let s = self.shared.read().await;
+                            (e, state) = s.core.state();
+                        }
                         match state {
                             ReplicaState::Promised | ReplicaState::Follower => {
                                 fut = Box::pin(run_idle(self.shared.clone()));
@@ -1787,7 +1795,16 @@ async fn remote_log_send(
     s: Arc<RwLock<Shared>>,
 ) -> Result<(), Error> {
     timed_print!("sending remote logs for {dest:?} starting at {next_idx:?}");
-    let mut ack_rx = s.read().await.ack_rx[&dest].clone();
+    // DEBUG: distinguish "blocked acquiring the RwLock" (true lock deadlock)
+    // from "parked on the watch channel" (ack_tx[dest] never re-signaled —
+    // suspected liveness stall, see project_leader_fail_stall memory).
+    let mut ack_rx = match tokio::time::timeout(Duration::from_secs(5), s.read()).await {
+        Ok(guard) => guard.ack_rx[&dest].clone(),
+        Err(_) => {
+            timed_print!("[STALL?] remote_log_send({dest:?}): blocked >5s acquiring read lock on Shared");
+            s.read().await.ack_rx[&dest].clone()
+        }
+    };
     use Message::*;
     let mut to_send = vec![];
     loop {
@@ -1798,7 +1815,18 @@ async fn remote_log_send(
             return Ok(());
         }
         if log_len <= next_idx {
-            ack_rx.changed().await?;
+            // DEBUG: log_len/next_idx frozen here + repeated [STALL?] prints below
+            // confirms the watch-channel liveness bug (ack_tx[dest] not bumped on
+            // Primary-transition / no PeriodicChecks heartbeat), not a lock deadlock.
+            match tokio::time::timeout(Duration::from_secs(5), ack_rx.changed()).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    timed_print!(
+                        "[STALL?] remote_log_send({dest:?}): still waiting for local log growth, \
+                         next_idx={next_idx} log_len={log_len} epoch={epoch:?}"
+                    );
+                }
+            }
             continue;
         }
 

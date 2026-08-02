@@ -560,6 +560,10 @@ impl GroupReplica {
         self.promised_epoch = epoch;
         self.state = ReplicaState::Candidate;
         self.accepts.clear();
+        // self counts as an accept, mirroring the self-promise below — otherwise
+        // quorum_size external accepts are needed instead of quorum_size - 1,
+        // which run_candidate's local quorum counting (net crate) doesn't expect.
+        self.accepts.insert(self.pid);
         // add self promise
         let (current_epoch, log_len) = self.log_status();
         self.add_promise(epoch, self.pid, self.clock.local(), current_epoch, log_len)

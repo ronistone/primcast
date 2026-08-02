@@ -185,12 +185,20 @@ pub async fn run_multi_group_recovery(
         std::pin::Pin<Box<dyn std::future::Future<Output = PayloadResult> + Send>>,
     > = FuturesUnordered::new();
     for (g, ids) in by_group {
+        eprintln!(
+            "[MGRecovery] plan: {} payload(s) -> co-dest group {:?}",
+            ids.len(), g
+        );
         let cfg = cfg.clone();
         fetches.push(Box::pin(fetch_payloads_from_group(
             g, ids, self_gid, self_pid, cfg,
         )));
     }
     for (p, ids) in by_peer {
+        eprintln!(
+            "[MGRecovery] plan: {} payload(s) -> own peer {:?}",
+            ids.len(), p
+        );
         let cfg = cfg.clone();
         fetches.push(Box::pin(fetch_payloads_from_peer(
             self_gid, p, ids, self_gid, self_pid, cfg,
@@ -357,6 +365,10 @@ async fn fetch_payloads_from_group(
     self_pid: Pid,
     cfg: Config,
 ) -> PayloadResult {
+    // eprintln!(
+    //     "[MGRecovery] recovering [{}, {}) — {}{} {:?}",
+    //     target_gid.0, target_gid, own_peers
+    // );
     let peers: Vec<Pid> = match cfg.group(target_gid) {
         Some(g) => g.peers.iter().map(|p| p.pid).collect(),
         None => return Err((ids, Error::Io(std::io::Error::new(
@@ -435,13 +447,23 @@ async fn request_payloads(
             ))
         })?
         .addr();
+    eprintln!(
+        "[MGRecovery] requesting {} payload(s) from ({:?}, {:?})",
+        ids.len(), target_gid, target_pid
+    );
     let req = Message::CrossGroupPayloadRequest {
         gid: self_gid,
         msg_ids: ids.to_vec(),
     };
     let mut conn = Conn::request((self_gid, self_pid), (target_gid, target_pid), addr, req).await?;
     match conn.recv().await? {
-        Message::CrossGroupPayloadResponse { payloads, missing } => Ok((payloads, missing)),
+        Message::CrossGroupPayloadResponse { payloads, missing } => {
+            eprintln!(
+                "[MGRecovery] ({:?}, {:?}) returned {} payload(s), {} missing: {:?}",
+                target_gid, target_pid, payloads.len(), missing.len(), missing
+            );
+            Ok((payloads, missing))
+        }
         m => Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unexpected payload response: {:?}", m),
