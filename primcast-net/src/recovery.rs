@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use crate::util::RwLock;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, SinkExt};
 
@@ -52,7 +52,7 @@ pub async fn run_recovery(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     let local_promised_epoch: Epoch;
     let local_log_epochs: Vec<(Epoch, u64)>;
     {
-        let shared = s.read().await;
+        let shared = s.read(crate::loc!()).await;
         cfg = shared.core.config.clone();
         self_gid = shared.core.gid;
         self_pid = shared.core.pid;
@@ -79,7 +79,7 @@ pub async fn run_recovery(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     if peers.is_empty() {
         // Single-node group, nothing to recover from
         eprintln!("[Recovery] Single-node group, skipping recovery");
-        let mut shared = s.write().await;
+        let mut shared = s.write(crate::loc!()).await;
         let clock = shared.core.clock();
         shared.core.finalize_recovery(local_promised_epoch, clock)?;
         shared.update_tx.send(()).ok();
@@ -88,7 +88,7 @@ pub async fn run_recovery(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
 
     // Check if gap is small enough to skip collaborative recovery
     let _gap = {
-        let shared = s.read().await;
+        let shared = s.read(crate::loc!()).await;
         let (_, _log_len) = shared.core.log_status();
         // For simplicity, we always run recovery. In production, add threshold: if gap < 1000 { return }
         0
@@ -172,7 +172,7 @@ pub async fn run_recovery(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     if gap == 0 {
         // Already up to date, just finalize
         eprintln!("[Recovery] Already up to date");
-        let mut shared = s.write().await;
+        let mut shared = s.write(crate::loc!()).await;
         let clock = shared.core.clock();
         shared.core.finalize_recovery(cluster_epoch, clock)?;
         shared.update_tx.send(()).ok();
@@ -273,14 +273,14 @@ pub async fn run_recovery(s: Arc<RwLock<Shared>>) -> Result<(), Error> {
 
     // --- Phase 4: Apply entries to the local log ---
     {
-        let mut shared = s.write().await;
+        let mut shared = s.write(crate::loc!()).await;
         shared.core.recovery_append_batch(all_entries)?;
     }
 
     // --- Phase 5: Finalize recovery ---
     eprintln!("[Recovery] Phase 5 - Finalizing recovery");
     {
-        let mut shared = s.write().await;
+        let mut shared = s.write(crate::loc!()).await;
         let clock = shared.core.clock();
         shared.core.finalize_recovery(cluster_epoch, clock)?;
 
@@ -417,7 +417,7 @@ pub async fn run_follower_collaborative_recovery(
 
     // Apply entries using start_epoch_append / append (same as run_follower does for LogAppend)
     {
-        let mut shared = s.write().await;
+        let mut shared = s.write(crate::loc!()).await;
         for (idx, entry_epoch, entry) in all_entries {
             let (actual_epoch, _) = shared.core.log_status();
             if entry_epoch > actual_epoch {

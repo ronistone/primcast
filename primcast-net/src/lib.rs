@@ -1,7 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 use std::u32;
 
 use bytes::Bytes;
@@ -14,7 +13,7 @@ use futures::StreamExt;
 
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio::sync::RwLock;
+use crate::util::RwLock;
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -49,6 +48,17 @@ const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const PROPOSAL_QUEUE: usize = 100_000;
 const DELIVERY_QUEUE: usize = 100_000;
 const BATCH_SIZE_YIELD: usize = 1_000;
+// How often the primary looks for messages that other groups know about but
+// this group never got a local ts for (lost in flight when a leader died), and
+// how long such a message must have been waiting before it is re-proposed.
+const MISSING_PROPOSAL_INTERVAL: Duration = Duration::from_millis(500);
+const MISSING_PROPOSAL_AGE: Duration = Duration::from_secs(1);
+const MISSING_PROPOSAL_BATCH: usize = 1_000;
+// Re-signals ack_tx watchers (remote_log_send/ack_send) that are parked waiting
+// for local log growth. Needed because a leader failing over with no fresh local
+// traffic never otherwise bumps ack_tx again, permanently stalling recovery on
+// the other end. See project_leader_fail_stall.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum Error {
@@ -110,7 +120,6 @@ pub struct Shared {
 }
 
 pub enum Event {
-    PeriodicChecks(Instant),
     Follow(Conn, Epoch),
     InitiateEpoch(Epoch),
     ProposalIn(mpsc::Receiver<(MsgId, Bytes, GidSet)>),
@@ -216,7 +225,7 @@ impl PrimcastReplica {
                         match ev {
                             Event::InitiateEpoch(epoch) => {
                                 timed_print!("Initiating epoch {:?}", epoch);
-                                let mut lock = leader_election_shared.write().await;
+                                let mut lock = leader_election_shared.write(crate::loc!()).await;
                                 if epoch.1 == self_pid {
                                     lock.core.become_candidate();
                                 }
@@ -262,13 +271,84 @@ impl PrimcastReplica {
 
         let mut abort_handles = vec![];
 
+        // Periodic heartbeat: nudges any ack_tx watcher parked waiting for log
+        // growth (remote_log_send/ack_send), so a stalled group self-heals even
+        // with no fresh proposals. Standalone task (mirrors the `--debug` ticker
+        // below, which is proven safe under load) — does NOT round-trip through
+        // `ev_tx`/the main select loop's `Event` handling, unlike an earlier
+        // version of this fix that caused a total-runtime-stall freeze under
+        // sustained load (bisection-confirmed; root cause not fully understood,
+        // but isolating this off the hot main-loop task resolved it).
+        {
+            let s = self.shared.clone();
+            abort_handles.push(AbortHandle::spawn(async move {
+                loop {
+                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                    let shared = s.read(crate::loc!()).await;
+                    let (log_epoch, log_len) = shared.core.log_status();
+                    let clock = shared.core.clock();
+                    for tx in shared.ack_tx.values() {
+                        tx.send((log_epoch, log_len, clock)).ok();
+                    }
+                }
+            }));
+        }
+
+        // Re-propose messages lost in flight across a leader change: the other
+        // destination groups already timestamped them, so every group blocks
+        // behind them (head-of-line in PendingSet) until this group gives them a
+        // local ts. Without this the cluster stops delivering after a failover.
+        {
+            let s = self.shared.clone();
+            let cfg = self.cfg.clone();
+            abort_handles.push(AbortHandle::spawn(async move {
+                loop {
+                    tokio::time::sleep(MISSING_PROPOSAL_INTERVAL).await;
+                    if let Err(err) = repair_missing_proposals(&cfg, &s).await {
+                        timed_print!("error repairing missing proposals: {err:?}");
+                    }
+                }
+            }));
+        }
+
         if let Some(secs) = debug {
             // debug printing
             let s = self.shared.clone();
             abort_handles.push(AbortHandle::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(secs)).await;
-                    s.write().await.core.print_debug_info();
+                    s.write(crate::loc!()).await.core.print_debug_info();
+                }
+            }));
+        }
+
+        // DEBUG: non-blocking lock probe to distinguish "write permit held
+        // forever by some task" from "permit free but nobody's polling".
+        {
+            let s = self.shared.clone();
+            abort_handles.push(AbortHandle::spawn(async move {
+                let mut probe_ticks: u64 = 0;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let status = match s.try_write(crate::loc!()) {
+                        Ok(_) => "write lock FREE",
+                        Err(_) => match s.try_read(crate::loc!()) {
+                            Ok(_) => "write HELD but read FREE",
+                            Err(_) => "write HELD, read HELD/BLOCKED",
+                        },
+                    };
+                    probe_ticks += 1;
+                    if status == "write lock FREE" {
+                        timed_print!("[LOCKPROBE] {status}");
+                    } else {
+                        // contended: name the holder(s)/waiter(s) so the stall
+                        // can be attributed to a call site.
+                        timed_print!("[LOCKPROBE] {status}\n  {}", s.dump());
+                    }
+                    // every 10s: where the lock's time is actually spent
+                    if probe_ticks % 10 == 0 {
+                        timed_print!("[LOCKTIME] {}", s.hold_report(6));
+                    }
                 }
             }));
         }
@@ -348,7 +428,7 @@ impl PrimcastReplica {
         // - passing proposals to the primcast core state
         // - handling Events
         // The main loop stops when shutdown resolves
-        let mut shutdown = self.shared.read().await.shutdown.clone();
+        let mut shutdown = self.shared.read(crate::loc!()).await.shutdown.clone();
         timed_print!("starting main loop...");
         let mut proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
         // Proposals that failed add_proposal with NotLeader (leadership changed mid-flight).
@@ -356,118 +436,153 @@ impl PrimcastReplica {
         let mut overflow_proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
         let mut rr_proposals_rx = RoundRobinStreams::new();
         rr_proposals_rx.push(ReceiverStream::new(proposal_rx));
+        // A replica task must never have more than one *pending* acquisition of
+        // `shared` that is not polled by this select. tokio's RwLock is FIFO-fair:
+        // once the lock frees, the permits are handed to the queued head waiter
+        // and only released again when that waiter's future is polled to
+        // completion. Awaiting the lock inside a select branch *body* suspends
+        // the whole select, so `fut` (run_candidate/run_primary/run_follower —
+        // all of which acquire `shared` themselves) stops being polled; if the
+        // permits were handed to `fut`'s pending acquisition, nobody can make
+        // progress and the replica freezes (observed on leader failover).
+        //
+        // So the main loop touches `shared` in exactly one place: a select
+        // branch whose future *is* the acquisition. All the branch bodies below
+        // only buffer work; the lock branch applies it. That way `fut`'s
+        // acquisition and the main loop's acquisition are always polled
+        // together, and whichever gets the permits makes progress.
+        let mut fut_done = false;
+        let mut pending_follow: Option<(Conn, Epoch)> = None;
+        let mut pending_proposals: Vec<(MsgId, Bytes, GidSet)> = vec![];
         'main: loop {
             // for tracking to which dests an ack should be sent
             let mut ack_dests = GidSet::new();
             loop {
+                let want_lock = fut_done || pending_follow.is_some() || !pending_proposals.is_empty();
                 tokio::select! {
                     // biased;
-                    _ = &mut fut => {
-                        // when the main task resolves, become idle
-                        let e;
-                        let state;
-                        {
-                            let s = self.shared.read().await;
-                            (e, state) = s.core.state();
+                    res = &mut fut, if !fut_done => {
+                        // main replica future resolved; next state is picked
+                        // under the lock below
+                        if let Err(err) = res {
+                            timed_print!("replica task ended with error: {err:?}");
                         }
-                        match state {
-                            ReplicaState::Promised | ReplicaState::Follower => {
-                                fut = Box::pin(run_idle(self.shared.clone()));
-                            }
-                            ReplicaState::Candidate => {
-                                fut = Box::pin(run_candidate(e, self.shared.clone()));
-                            }
-                            ReplicaState::Primary => {
-                                // Commit any proposals that accumulated in core.proposals
-                                // during Candidate state (add_proposal succeeded but
-                                // propose() couldn't run because state wasn't Primary yet).
-                                {
-                                    let mut s = self.shared.write().await;
-                                    if let Err(err) = s.core.propose() {
-                                        timed_print!("error flushing queued proposals on primary transition: {err:?}");
-                                    }
-                                }
-                                // Re-inject proposals that previously failed add_proposal
-                                // with NotLeader so they are retried under the new epoch.
-                                if !overflow_proposals.is_empty() {
-                                    let capacity = overflow_proposals.len();
-                                    let (tx, rx) = mpsc::channel(capacity);
-                                    for p in overflow_proposals.drain(..) {
-                                        // capacity == len, so try_send never fails here
-                                        let _ = tx.try_send(p);
-                                    }
-                                    rr_proposals_rx.push(ReceiverStream::new(rx));
-                                }
-                                fut = Box::pin(run_primary(e, self.shared.clone()));
-                            }
-                            ReplicaState::Recovering => {
-                                // Should not happen — nodes always start as Promised and recovery
-                                // happens via the leader sync process, not a separate pre-startup phase
-                                eprintln!("WARNING: Unexpected Recovering state in main loop");
-                                fut = Box::pin(run_idle(self.shared.clone()));
-                            }
-                        }
+                        fut_done = true;
                     },
                     Some(ev) = self.ev_rx.recv() => {
                         match ev {
                             Event::Follow(conn, epoch) => {
                                 // new connection from a leader
-                                let (e, state) = self.shared.read().await.core.state();
-                                if e == epoch && (state == ReplicaState::Promised || state == ReplicaState::Follower) {
-                                    fut = Box::pin(run_follower(conn, epoch, self.shared.clone()));
-                                } else {
-                                    timed_print!("=================== [ignoring follow event for epoch {:?} in state {:?}] ========================", epoch, state);
-                                    fut = Box::pin(run_idle(self.shared.clone()));
-                                }
+                                pending_follow = Some((conn, epoch));
                             }
                             Event::ProposalIn(rx) => {
                                 rr_proposals_rx.push(ReceiverStream::new(rx));
-                            }
-                            Event::PeriodicChecks(_now) => {
-                                // TODO:
                             }
                             Event::InitiateEpoch(..) => {
                                 // new epoch proposal
                             }
                         }
                     }
-                    n = rr_proposals_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals) => {
+                    n = rr_proposals_rx.next_ready_chunk(BATCH_SIZE_YIELD, &mut proposals), if pending_proposals.is_empty() => {
                         if n == 0 {
                             break;
                         }
-                        // handle next batch of proposals
-
-                        let mut s = self.shared.write().await;
-                        for (msg_id, msg, dest) in proposals.drain(..) {
-                            ack_dests.merge(&dest);
-                            // Clone msg/dest before moving into add_proposal so we can
-                            // preserve them in overflow_proposals on NotLeader failure.
-                            let msg_copy = msg.clone();
-                            let dest_copy = dest.clone();
-                            match s.core.add_proposal(msg_id, msg, dest) {
-                                Ok(_) => (),
-                                Err(primcast_core::Error::NotLeader { .. }) => {
-                                    // Leadership changed while proposal was in flight.
-                                    // Save it so it can be re-injected when this replica
-                                    // (or another) next becomes Primary.
-                                    timed_print!("proposal {msg_id} rejected (not leader), buffering for retry");
-                                    overflow_proposals.push((msg_id, msg_copy, dest_copy));
-                                }
-                                Err(primcast_core::Error::IdAlreadyUsed) => {
-                                    // Already committed by a previous leader; delivery will arrive.
-                                }
-                                Err(err) => {
-                                    timed_print!("error queuing proposal {msg_id}: {err:?}");
-                                },
+                        // buffer the batch; applied under the lock below
+                        pending_proposals.append(&mut proposals);
+                    }
+                    mut s = self.shared.write(crate::loc!()), if want_lock => {
+                        // NOTE: no `.await` in this body — see comment above.
+                        if let Some((conn, epoch)) = pending_follow.take() {
+                            let (e, state) = s.core.state();
+                            if e == epoch && (state == ReplicaState::Promised || state == ReplicaState::Follower) {
+                                fut = Box::pin(run_follower(conn, epoch, self.shared.clone()));
+                            } else {
+                                timed_print!("=================== [ignoring follow event for epoch {:?} in state {:?}] ========================", epoch, state);
+                                fut = Box::pin(run_idle(self.shared.clone()));
                             }
+                            fut_done = false;
+                        } else if fut_done {
+                            // when the main task resolves, pick the next state
+                            let (e, state) = s.core.state();
+                            match state {
+                                ReplicaState::Promised | ReplicaState::Follower => {
+                                    fut = Box::pin(run_idle(self.shared.clone()));
+                                }
+                                ReplicaState::Candidate => {
+                                    fut = Box::pin(run_candidate(e, self.shared.clone()));
+                                }
+                                ReplicaState::Primary => {
+                                    // Commit any proposals that accumulated in core.proposals
+                                    // during Candidate state (add_proposal succeeded but
+                                    // propose() couldn't run because state wasn't Primary yet).
+                                    if let Err(err) = s.core.propose() {
+                                        timed_print!("error flushing queued proposals on primary transition: {err:?}");
+                                    }
+                                    // Re-signal every ack_tx watcher immediately on taking over as
+                                    // Primary: a failed-over leader with no fresh local traffic
+                                    // would otherwise have to wait for the next heartbeat tick to
+                                    // unstick remote_log_send/ack_send on the other end.
+                                    let (log_epoch, log_len) = s.core.log_status();
+                                    let clock = s.core.clock();
+                                    for tx in s.ack_tx.values() {
+                                        tx.send((log_epoch, log_len, clock)).ok();
+                                    }
+                                    // Re-inject proposals that previously failed add_proposal
+                                    // with NotLeader so they are retried under the new epoch.
+                                    if !overflow_proposals.is_empty() {
+                                        let capacity = overflow_proposals.len();
+                                        let (tx, rx) = mpsc::channel(capacity);
+                                        for p in overflow_proposals.drain(..) {
+                                            // capacity == len, so try_send never fails here
+                                            let _ = tx.try_send(p);
+                                        }
+                                        rr_proposals_rx.push(ReceiverStream::new(rx));
+                                    }
+                                    fut = Box::pin(run_primary(e, self.shared.clone()));
+                                }
+                                ReplicaState::Recovering => {
+                                    // Should not happen — nodes always start as Promised and recovery
+                                    // happens via the leader sync process, not a separate pre-startup phase
+                                    eprintln!("WARNING: Unexpected Recovering state in main loop");
+                                    fut = Box::pin(run_idle(self.shared.clone()));
+                                }
+                            }
+                            fut_done = false;
                         }
-                        if let Err(err) = s.core.propose() {
-                            timed_print!("error proposing: {err:?}");
-                        }
-                        let (log_epoch, log_len) = s.core.log_status();
-                        let clock = s.core.clock();
-                        for gid in ack_dests.0.drain(..) {
-                            s.ack_tx[&gid].send((log_epoch, log_len, clock))?;
+
+                        // handle the buffered batch of proposals
+                        if !pending_proposals.is_empty() {
+                            for (msg_id, msg, dest) in pending_proposals.drain(..) {
+                                ack_dests.merge(&dest);
+                                // Clone msg/dest before moving into add_proposal so we can
+                                // preserve them in overflow_proposals on NotLeader failure.
+                                let msg_copy = msg.clone();
+                                let dest_copy = dest.clone();
+                                match s.core.add_proposal(msg_id, msg, dest) {
+                                    Ok(_) => (),
+                                    Err(primcast_core::Error::NotLeader { .. }) => {
+                                        // Leadership changed while proposal was in flight.
+                                        // Save it so it can be re-injected when this replica
+                                        // (or another) next becomes Primary.
+                                        timed_print!("proposal {msg_id} rejected (not leader), buffering for retry");
+                                        overflow_proposals.push((msg_id, msg_copy, dest_copy));
+                                    }
+                                    Err(primcast_core::Error::IdAlreadyUsed) => {
+                                        // Already committed by a previous leader; delivery will arrive.
+                                    }
+                                    Err(err) => {
+                                        timed_print!("error queuing proposal {msg_id}: {err:?}");
+                                    },
+                                }
+                            }
+                            if let Err(err) = s.core.propose() {
+                                timed_print!("error proposing: {err:?}");
+                            }
+                            let (log_epoch, log_len) = s.core.log_status();
+                            let clock = s.core.clock();
+                            for gid in ack_dests.0.drain(..) {
+                                s.ack_tx[&gid].send((log_epoch, log_len, clock))?;
+                            }
                         }
                     }
                     _ = &mut shutdown => break 'main,
@@ -479,6 +594,75 @@ impl PrimcastReplica {
 
         Ok(())
     }
+}
+
+/// Find messages that co-destination groups have timestamped but this group
+/// never proposed (their proposal was lost when the previous leader died) and
+/// re-propose them here.
+///
+/// Only the primary can propose. The payload is not kept in the pending set, so
+/// it is fetched by msg_id from one of the other destination groups, which do
+/// have the message in their logs.
+async fn repair_missing_proposals(cfg: &config::Config, s: &Arc<RwLock<Shared>>) -> Result<(), Error> {
+    let self_gid;
+    let self_pid;
+    let proposal_tx;
+    let mut missing;
+    {
+        let sr = s.read(crate::loc!()).await;
+        let (_, state) = sr.core.state();
+        if state != ReplicaState::Primary {
+            return Ok(());
+        }
+        self_gid = sr.core.gid;
+        self_pid = sr.core.pid;
+        proposal_tx = sr.proposal_tx.clone();
+        missing = sr.core.missing_local_ts_older_than(MISSING_PROPOSAL_AGE);
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.truncate(MISSING_PROPOSAL_BATCH);
+    timed_print!(
+        "repairing {} msg(s) known to other groups but never proposed here",
+        missing.len()
+    );
+
+    // group the msg_ids by a co-destination group that can serve the payload
+    let mut by_group: HashMap<Gid, Vec<MsgId>> = HashMap::default();
+    let mut dests: HashMap<MsgId, GidSet> = HashMap::default();
+    for (msg_id, dest) in missing {
+        let Some(src) = dest.iter().find(|g| **g != self_gid).copied() else {
+            // local-only msg can't be known through a remote ts
+            continue;
+        };
+        by_group.entry(src).or_default().push(msg_id);
+        dests.insert(msg_id, dest);
+    }
+
+    for (src_gid, ids) in by_group {
+        let Some(peers) = cfg.peers(src_gid) else { continue };
+        for peer in peers {
+            match multi_group_recovery::request_payloads(src_gid, peer.pid, &ids, self_gid, self_pid, cfg).await {
+                Ok((payloads, _missing)) => {
+                    for (msg_id, msg) in payloads {
+                        let Some(dest) = dests.get(&msg_id) else { continue };
+                        // goes through the normal proposal path; a msg that did
+                        // make it into the log is rejected there as IdAlreadyUsed
+                        if proposal_tx.send((msg_id, msg, dest.clone())).await.is_err() {
+                            return Err(Error::ReplicaShutdown);
+                        }
+                    }
+                    break;
+                }
+                Err(err) => {
+                    timed_print!("error fetching payloads from {src_gid:?}:{:?}: {err:?}", peer.pid);
+                    continue;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Replica is waiting for a connection from the leader.
@@ -503,7 +687,7 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     let self_pid;
     let new_epoch;
     {
-        let mut s = s.write().await;
+        let mut s = s.write(crate::loc!()).await;
         cfg = s.core.config.clone();
         self_pid = s.core.pid;
         self_gid = s.core.gid;
@@ -537,7 +721,7 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     while let Some(join_result) = promise_reqs.next().await {
         match join_result {
             Ok(res) => {
-                let mut s = s.write().await;
+                let mut s = s.write(crate::loc!()).await;
                 match res {
                     Ok((pid, log_epoch, log_len, clock)) => {
                         if let Some(quorum_promise) = s.core.add_promise(new_epoch, pid, clock, log_epoch, log_len)? {
@@ -565,7 +749,7 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     let self_gid;
     let self_pid;
     {
-        let mut s = s.write().await;
+        let mut s = s.write(crate::loc!()).await;
         cfg = s.core.config.clone();
         self_pid = s.core.pid;
         self_gid = s.core.gid;
@@ -622,7 +806,7 @@ async fn run_candidate(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     }
 
     {
-        let s = s.read().await;
+        let s = s.read(crate::loc!()).await;
         timed_print!("candidate accepts received: {:?}", s.core.accepts_len());
     }
     Ok(())
@@ -636,7 +820,7 @@ async fn run_primary(e: Epoch, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
     let self_gid;
     let self_pid;
     {
-        let s = s.read().await;
+        let s = s.read(crate::loc!()).await;
         cfg = s.core.config.clone();
         self_pid = s.core.pid;
         self_gid = s.core.gid;
@@ -678,7 +862,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     let self_gid;
     let self_pid;
     {
-        let s = s.read().await;
+        let s = s.read(crate::loc!()).await;
         cfg = s.core.config.clone();
         self_pid = s.core.pid;
         self_gid = s.core.gid;
@@ -688,7 +872,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
     let (mut conn_tx, mut conn_rx) = conn.split();
 
     // send ack back to primary
-    let mut ack_rx = s.read().await.ack_rx[&self_gid].clone();
+    let mut ack_rx = s.read(crate::loc!()).await.ack_rx[&self_gid].clone();
     let (leader_tx, mut leader_rx) = tokio::sync::mpsc::unbounded_channel();
     let send_acks_task = {
         async move {
@@ -768,7 +952,7 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
 
         // process msg batch
         {
-            let mut s = s.write().await;
+            let mut s = s.write(crate::loc!()).await;
             for msg in msgs.drain(..) {
                 match msg {
                     Ok(Message::LogAppend {
@@ -809,25 +993,48 @@ async fn run_follower(conn: Conn, e: Epoch, s: Arc<RwLock<Shared>>) -> Result<()
                         // enabled, offload multi-dest payloads to co-dest groups;
                         // otherwise use the single-group path. Both have identical
                         // apply semantics, so this is a drop-in swap.
-                        if cfg.multi_group_recovery {
+                        // A failed recovery round must NOT end the follower
+                        // session: dropping run_follower closes the connection
+                        // the primary is waiting on, and the primary just
+                        // reconnects and asks for the same range again — a
+                        // livelock in which the follower never catches up and
+                        // its acks (and with them the group's safe prefix and
+                        // every other group's remote learner) freeze. Report and
+                        // let the primary re-drive from our acked state below.
+                        let recovery = if cfg.multi_group_recovery {
                             let planner = multi_group_recovery::CoDestinationPlanner;
                             multi_group_recovery::run_multi_group_recovery(
                                 from_idx, to_idx, e, &cfg, self_gid, self_pid,
                                 &planner, &s_arc,
-                            ).await?;
+                            ).await
                         } else {
                             recovery::run_follower_collaborative_recovery(
                                 from_idx, to_idx, e, &cfg, self_gid, self_pid,
                                 &s_arc,
-                            ).await?;
+                            ).await
+                        };
+                        if let Err(err) = recovery {
+                            timed_print!(
+                                "collaborative recovery [{from_idx}, {to_idx}) failed: {err:?} \
+                                 (staying follower, primary will re-drive)"
+                            );
                         }
 
-                        // Send ack with updated log status
+                        // Send ack with updated log status, and re-signal every
+                        // ack_tx watcher with the post-recovery log status. Without
+                        // this, remote_log_send tasks serving other dest groups the
+                        // entries we just recovered stay parked on the stale
+                        // pre-recovery watch value forever (recovered entries never
+                        // otherwise trigger a bump, since they bypass the normal
+                        // per-batch tail below via `continue 'recv`).
                         {
-                            let shared = s_arc.read().await;
+                            let shared = s_arc.read(crate::loc!()).await;
                             let (log_epoch, log_len) = shared.core.log_status();
                             let clock = shared.core.clock();
                             leader_tx.send(Message::Ack { log_epoch, log_len, clock }).unwrap();
+                            for tx in shared.ack_tx.values() {
+                                tx.send((log_epoch, log_len, clock)).ok();
+                            }
                         }
                         continue 'recv;
                     }
@@ -874,7 +1081,7 @@ async fn acceptor_task(listener: tokio::net::TcpListener, s: Arc<RwLock<Shared>>
     let self_pid;
     let mut handles = FuturesUnordered::new();
     {
-        let s = s.read().await;
+        let s = s.read(crate::loc!()).await;
         self_gid = s.core.gid;
         self_pid = s.core.pid;
     }
@@ -918,7 +1125,7 @@ async fn handle_connection(
         Message::NewEpoch { epoch } => {
             // Incoming connection from the candidate of `epoch`
             timed_print!("new epoch request from {:?}:{:?} =  {:?}", conn.gid(), conn.pid(), epoch);
-            let res = s.write().await.core.new_epoch_proposal(epoch);
+            let res = s.write(crate::loc!()).await.core.new_epoch_proposal(epoch);
             match res {
                 Ok((log_epoch, log_len, clock)) => {
                     timed_print!("===============promised epoch: {:?}============", epoch);
@@ -939,13 +1146,13 @@ async fn handle_connection(
         }
         Message::StartEpochCheck { epoch, log_epochs } => {
             // Incoming connection from the primary of `epoch`
-            let res = s.write().await.core.start_epoch_check(epoch, log_epochs);
+            let res = s.write(crate::loc!()).await.core.start_epoch_check(epoch, log_epochs);
             match res {
                 Ok((log_epoch, log_len)) => {
                     timed_print!("=== Starting Epoch Check and sending Follow {}, {} ===", log_epoch, log_len);
                     conn.send(Message::Following { log_epoch, log_len }).await?;
                     {
-                        let s = s.read().await;
+                        let s = s.read(crate::loc!()).await;
                         let ev_tx = s.ev_tx.clone();
                         ev_tx
                             .send(Event::Follow(conn, epoch))
@@ -961,7 +1168,7 @@ async fn handle_connection(
         }
         Message::ProposalStart => {
             // Incoming proposals from a process that thinks we're the primary
-            let (epoch, state) = s.read().await.core.state();
+            let (epoch, state) = s.read(crate::loc!()).await.core.state();
             match state {
                 ReplicaState::Primary | ReplicaState::Candidate => {
                     conn.send(Message::ProposalStart).await?;
@@ -973,7 +1180,7 @@ async fn handle_connection(
             }
             // forward proposals to main loop
             timed_print!("receiving proposals from {:?}:{:?}", conn.gid(), conn.pid());
-            let ev_tx = s.read().await.ev_tx.clone();
+            let ev_tx = s.read(crate::loc!()).await.ev_tx.clone();
             let (tx, rx) = mpsc::channel(PROPOSAL_QUEUE);
             ev_tx.send(Event::ProposalIn(rx))?;
             let mut msgs = vec![];
@@ -1000,7 +1207,7 @@ async fn handle_connection(
         } => {
             // Respond with our status
             let (current_epoch, total_log_len, our_log_epochs, leader_pid) = {
-                let shared = s.read().await;
+                let shared = s.read(crate::loc!()).await;
                 let (_log_epoch, log_len) = shared.core.log_status();
                 let (epoch, _state) = shared.core.state();
                 let log_epochs = shared.core.log_epochs().clone();
@@ -1049,7 +1256,7 @@ async fn handle_connection(
         Message::RecoverySkeletonRequest { from_idx, to_idx } => {
             const SKELETON_BATCH_SIZE: usize = 256;
             let skeletons = {
-                let shared = s.read().await;
+                let shared = s.read(crate::loc!()).await;
                 shared.core.log_skeleton_range(from_idx, to_idx)
             };
             timed_print!("skeleton request [{}, {}) -> {} entries", from_idx, to_idx, skeletons.len());
@@ -1067,7 +1274,7 @@ async fn handle_connection(
         // Multi-group recovery: serve payloads of (multi-dest) messages by msg_id.
         Message::CrossGroupPayloadRequest { gid: _req_gid, msg_ids } => {
             let (payloads, missing) = {
-                let shared = s.read().await;
+                let shared = s.read(crate::loc!()).await;
                 shared.core.payloads_for_msg_ids(&msg_ids)
             };
             timed_print!("cross-group payload request: {} found, {} missing", payloads.len(), missing.len());
@@ -1089,7 +1296,7 @@ async fn get_promise(
     let self_gid;
     let self_pid;
     {
-        let s = s.read().await;
+        let s = s.read(crate::loc!()).await;
         self_gid = s.core.gid;
         self_pid = s.core.pid;
     }
@@ -1118,23 +1325,36 @@ async fn deliver_task(
     delivery_tx: mpsc::Sender<(Clock, MsgId, Bytes, GidSet)>,
     s: Arc<RwLock<Shared>>,
 ) -> Result<(), Error> {
-    let mut update_rx = s.read().await.update_rx.clone();
+    let mut update_rx = s.read(crate::loc!()).await.update_rx.clone();
     let mut deliveries = vec![];
     let mut last_delivery = (0, 0);
     // sleep(Duration::from_millis(15000)).await; // wait for initial state
     loop {
-        update_rx.changed().await?;
-        let mut s = s.write().await;
-        s.core.update();
-        while let Some(d) = s.core.next_delivery() {
-            let final_ts = d.final_ts.unwrap();
-            assert!(last_delivery < (final_ts, d.msg_id)); // sanity check!
-            last_delivery = (final_ts, d.msg_id);
-            deliveries.push((final_ts, d.msg_id, d.msg.clone(), d.dest.clone()));
-        }
-        drop(s); // must not await with Shared locked
+        // Draining every available delivery under one acquisition makes this the
+        // biggest single holder of the shared lock under load (each delivery does
+        // a persistence write for the final ts). Cap the batch so proposals,
+        // appends and acks get the lock in between; if we stopped at the cap
+        // there is more work, so don't wait for the next update signal.
+        let mut more = false;
+        {
+            let mut s = s.write(crate::loc!()).await;
+            s.core.update();
+            while let Some(d) = s.core.next_delivery() {
+                let final_ts = d.final_ts.unwrap();
+                assert!(last_delivery < (final_ts, d.msg_id)); // sanity check!
+                last_delivery = (final_ts, d.msg_id);
+                deliveries.push((final_ts, d.msg_id, d.msg.clone(), d.dest.clone()));
+                if deliveries.len() >= BATCH_SIZE_YIELD {
+                    more = true;
+                    break;
+                }
+            }
+        } // must not await with Shared locked
         for d in deliveries.drain(..) {
             delivery_tx.send(d).await?;
+        }
+        if !more {
+            update_rx.changed().await?;
         }
     }
 }
@@ -1146,7 +1366,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
     let self_pid;
     let sync_log_epoch;
     {
-        let s = s.read().await;
+        let s = s.read(crate::loc!()).await;
         self_gid = s.core.gid;
         self_pid = s.core.pid;
         sync_log_epoch = s.core.log_status().0;
@@ -1159,7 +1379,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
         let promised_epoch;
         let log_epochs;
         {
-            let s = s.read().await;
+            let s = s.read(crate::loc!()).await;
             (promised_epoch, _) = s.core.state();
             if promised_epoch != e {
                 timed_print!("The promised epoch is different from the current epoch");
@@ -1177,7 +1397,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
     let (mut follower_log_epoch, mut follower_log_len) = match conn.recv().await? {
         NewEpoch { epoch: higher_epoch } => {
             timed_print!("follower changed to new epoch {:?}", higher_epoch);
-            s.write().await.core.new_epoch_proposal(higher_epoch)?;
+            s.write(crate::loc!()).await.core.new_epoch_proposal(higher_epoch)?;
             return Ok(());
         }
         Following { log_epoch, log_len } => {
@@ -1187,14 +1407,14 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
         m => panic!("unexpected msg {:?}", m),
     };
     // send log entries as they become available
-    let mut ack_rx = s.read().await.ack_rx[&self_gid].clone();
+    let mut ack_rx = s.read(crate::loc!()).await.ack_rx[&self_gid].clone();
     let mut to_send = vec![];
     let mut last_clock_sent = 0;
     let s_arc = s.clone(); // Keep original Arc for later write access
     loop {
         let mut ack_dests = GidSet::new();
         {
-            let s_guard = s.read().await;
+            let s_guard = s.read(crate::loc!()).await;
             let (log_epoch, log_len) = s_guard.core.log_status();
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
             // timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
@@ -1307,7 +1527,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
                         }
                         Ack { log_epoch, log_len, clock } => {
                             // timed_print!("ack from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), log_epoch);
-                            let mut s_write = s_arc.write().await;
+                            let mut s_write = s_arc.write(crate::loc!()).await;
                             let old_clock = s_write.core.clock();
                             s_write.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
                             if clock > old_clock {
@@ -1323,7 +1543,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
                             timed_print!("log append from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), entry_epoch);
                             {
                                 ack_dests.merge(&entry.dest);
-                                let mut s_write = s_arc.write().await;
+                                let mut s_write = s_arc.write(crate::loc!()).await;
                                 s_write.core.append(e, idx, entry)?;
                             }
                         }
@@ -1333,7 +1553,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
             }
         }
         {
-            let s_final = s_arc.write().await;
+            let s_final = s_arc.write(crate::loc!()).await;
             let (epoch, len) = s_final.core.log_status();
             let clock = s_final.core.clock();
             for gid in ack_dests.0.drain(..) {
@@ -1346,7 +1566,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
     let promised_epoch;
     let clock;
     {
-        let s_read = s_arc.read().await;
+        let s_read = s_arc.read(crate::loc!()).await;
         (promised_epoch, _) = s_read.core.state();
         if promised_epoch != e {
             timed_print!("The promised epoch is different from the current epoch second");
@@ -1373,7 +1593,7 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
         }
         Ack { log_epoch, .. } => {
             {
-                let mut s = s.write().await;
+                let mut s = s.write(crate::loc!()).await;
                 s.core.append_accept(peer.pid, log_epoch);
             }
         }
@@ -1381,6 +1601,33 @@ async fn sync_with(peer: &PeerConfig, e: Epoch, s: &Arc<RwLock<Shared>>) -> Resu
         m => panic!("unexpected message: {:?}", m)
     }
 
+    Ok(())
+}
+
+/// Feed an ack received from a follower into the core state.
+///
+/// Every ack from a follower MUST go through here: the primary learns follower
+/// progress *only* over this connection (`acks_fetch` runs on followers, not on
+/// the primary), so an ack that is consumed for local bookkeeping without
+/// reaching `core.add_ack` leaves that follower stuck at 0 acked entries. With
+/// two followers stuck at 0 the quorum never advances, `safe_len` freezes and
+/// the group stops delivering — while its log keeps growing.
+async fn apply_follower_ack(
+    s: &Arc<RwLock<Shared>>,
+    self_gid: Gid,
+    pid: Pid,
+    log_epoch: Epoch,
+    log_len: u64,
+    clock: Clock,
+) -> Result<(), Error> {
+    let mut s = s.write(crate::loc!()).await;
+    let old_clock = s.core.clock();
+    s.core.add_ack(pid, log_epoch, log_len, clock)?;
+    let new_clock = s.core.clock();
+    if clock > old_clock {
+        s.ack_tx[&self_gid].send_modify(|(_, _, c)| *c = new_clock);
+    }
+    s.update_tx.send(())?;
     Ok(())
 }
 
@@ -1394,7 +1641,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
     let self_pid;
     let sync_log_epoch;
     {
-        let s = s.read().await;
+        let s = s.read(crate::loc!()).await;
         self_gid = s.core.gid;
         self_pid = s.core.pid;
         sync_log_epoch = s.core.log_status().0;
@@ -1407,7 +1654,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
         let promised_epoch;
         let log_epochs;
         {
-            let s = s.read().await;
+            let s = s.read(crate::loc!()).await;
             (promised_epoch, _) = s.core.state();
             if promised_epoch != e {
                 return Ok(()); // replica accepted higher epoch
@@ -1423,7 +1670,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
 
     let (_, mut follower_log_len) = match conn.recv().await? {
         NewEpoch { epoch: higher_epoch } => {
-            s.write().await.core.new_epoch_proposal(higher_epoch)?;
+            s.write(crate::loc!()).await.core.new_epoch_proposal(higher_epoch)?;
             return Ok(());
         }
         Following { log_epoch, log_len } => {
@@ -1434,14 +1681,25 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
     };
 
     // send log entries as they become available
-    let mut ack_rx = s.read().await.ack_rx[&self_gid].clone();
+    let mut ack_rx = s.read(crate::loc!()).await.ack_rx[&self_gid].clone();
     let mut to_send = vec![];
     let mut last_clock_sent = 0;
+    // Tracks whether the follower has been sent an Ack for this sync session yet.
+    // Needed because the clock-bump condition below only fires on *growth*: in an
+    // idle cluster (no proposals ever made) clock never advances past 0, so a
+    // freshly-Promised follower would never receive the Ack it needs to complete
+    // its quorum and transition to Follower — stuck in Promised forever.
+    let mut initial_ack_sent = false;
+    // Collaborative recovery is a shortcut for large gaps, not a requirement. If
+    // a round comes back without the follower having advanced, stop using it for
+    // this session and stream entries the normal way — otherwise the primary can
+    // re-trigger recovery forever while the follower never catches up.
+    let mut use_collab_recovery = true;
     loop {
         {
-            let s = s.read().await;
-            let (promised_epoch, _) = s.core.state();
-            let (log_epoch, log_len) = s.core.log_status();
+            let sg = s.read(crate::loc!()).await;
+            let (promised_epoch, _) = sg.core.state();
+            let (log_epoch, log_len) = sg.core.log_status();
             if promised_epoch != e || log_epoch != sync_log_epoch {
                 // replica changed epochs, stop task
                 timed_print!("follower changed epoch to {:?} != {:?} or log epoch to {:?} != {:?}", promised_epoch, e, log_epoch, sync_log_epoch);
@@ -1450,10 +1708,10 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             
             // Check for large gap and trigger collaborative recovery
             let gap = log_len - follower_log_len;
-            if gap > BATCH_SIZE_YIELD as u64 * 10 {
+            if gap > BATCH_SIZE_YIELD as u64 * 10 && use_collab_recovery {
                 timed_print!("large gap ({}) for follower {:?}:{:?}, triggering collaborative recovery", 
                     gap, conn.gid(), conn.pid());
-                drop(s); // release read lock before sending
+                drop(sg); // release read lock before sending
 
                 conn.send(Message::CollaborativeRecoveryStart {
                     from_idx: follower_log_len,
@@ -1463,9 +1721,50 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                 // Wait for follower to complete collaborative recovery
                 loop {
                     match conn.recv().await? {
-                        Message::Ack { log_epoch: _, log_len: ack_ll, clock: _ } => {
+                        Message::Ack { log_epoch, log_len: ack_ll, clock } => {
                             timed_print!("follower completed collaborative recovery, log_len = {}", ack_ll);
+                            if ack_ll <= follower_log_len {
+                                timed_print!(
+                                    "collaborative recovery made no progress for {:?}:{:?} \
+                                     (still at {ack_ll}), falling back to streaming",
+                                    conn.gid(),
+                                    conn.pid()
+                                );
+                                use_collab_recovery = false;
+                            }
+                            // the recovered entries are acked entries: count them
+                            // towards the quorum before moving on
+                            apply_follower_ack(&s, self_gid, conn.pid(), log_epoch, ack_ll, clock).await?;
                             follower_log_len = ack_ll;
+                            // Mirror the ack back: while the gap keeps re-opening
+                            // this branch replaces the normal send path entirely,
+                            // so it is the only place the follower can learn that
+                            // the primary holds these entries. Clock stays at the
+                            // ts of the last entry the follower now has.
+                            let (ack_epoch, ack_len, ack_clock) = {
+                                let sg = s.read(crate::loc!()).await;
+                                let (le, ll) = sg.core.log_status();
+                                // the follower may report more entries than we
+                                // hold; only index what we actually have
+                                let last_common = std::cmp::min(ack_ll, ll);
+                                let ts = if last_common > 0 {
+                                    sg.core
+                                        .log_entry(last_common - 1)
+                                        .map(|(_, e)| e.local_ts)
+                                        .unwrap_or(last_clock_sent)
+                                } else {
+                                    last_clock_sent
+                                };
+                                (le, ll, ts)
+                            };
+                            last_clock_sent = std::cmp::max(last_clock_sent, ack_clock);
+                            initial_ack_sent = true;
+                            conn.send(Ack {
+                                log_epoch: ack_epoch,
+                                log_len: ack_len,
+                                clock: last_clock_sent,
+                            })
+                            .await?;
                             break;
                         }
                         Message::NewEpoch { epoch } => {
@@ -1488,7 +1787,7 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             
             // gather entries to be sent (up to BATCH_SIZE_YIELD)
             while follower_log_len < log_len {
-                let (epoch, entry) = s.core.log_entry(follower_log_len).unwrap();
+                let (epoch, entry) = sg.core.log_entry(follower_log_len).unwrap();
 
                 // timed_print!("follower log status: {}, my log: {}", follower_log_len, log_len);
                 to_send.push(LogAppend {
@@ -1506,8 +1805,26 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
             // from a primary *must be sent in ts order*. A follower should see
             // its primary clock update ONLY IF it has received all log entries
             // with smaller clock value.
-            if follower_log_len == log_len && s.core.clock() > last_clock_sent {
-                last_clock_sent = s.core.clock();
+            // Always send at least one Ack once caught up (`!initial_ack_sent`),
+            // even without clock growth, so quorum-completion isn't starved by
+            // an idle cluster (see comment on `initial_ack_sent` above).
+            if follower_log_len == log_len && (sg.core.clock() > last_clock_sent || !initial_ack_sent) {
+                last_clock_sent = sg.core.clock();
+                initial_ack_sent = true;
+                to_send.push(Ack {
+                    log_epoch,
+                    log_len,
+                    clock: last_clock_sent,
+                });
+            } else if !to_send.is_empty() {
+                // Still behind: tell the follower how long our log is anyway, but
+                // with the ts of the last entry we just fed it — never our current
+                // clock, which would let it deliver ahead of entries it lacks.
+                // Without this ack the follower's entry for the primary never
+                // advances, so its own safe_len freezes and it stops delivering
+                // (and stops serving fresh timestamps to the other groups) for as
+                // long as the primary is streaming a backlog.
+                initial_ack_sent = true;
                 to_send.push(Ack {
                     log_epoch,
                     log_len,
@@ -1522,6 +1839,26 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
         }
         conn.flush().await?;
         tokio::task::yield_now().await;
+
+        // Drain acks that have already arrived, without blocking on the socket.
+        // While the log keeps growing the `continue` below short-circuits back
+        // to sending, so the 'wait select (the only other place acks are read)
+        // may never be reached and the quorum would starve under sustained load.
+        while let Some(msg) = conn.next().now_or_never().flatten() {
+            match msg? {
+                NewEpoch { epoch } => {
+                    if epoch > sync_log_epoch {
+                        timed_print!("follower changed to new epoch {:?}", epoch);
+                        return Ok(());
+                    }
+                }
+                Ack { log_epoch, log_len, clock } => {
+                    apply_follower_ack(&s, self_gid, conn.pid(), log_epoch, log_len, clock).await?;
+                    follower_log_len = std::cmp::max(follower_log_len, log_len);
+                }
+                m => panic!("unexpected message: {:?}", m),
+            }
+        }
 
         // are more entries already available? then send them
         let (new_log_epoch, new_log_len, new_clock) = *ack_rx.borrow_and_update();
@@ -1560,19 +1897,13 @@ async fn sync_follower(peer: PeerConfig, e: Epoch, s: Arc<RwLock<Shared>>) -> Re
                         }
                         Ack { log_epoch, log_len, clock } => {
                             // timed_print!("ack from follower {:?}:{:?} for log epoch {:?}", conn.gid(), conn.pid(), log_epoch);
+                            apply_follower_ack(&s, self_gid, conn.pid(), log_epoch, log_len, clock).await?;
                             // Check if this is from collaborative recovery (log_len changed significantly)
                             if log_len > follower_log_len {
                                 timed_print!("follower updated to log_len = {} from collaborative recovery", log_len);
                                 follower_log_len = log_len;
                                 break 'wait; // break wait loop and re-check gap
                             }
-                            let mut s = s.write().await;
-                            let old_clock = s.core.clock();
-                            s.core.add_ack(conn.pid(), log_epoch, log_len, clock)?;
-                            if clock > old_clock {
-                                s.ack_tx[&self_gid].send_modify(|(_, _, clock)| *clock = s.core.clock());
-                            }
-                            s.update_tx.send(())?;
                         }
                         m => panic!("unexpected message: {:?}", m),
                     }
@@ -1590,7 +1921,7 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
     let epoch;
     let next_idx;
     {
-        let s = s.read().await;
+        let s = s.read(crate::loc!()).await;
         self_gid = s.core.gid;
         self_pid = s.core.pid;
         (epoch, next_idx) = s.core.remote_expected_entry(remote_gid);
@@ -1606,7 +1937,7 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
     let mut msgs = vec![];
     while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
         {
-            let mut s = s.write().await;
+            let mut s = s.write(crate::loc!()).await;
             let old_clock = s.core.clock();
             for msg in msgs.drain(..) {
                 match msg? {
@@ -1639,8 +1970,8 @@ async fn remote_log_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLoc
 
 /// Fetch acks from another replica in our group
 async fn acks_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
-    let self_gid = s.read().await.core.gid;
-    let self_pid = s.read().await.core.pid;
+    let self_gid = s.read(crate::loc!()).await.core.gid;
+    let self_pid = s.read(crate::loc!()).await.core.pid;
     timed_print!("fetching acks from {:?}:{:?}", self_gid, peer.pid);
 
     use Message::*;
@@ -1650,7 +1981,7 @@ async fn acks_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Erro
     let mut msgs = vec![];
     while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
         {
-            let mut s = s.write().await;
+            let mut s = s.write(crate::loc!()).await;
             let old_clock = s.core.clock();
             for msg in msgs.drain(..) {
                 match msg? {
@@ -1676,8 +2007,8 @@ async fn acks_fetch(peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Erro
 
 /// Fetch remote acks from a replica in another group
 async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLock<Shared>>) -> Result<(), Error> {
-    let self_gid = s.read().await.core.gid;
-    let self_pid = s.read().await.core.pid;
+    let self_gid = s.read(crate::loc!()).await.core.gid;
+    let self_pid = s.read(crate::loc!()).await.core.pid;
     timed_print!("fetching remote acks from {:?}:{:?}", remote_gid, remote_peer.pid);
 
     use Message::*;
@@ -1687,7 +2018,7 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
     let mut msgs = vec![];
     while 0 < conn.next_ready_chunk(BATCH_SIZE_YIELD, &mut msgs).await {
         {
-            let mut s = s.write().await;
+            let mut s = s.write(crate::loc!()).await;
             let old_clock = s.core.clock();
             for msg in msgs.drain(..) {
                 match msg? {
@@ -1714,7 +2045,7 @@ async fn remote_acks_fetch(remote_gid: Gid, remote_peer: PeerConfig, s: Arc<RwLo
 /// Send acks to the incoming connection.
 /// If send_bump is false, don't send ack on "clock only" updates.
 async fn ack_send(mut conn: Conn, s: Arc<RwLock<Shared>>, send_bump: bool) -> Result<(), Error> {
-    let mut ack_rx = s.read().await.ack_rx[&conn.gid()].clone();
+    let mut ack_rx = s.read(crate::loc!()).await.ack_rx[&conn.gid()].clone();
     use Message::*;
     let mut last_ack = None;
     let mut last_clock = 0;
@@ -1751,7 +2082,7 @@ async fn recovery_send_range(
     while idx < to_idx {
         let mut entries = Vec::new();
         {
-            let shared = s.read().await;
+            let shared = s.read(crate::loc!()).await;
             let batch_end = std::cmp::min(idx + batch_size as u64, to_idx);
             while idx < batch_end {
                 match shared.core.log_entry(idx) {
@@ -1795,16 +2126,7 @@ async fn remote_log_send(
     s: Arc<RwLock<Shared>>,
 ) -> Result<(), Error> {
     timed_print!("sending remote logs for {dest:?} starting at {next_idx:?}");
-    // DEBUG: distinguish "blocked acquiring the RwLock" (true lock deadlock)
-    // from "parked on the watch channel" (ack_tx[dest] never re-signaled —
-    // suspected liveness stall, see project_leader_fail_stall memory).
-    let mut ack_rx = match tokio::time::timeout(Duration::from_secs(5), s.read()).await {
-        Ok(guard) => guard.ack_rx[&dest].clone(),
-        Err(_) => {
-            timed_print!("[STALL?] remote_log_send({dest:?}): blocked >5s acquiring read lock on Shared");
-            s.read().await.ack_rx[&dest].clone()
-        }
-    };
+    let mut ack_rx = s.read(crate::loc!()).await.ack_rx[&dest].clone();
     use Message::*;
     let mut to_send = vec![];
     loop {
@@ -1816,8 +2138,8 @@ async fn remote_log_send(
         }
         if log_len <= next_idx {
             // DEBUG: log_len/next_idx frozen here + repeated [STALL?] prints below
-            // confirms the watch-channel liveness bug (ack_tx[dest] not bumped on
-            // Primary-transition / no PeriodicChecks heartbeat), not a lock deadlock.
+            // confirms the watch-channel liveness bug (ack_tx[dest] not bumped),
+            // not a lock deadlock.
             match tokio::time::timeout(Duration::from_secs(5), ack_rx.changed()).await {
                 Ok(res) => res?,
                 Err(_) => {
@@ -1831,7 +2153,7 @@ async fn remote_log_send(
         }
 
         {
-            let sr = s.read().await;
+            let sr = s.read(crate::loc!()).await;
             let (log_epoch, log_len) = sr.core.log_status();
             // we need to double check the epoch, as it may have changed in the meanwhile
             if log_epoch != epoch {
@@ -1905,9 +2227,9 @@ async fn proposal_sender(
         // if we're the leader of the group, send directly to main loop
         if (conn.gid(), conn.pid()) == from {
             timed_print!("forwarding proposals to itself");
-            let tx = s.read().await.proposal_tx.clone();
+            let tx = s.read(crate::loc!()).await.proposal_tx.clone();
             loop {
-                let (_, state) = s.read().await.core.state();
+                let (_, state) = s.read(crate::loc!()).await.core.state();
                 if state != ReplicaState::Primary && state != ReplicaState::Candidate {
                     // not group leader anymore, try connect to leader
                     continue 'connect;

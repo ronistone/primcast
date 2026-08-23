@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::sync::RwLock;
+use crate::util::RwLock;
 
 use bytes::Bytes;
 use primcast_core::config::Config;
@@ -125,12 +125,17 @@ pub async fn run_multi_group_recovery(
             "group not found",
         ))
     })?;
-    let own_peers: Vec<Pid> = group
+    // Ask the epoch owner (the primary that asked us to recover) first: it is the
+    // one replica guaranteed to hold [from_idx, to_idx). The other follower may
+    // itself be behind, and a short skeleton aborts the whole recovery.
+    let leader = epoch.owner();
+    let mut own_peers: Vec<Pid> = group
         .peers
         .iter()
         .filter(|p| p.pid != self_pid)
         .map(|p| p.pid)
         .collect();
+    own_peers.sort_by_key(|p| *p != leader);
 
     if own_peers.is_empty() {
         return Ok(());
@@ -276,7 +281,7 @@ pub async fn run_multi_group_recovery(
 
     eprintln!("[MGRecovery] applying {} entries", all_entries.len());
     {
-        let mut shared = s.write().await;
+        let mut shared = s.write(crate::loc!()).await;
         for (idx, entry_epoch, entry) in all_entries {
             let (actual_epoch, _) = shared.core.log_status();
             if entry_epoch > actual_epoch {
@@ -318,7 +323,24 @@ async fn fetch_skeleton(
             }
         };
         match collect_skeleton(conn).await {
-            Ok(entries) => return Ok(entries),
+            Ok(entries) => {
+                // A peer that is itself behind answers with a short skeleton;
+                // accepting it aborts the recovery ("incomplete skeleton"), so
+                // treat it as a miss and ask the next peer instead.
+                if entries.len() as u64 == to_idx - from_idx {
+                    return Ok(entries);
+                }
+                eprintln!(
+                    "[MGRecovery] {:?} served {} of {} skeleton entries, trying next peer",
+                    pid,
+                    entries.len(),
+                    to_idx - from_idx
+                );
+                last_err = Some(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "incomplete skeleton",
+                )));
+            }
             Err(e) => last_err = Some(e),
         }
     }
@@ -430,7 +452,7 @@ async fn fetch_payloads_with_own_peers(
 }
 
 /// One request/response round to fetch payloads by msg_id from (gid, pid).
-async fn request_payloads(
+pub(crate) async fn request_payloads(
     target_gid: Gid,
     target_pid: Pid,
     ids: &[MsgId],

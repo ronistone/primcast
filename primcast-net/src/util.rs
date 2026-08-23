@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::task::Poll;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures::prelude::*;
 use futures::ready;
@@ -160,31 +161,84 @@ impl Shutdown {
     }
 }
 
+// DEBUG: correlates AbortHandle::abort()/Drop (the *request* to cancel) with
+// whether the spawned future's own Drop glue (the *actual* teardown, which
+// releases any guard/permit it's holding) ever runs. tokio::task::JoinHandle::
+// abort() only schedules a final poll to tear the task down; it is not
+// synchronous. If we see "abort requested" for an id but never see the
+// matching "future dropped", the final poll-and-drop never happened —
+// confirming a missed-wakeup/stuck-executor rather than a leaked guard in
+// application code. See project_leader_fail_stall investigation.
+static ABORT_HANDLE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pin_project! {
+    struct DropCanary<F> {
+        #[pin]
+        inner: F,
+        id: u64,
+        caller: &'static std::panic::Location<'static>,
+    }
+
+    impl<F> PinnedDrop for DropCanary<F> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            primcast_core::timed_print!(
+                "[ABORTHANDLE] task {} (spawned @ {}) future DROPPED (final teardown ran)",
+                this.id, this.caller
+            );
+        }
+    }
+}
+
+impl<F: Future> Future for DropCanary<F> {
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        self.project().inner.poll(cx)
+    }
+}
+
 /// Wrapper over async task JoinHandle that aborts the task if it is dropped.
 /// Can also be awaited (as a JoinHandle) to wait for task completion and
 /// result. Note that just dropping the AbortHandle or calling abort() does not
 /// mean the task is finished immediately.
-pub struct AbortHandle<T>(tokio::task::JoinHandle<T>);
+pub struct AbortHandle<T> {
+    jh: tokio::task::JoinHandle<T>,
+    id: u64,
+    caller: &'static std::panic::Location<'static>,
+}
 
 impl<T> AbortHandle<T> {
     /// wrap an existing join handle
+    #[track_caller]
     pub fn new(join_handle: tokio::task::JoinHandle<T>) -> Self {
-        Self(join_handle)
+        Self {
+            jh: join_handle,
+            id: ABORT_HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            caller: std::panic::Location::caller(),
+        }
     }
 
     /// tokio::spawn the future, returning its AbortHandle
+    #[track_caller]
     pub fn spawn<F>(future: F) -> Self
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let jh = tokio::spawn(future);
-        Self(jh)
+        let id = ABORT_HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let caller = std::panic::Location::caller();
+        primcast_core::timed_print!("[ABORTHANDLE] task {} spawned @ {}", id, caller);
+        let jh = tokio::spawn(DropCanary { inner: future, id, caller });
+        Self { jh, id, caller }
     }
 
     /// abort the task
     pub fn abort(&self) {
-        self.0.abort()
+        primcast_core::timed_print!(
+            "[ABORTHANDLE] task {} (spawned @ {}) abort() requested",
+            self.id, self.caller
+        );
+        self.jh.abort()
     }
 }
 
@@ -193,13 +247,17 @@ impl<T> Future for AbortHandle<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.0.poll_unpin(cx)
+        this.jh.poll_unpin(cx)
     }
 }
 
 impl<T> Drop for AbortHandle<T> {
     fn drop(&mut self) {
-        self.0.abort()
+        primcast_core::timed_print!(
+            "[ABORTHANDLE] task {} (spawned @ {}) AbortHandle dropped -> abort() requested",
+            self.id, self.caller
+        );
+        self.jh.abort()
     }
 }
 
@@ -259,21 +317,154 @@ where
         }
     }
 }
+/// Wrapper over tokio RwLock instrumented to track *who* holds/waits for the
+/// lock, so a stall can be attributed to a specific call site.
+///
+/// Every acquisition records `file:line` + a timestamp in a side table; the
+/// `[LOCKPROBE]` ticker dumps that table when the lock looks stuck.
+pub struct RwLock<T> {
+    inner: tokio::sync::RwLock<T>,
+    track: std::sync::Mutex<Track>,
+}
 
-/// Wrapper over tokio RwLock, instrumented with printing for debugging.
-pub struct RwLock<T>(tokio::sync::RwLock<T>);
-pub struct RwLockWriteGuard<'a, T>(u32, tokio::sync::RwLockWriteGuard<'a, T>);
-pub struct RwLockReadGuard<'a, T>(u32, tokio::sync::RwLockReadGuard<'a, T>);
+type TaskId = Option<tokio::task::Id>;
+
+#[derive(Default)]
+struct Track {
+    next_id: u64,
+    writer: Option<(u64, &'static str, Instant, TaskId)>,
+    readers: std::collections::HashMap<u64, (&'static str, Instant, TaskId)>,
+    waiting: std::collections::HashMap<u64, (&'static str, bool, Instant, TaskId, std::sync::Arc<WakeProbe>)>,
+    /// Last guard release seen: (loc, when). If the lock looks stuck with no
+    /// holder, this says when it was last actually free.
+    last_release: Option<(&'static str, Instant)>,
+    acquires: u64,
+    releases: u64,
+    /// Cumulative hold time and count per call site — who actually owns the
+    /// lock's time budget under load.
+    hold_stats: std::collections::HashMap<&'static str, (std::time::Duration, u64)>,
+}
+
+/// Counts how many times a pending lock-acquire future was woken, so a stall
+/// can be classified: `wakes=0` means the semaphore never handed the permit
+/// over (missing permits / never released), `wakes>0` with the future still
+/// pending means the wake happened but the task was not re-polled.
+#[derive(Default)]
+pub struct WakeProbe {
+    count: std::sync::atomic::AtomicU64,
+    polls: std::sync::atomic::AtomicU64,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl futures::task::ArcWake for WakeProbe {
+    fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+        arc_self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let w = arc_self.waker.lock().unwrap().clone();
+        if let Some(w) = w {
+            w.wake();
+        }
+    }
+}
+
+pin_project! {
+    /// Wraps a lock-acquire future: counts polls/wakes and removes the waiter
+    /// bookkeeping entry if the future is dropped before completing (a select!
+    /// branch losing the race), so the waiter list stays truthful.
+    struct TrackedAcquire<'a, F, T> {
+        #[pin]
+        inner: F,
+        lock: &'a RwLock<T>,
+        id: u64,
+        probe: std::sync::Arc<WakeProbe>,
+        done: bool,
+    }
+
+    impl<'a, F, T> PinnedDrop for TrackedAcquire<'a, F, T> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            if !*this.done {
+                this.lock.track.lock().unwrap().waiting.remove(this.id);
+            }
+        }
+    }
+}
+
+impl<'a, F: Future, T> Future for TrackedAcquire<'a, F, T> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<F::Output> {
+        let this = self.project();
+        this.probe.polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *this.probe.waker.lock().unwrap() = Some(cx.waker().clone());
+        let w = futures::task::waker_ref(this.probe);
+        let mut cx2 = std::task::Context::from_waker(&w);
+        let res = this.inner.poll(&mut cx2);
+        if res.is_ready() {
+            *this.done = true;
+        }
+        res
+    }
+}
+
+impl Track {
+    /// Does `task` already hold this lock? Acquiring again from the same task
+    /// deadlocks (tokio RwLock is neither reentrant nor reader-preferring: a
+    /// second `read()` queues behind any waiting writer).
+    fn held_by(&self, task: TaskId) -> Option<&'static str> {
+        if task.is_none() {
+            return None;
+        }
+        if let Some((_, loc, _, w)) = &self.writer {
+            if *w == task {
+                return Some(loc);
+            }
+        }
+        self.readers
+            .values()
+            .find(|(_, _, t)| *t == task)
+            .map(|(loc, _, _)| *loc)
+    }
+}
+
+pub struct RwLockWriteGuard<'a, T> {
+    id: u64,
+    lock: &'a RwLock<T>,
+    guard: tokio::sync::RwLockWriteGuard<'a, T>,
+}
+
+pub struct RwLockReadGuard<'a, T> {
+    id: u64,
+    lock: &'a RwLock<T>,
+    guard: tokio::sync::RwLockReadGuard<'a, T>,
+}
 
 impl<'a, T> Drop for RwLockReadGuard<'a, T> {
     fn drop(&mut self) {
-        println!("=> unlocking read {}", self.0);
+        let mut t = self.lock.track.lock().unwrap();
+        if let Some((loc, since, _)) = t.readers.remove(&self.id) {
+            let now = Instant::now();
+            t.releases += 1;
+            t.last_release = Some((loc, now));
+            let e = t.hold_stats.entry(loc).or_insert((std::time::Duration::ZERO, 0));
+            e.0 += now.duration_since(since);
+            e.1 += 1;
+        }
     }
 }
 
 impl<'a, T> Drop for RwLockWriteGuard<'a, T> {
     fn drop(&mut self) {
-        println!("=> unlocking write {}", self.0);
+        let mut t = self.lock.track.lock().unwrap();
+        if t.writer.map(|(id, _, _, _)| id) == Some(self.id) {
+            let (_, loc, since, _) = t.writer.unwrap();
+            let now = Instant::now();
+            t.writer = None;
+            t.releases += 1;
+            t.last_release = Some((loc, now));
+            let e = t.hold_stats.entry(loc).or_insert((std::time::Duration::ZERO, 0));
+            e.0 += now.duration_since(since);
+            e.1 += 1;
+        }
     }
 }
 
@@ -281,7 +472,7 @@ impl<'a, T> std::ops::Deref for RwLockReadGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.1.deref()
+        self.guard.deref()
     }
 }
 
@@ -289,36 +480,177 @@ impl<'a, T> std::ops::Deref for RwLockWriteGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.1.deref()
+        self.guard.deref()
     }
 }
 
 impl<'a, T> std::ops::DerefMut for RwLockWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.1.deref_mut()
+        self.guard.deref_mut()
     }
 }
 
 impl<T> RwLock<T> {
     pub fn new(inner: T) -> Self {
-        RwLock(tokio::sync::RwLock::new(inner))
+        RwLock {
+            inner: tokio::sync::RwLock::new(inner),
+            track: std::sync::Mutex::new(Track::default()),
+        }
     }
 
-    pub async fn write(&self, line: u32) -> RwLockWriteGuard<'_, T> {
-        println!("=> locking write {}", line);
-        let g = self.0.write().await;
-        println!("=> ok write {}", line);
-        RwLockWriteGuard(line, g)
+    fn begin_wait(&self, loc: &'static str, write: bool) -> (u64, std::sync::Arc<WakeProbe>) {
+        let task = tokio::task::try_id();
+        let mut t = self.track.lock().unwrap();
+        if let Some(held_at) = t.held_by(task) {
+            // Self-deadlock: this task is about to block on a lock it already
+            // holds. Report it instead of hanging silently.
+            eprintln!(
+                "[LOCKDEADLOCK] task {:?} acquiring {} ({}) while already holding it from {held_at}",
+                task,
+                loc,
+                if write { "write" } else { "read" },
+            );
+        }
+        t.next_id += 1;
+        let id = t.next_id;
+        let probe = std::sync::Arc::new(WakeProbe::default());
+        t.waiting.insert(id, (loc, write, Instant::now(), task, probe.clone()));
+        (id, probe)
     }
 
-    pub async fn read(&self, line: u32) -> RwLockReadGuard<'_, T> {
-        println!("=> locking read {}", line);
-        let g = self.0.read().await;
-        println!("=> ok read {}", line);
-        RwLockReadGuard(line, g)
+    pub async fn write(&self, loc: &'static str) -> RwLockWriteGuard<'_, T> {
+        let (id, probe) = self.begin_wait(loc, true);
+        let guard = TrackedAcquire {
+            inner: self.inner.write(),
+            lock: self,
+            id,
+            probe,
+            done: false,
+        }
+        .await;
+        {
+            let mut t = self.track.lock().unwrap();
+            t.waiting.remove(&id);
+            t.acquires += 1;
+            t.writer = Some((id, loc, Instant::now(), tokio::task::try_id()));
+        }
+        RwLockWriteGuard { id, lock: self, guard }
+    }
+
+    pub async fn read(&self, loc: &'static str) -> RwLockReadGuard<'_, T> {
+        let (id, probe) = self.begin_wait(loc, false);
+        let guard = TrackedAcquire {
+            inner: self.inner.read(),
+            lock: self,
+            id,
+            probe,
+            done: false,
+        }
+        .await;
+        {
+            let mut t = self.track.lock().unwrap();
+            t.waiting.remove(&id);
+            t.acquires += 1;
+            t.readers.insert(id, (loc, Instant::now(), tokio::task::try_id()));
+        }
+        RwLockReadGuard { id, lock: self, guard }
+    }
+
+    pub fn try_write(&self, loc: &'static str) -> Result<RwLockWriteGuard<'_, T>, tokio::sync::TryLockError> {
+        let guard = self.inner.try_write()?;
+        let mut t = self.track.lock().unwrap();
+        t.next_id += 1;
+        let id = t.next_id;
+        t.writer = Some((id, loc, Instant::now(), tokio::task::try_id()));
+        t.acquires += 1;
+        drop(t);
+        Ok(RwLockWriteGuard { id, lock: self, guard })
+    }
+
+    pub fn try_read(&self, loc: &'static str) -> Result<RwLockReadGuard<'_, T>, tokio::sync::TryLockError> {
+        let guard = self.inner.try_read()?;
+        let mut t = self.track.lock().unwrap();
+        t.next_id += 1;
+        let id = t.next_id;
+        t.readers.insert(id, (loc, Instant::now(), tokio::task::try_id()));
+        t.acquires += 1;
+        drop(t);
+        Ok(RwLockReadGuard { id, lock: self, guard })
+    }
+
+    /// Cumulative hold time per call site, biggest first: where the lock's time
+    /// actually goes under load (contention, not deadlock).
+    pub fn hold_report(&self, top: usize) -> String {
+        let t = self.track.lock().unwrap();
+        let mut v: Vec<_> = t.hold_stats.iter().collect();
+        v.sort_by_key(|(_, (d, _))| std::cmp::Reverse(*d));
+        let total: std::time::Duration = t.hold_stats.values().map(|(d, _)| *d).sum();
+        let mut out = format!("lock time total={:?}", total);
+        for (loc, (d, n)) in v.into_iter().take(top) {
+            out.push_str(&format!(
+                "\n    {loc} held {:?} over {n} acquires (avg {:?})",
+                d,
+                d.checked_div(*n as u32).unwrap_or_default()
+            ));
+        }
+        out
+    }
+
+    /// Human-readable snapshot: current writer, readers and waiters with ages.
+    pub fn dump(&self) -> String {
+        let t = self.track.lock().unwrap();
+        let now = Instant::now();
+        let mut out = String::new();
+        match &t.writer {
+            Some((_, loc, since, task)) => {
+                out.push_str(&format!(
+                    "writer={loc} task={task:?} held_for={:?}",
+                    now.duration_since(*since)
+                ));
+            }
+            None => out.push_str("writer=none"),
+        }
+        let mut readers: Vec<_> = t.readers.values().collect();
+        readers.sort_by_key(|(_, since, _)| *since);
+        out.push_str(&format!(" readers={}", readers.len()));
+        for (loc, since, task) in readers.iter().take(8) {
+            out.push_str(&format!(
+                "\n    reader {loc} task={task:?} held_for={:?}",
+                now.duration_since(*since)
+            ));
+        }
+        match &t.last_release {
+            Some((loc, when)) => out.push_str(&format!(
+                "\n  acquires={} releases={} last_release={loc} {:?} ago",
+                t.acquires,
+                t.releases,
+                now.duration_since(*when)
+            )),
+            None => out.push_str(&format!("\n  acquires={} releases={} last_release=never", t.acquires, t.releases)),
+        }
+        let mut waiting: Vec<_> = t.waiting.values().collect();
+        waiting.sort_by_key(|(_, _, since, _, _)| *since);
+        out.push_str(&format!("\n  waiting={}", waiting.len()));
+        for (loc, write, since, task, probe) in waiting.iter().take(20) {
+            out.push_str(&format!(
+                "\n    waiter {loc} kind={} task={task:?} waiting_for={:?} polls={} wakes={}",
+                if *write { "write" } else { "read" },
+                now.duration_since(*since),
+                probe.polls.load(std::sync::atomic::Ordering::Relaxed),
+                probe.count.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+        }
+        out
     }
 }
 
+/// `file:line` of the call site, used to label lock acquisitions.
+#[macro_export]
+macro_rules! loc {
+    () => {
+        concat!(file!(), ":", line!())
+    };
+}
 #[cfg(test)]
 mod tests {
     use super::*;
