@@ -114,14 +114,18 @@ async fn propose(
     let mut rng = StdRng::from_entropy();
     while let Some((msg, dest, reply_tx)) = req_rx.recv().await {
         let mid = rng.gen();
-        let mut request_map = request_map.lock().await;
-        use std::collections::hash_map::Entry;
-        match request_map.entry(mid) {
-            Entry::Occupied(_) => panic!("conflicting msg id generated"),
-            Entry::Vacant(e) => {
-                e.insert(reply_tx);
+        {
+            let mut request_map = request_map.lock().await;
+            use std::collections::hash_map::Entry;
+            match request_map.entry(mid) {
+                Entry::Occupied(_) => panic!("conflicting msg id generated"),
+                Entry::Vacant(e) => {
+                    e.insert(reply_tx);
+                }
             }
-        }
+        } // release request_map before the (potentially blocking) propose call,
+          // so a slow/backed-up proposal can't stall deliver()'s replies to
+          // every other in-flight client request on this process.
         handle.propose(mid, msg, dest).await.unwrap();
     }
     todo!()
@@ -178,6 +182,12 @@ fn main() {
     };
 
     rt.block_on(async {
+        if let Ok(port) = std::env::var("TOKIO_CONSOLE_PORT") {
+            let port: u16 = port.parse().expect("TOKIO_CONSOLE_PORT must be a u16");
+            console_subscriber::ConsoleLayer::builder()
+                .server_addr(([127, 0, 0, 1], port))
+                .init();
+        }
         let mut handle = PrimcastReplica::start(Gid(args.gid), Pid(args.pid), cfg.clone(), args.hybrid, args.debug, None).await;
         let delivery_rx = handle.take_delivery_rx().unwrap();
 

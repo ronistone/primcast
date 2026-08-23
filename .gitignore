@@ -7,3 +7,11 @@ log_out_*_*.txt
 db/
 # Added by code-review-graph
 .code-review-graph/
+
+# client/server run output
+client.out*
+logs.*
+
+# plotting (scripts/plot_client_log.py)
+plots/
+.venv-plot/

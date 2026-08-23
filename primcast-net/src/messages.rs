@@ -1,5 +1,6 @@
 use primcast_core::types::*;
 use primcast_core::LogEntry;
+use primcast_core::LogSkeletonEntry;
 use primcast_core::RemoteEntry;
 
 use bytes::Bytes;
@@ -111,6 +112,30 @@ pub enum Message {
         gid: Gid,
         from_idx: u64,
         to_idx: u64,
+    },
+
+    // === Multi-group collaborative recovery ===
+    // Own-group request for the authoritative metadata skeleton of a log range.
+    // The response carries no payload bytes, only ordering metadata.
+    RecoverySkeletonRequest {
+        from_idx: u64,
+        to_idx: u64,
+    },
+    RecoverySkeletonChunk {
+        entries: Vec<LogSkeletonEntry>,
+        is_last: bool,
+    },
+
+    // Cross-group request: ask a co-destination group for payloads of messages
+    // (identified by msg_id) that it also received. `gid` is the requesting group.
+    CrossGroupPayloadRequest {
+        gid: Gid,
+        msg_ids: Vec<MsgId>,
+    },
+    CrossGroupPayloadResponse {
+        payloads: Vec<(MsgId, Bytes)>,
+        // msg_ids this group could not serve; requester falls back to own peers
+        missing: Vec<MsgId>,
     },
 }
 

@@ -1,6 +1,8 @@
 leader_timeout_secs: 2
 reconnect_timeout_secs: 2
 log_enabled: true
+persistence_backend: "lmdb"
+multi_group_recovery: true
 groups:
   - gid: 0
     quorum: 2
@@ -10,14 +12,17 @@ groups:
         ip: 127.0.0.1
         port: 10000
         client_port: 20000
+        persistence_database: "db/primcast.0_00"
       - pid: 1
         ip: 127.0.0.1
         port: 10001
         client_port: 20001
+        persistence_database: "db/primcast.0_01"
       - pid: 2
         ip: 127.0.0.1
         port: 10002
         client_port: 20002
+        persistence_database: "db/primcast.0_02"
   - gid: 1
     quorum: 2
     zookeeper_url: 127.0.0.1:2181
@@ -26,14 +31,17 @@ groups:
         ip: 127.0.0.1
         port: 10003
         client_port: 20003
+        persistence_database: "db/primcast.1_00"
       - pid: 1
         ip: 127.0.0.1
         port: 10004
         client_port: 20004
+        persistence_database: "db/primcast.1_01"
       - pid: 2
         ip: 127.0.0.1
         port: 10005
         client_port: 20005
+        persistence_database: "db/primcast.1_02"
   - gid: 2
     quorum: 2
     zookeeper_url: 127.0.0.1:2181
@@ -42,11 +50,14 @@ groups:
         ip: 127.0.0.1
         port: 10006
         client_port: 20006
+        persistence_database: "db/primcast.2_00"
       - pid: 1
         ip: 127.0.0.1
         port: 10007
         client_port: 20007
+        persistence_database: "db/primcast.2_01"
       - pid: 2
         ip: 127.0.0.1
         port: 10008
         client_port: 20008
+        persistence_database: "db/primcast.2_02"

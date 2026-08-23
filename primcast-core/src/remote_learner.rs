@@ -183,6 +183,18 @@ impl RemoteLearner {
         self.safe_idx
     }
 
+    /// Entries received from the remote group but not yet delivered (they sit
+    /// here until `safe_idx` covers them). A growing count with a frozen
+    /// `safe_idx` means the entries arrive fine but no quorum of remote acks in
+    /// `remote_log_epoch` is being seen.
+    pub(crate) fn buffered(&self) -> usize {
+        self.remote_log.len()
+    }
+
+    pub(crate) fn log_epoch(&self) -> Epoch {
+        self.remote_log_epoch
+    }
+
     pub(crate) fn remote_info(&self) -> impl Iterator<Item = (Pid, Epoch, u64)> + '_ {
         self.remote_info
             .iter()
