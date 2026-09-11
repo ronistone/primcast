@@ -1,5 +1,6 @@
 use priority_queue::PriorityQueue;
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::hash::BuildHasherDefault;
 use std::time::Instant;
 
@@ -56,6 +57,11 @@ pub struct PendingSet {
     min_new_proposal: Clock,
     /// sanity check: no new log entries with ts smaller than some previous local group ts
     highest_local_ts: Clock,
+    /// Log indexes of every pending msg that has a local log entry.
+    /// `ts_order.peek()` is *not* usable for this: its priority is
+    /// `max(entry_ts, max_group_ts)`, so a high remote group ts can push an
+    /// early log entry deep into the queue. Retention trims below this floor.
+    pending_log_idx: BTreeSet<u64>,
 }
 
 impl PendingSet {
@@ -69,6 +75,7 @@ impl PendingSet {
             last_popped: (0, 0),
             min_new_proposal: 0,
             highest_local_ts: 0,
+            pending_log_idx: Default::default(),
         }
     }
 
@@ -109,6 +116,7 @@ impl PendingSet {
                 assert!(m.entry_ts.is_none());
                 m.entry_ts = Some(entry_ts);
                 m.log_idx = Some(log_idx);
+                self.pending_log_idx.insert(log_idx);
                 ts = std::cmp::max(m.entry_ts, m.max_group_ts).unwrap();
             }
             Entry::Vacant(e) => {
@@ -121,6 +129,7 @@ impl PendingSet {
                     last_modified: Instant::now(),
                     log_idx: Some(log_idx),
                 });
+                self.pending_log_idx.insert(log_idx);
                 ts = entry_ts;
             }
         }
@@ -185,12 +194,21 @@ impl PendingSet {
     pub fn remove_entry_ts(&mut self, msg_id: MsgId) {
         if let Some(p) = self.all.get_mut(&msg_id) {
             p.entry_ts = None;
-            p.log_idx = None;
+            if let Some(idx) = p.log_idx.take() {
+                self.pending_log_idx.remove(&idx);
+            }
             // sanity check that the group timestamp is not decided
             assert!(p.missing_group_ts.contains(self.gid));
             // remove from ts_order
             self.ts_order.remove(&msg_id).unwrap();
         }
+    }
+
+    /// Smallest log idx still referenced by an undelivered msg. Retention must
+    /// not trim at or above this: a pending entry's payload is read back by
+    /// `next_delivery` and its `msg_id` must stay in the dedup set.
+    pub fn min_log_idx(&self) -> Option<u64> {
+        self.pending_log_idx.first().copied()
     }
 
     /// Head-of-line info: the smallest-ts pending msg and the groups whose ts
@@ -261,6 +279,7 @@ impl PendingSet {
         let final_ts = self.all.get(&msg_id).unwrap().final_ts()?;
         assert_eq!(*ts, final_ts);
         let p = self.all.remove(&msg_id).unwrap();
+        self.pending_log_idx.remove(&p.log_idx.unwrap());
         let (_, Reverse((ts, msg_id))) = self.ts_order.pop().unwrap();
         assert!((ts, msg_id) > self.last_popped);
         self.last_popped = (ts, msg_id);

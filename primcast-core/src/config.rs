@@ -61,6 +61,29 @@ pub struct Config {
     /// Defaults to false (single-group recovery) when absent from the config.
     #[serde(default)]
     pub multi_group_recovery: bool,
+    /// How many payload-bearing log entries to keep in memory behind the trim
+    /// floor (`min(safe_len, pending.min_log_idx())`). Entries evicted from the
+    /// in-memory deque are still served from persistence by `get_log`, so this
+    /// is a performance knob, not a correctness one.
+    #[serde(default = "default_log_retention_entries")]
+    pub log_retention_entries: u64,
+    /// How many `msg_id`s to keep in the dedup set / reverse index behind the
+    /// same floor. This one *is* a correctness knob: `msgid` has no persistence
+    /// fallback, so the window must cover the re-proposal horizon
+    /// (`MISSING_PROPOSAL_AGE`, leadership-change re-injection, client
+    /// reconnect — all second-scale). Default ≈ 60 s at 20k appends/s.
+    #[serde(default = "default_msgid_retention_entries")]
+    pub msgid_retention_entries: u64,
+}
+
+/// ≈ 5 s of log at 20k appends/s.
+fn default_log_retention_entries() -> u64 {
+    100_000
+}
+
+/// ≈ 60 s of log at 20k appends/s.
+fn default_msgid_retention_entries() -> u64 {
+    1_200_000
 }
 
 impl GroupConfig {
@@ -123,6 +146,8 @@ impl Config {
             log_enabled: true,
             persistence_backend: "lmdb".to_string(),
             multi_group_recovery: false,
+            log_retention_entries: default_log_retention_entries(),
+            msgid_retention_entries: default_msgid_retention_entries(),
         }
     }
 

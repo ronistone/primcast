@@ -3,6 +3,8 @@ use bytes::Bytes;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::VecDeque;
+
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 
@@ -160,8 +162,15 @@ pub struct GroupReplica {
     state: ReplicaState,
     promised_epoch: Epoch,
 
-    /// The replica log - cached entries indexed by log position
-    log: HashMap<u64, LogEntry>,
+    /// The replica log - the retained suffix of entries, `log[0]` being log
+    /// position `log_base`. Dense and contiguous, so a deque beats a map: it
+    /// indexes without hashing and, unlike hashbrown, actually gives memory
+    /// back on `pop_front`. Entries below `log_base` are served from
+    /// persistence by `get_log`.
+    log: VecDeque<LogEntry>,
+    /// Log position of `log[0]`; entries below this were trimmed (or never
+    /// loaded, at startup) and live only in persistence.
+    log_base: u64,
     /// Current log length (highest index + 1)
     log_len_cached: u64,
     /// Epochs stored in the log and the size of the log for each.
@@ -170,8 +179,15 @@ pub struct GroupReplica {
     current_epoch_acks: Vec<(u64, Pid)>,
     /// Safe prefix of the log (acknowledged by a quorum)
     safe_len: u64,
-    /// All MsgId present in the log
+    /// MsgId of the retained suffix of the log, used for proposal dedup.
+    /// Unlike `log` this has no persistence fallback, so its window must cover
+    /// the re-proposal horizon (`Config::msgid_retention_entries`).
     msgid: HashMap<u16, HashSet<MsgId>>,
+    /// The same ids in log order, so eviction can drop the oldest first.
+    /// `msgid_order[0]` is the msg_id at log position `msgid_base`, and
+    /// `msgid_base + msgid_order.len() == log_len_cached` always holds.
+    msgid_order: VecDeque<MsgId>,
+    msgid_base: u64,
     /// Reverse index MsgId -> log idx, for serving payloads by msg_id during
     /// multi-group collaborative recovery. Covers in-memory entries (idx >= the
     /// safe_len at load time); lookups that miss are reported as `missing` so the
@@ -292,12 +308,15 @@ impl GroupReplica {
 
             state,
             promised_epoch,
-            log: HashMap::default(),
+            log: VecDeque::new(),
+            log_base: 0,
             log_len_cached: 0,
             log_epochs: log_epochs,
             current_epoch_acks,
             safe_len: safe_len,
             msgid,
+            msgid_order: VecDeque::new(),
+            msgid_base: 0,
             msgid_idx: HashMap::default(),
             pending: PendingSet::new(gid),
 
@@ -323,6 +342,10 @@ impl GroupReplica {
             last.1 = safe_len;
         }
         result.log_len_cached = safe_len;
+        // The loader below only re-inserts entries with idx >= safe_len, so the
+        // safe prefix already lives only in persistence. Say so explicitly.
+        result.log_base = safe_len;
+        result.msgid_base = safe_len;
 
         log_persisted.iter().for_each(|e| { // This code load all log in memory
             let (actual_epoch, _) = result.log_status();
@@ -338,7 +361,7 @@ impl GroupReplica {
     fn get_log(&self, idx: u64) -> Result<LogEntry, Error> {
         
         // Try cache first
-        if let Some(entry) = self.log.get(&idx) {
+        if let Some(entry) = self.retained_log(idx) {
             return Ok(entry.clone());
         }
 
@@ -377,7 +400,7 @@ impl GroupReplica {
         // This runs once per delivered message. Reading the entry back from the
         // store first cost an extra LMDB read txn per delivery; the in-memory log
         // holds it in the common case, so only fall back to the store on a miss.
-        let cached = self.log.get(&idx).cloned();
+        let cached = self.retained_log(idx).cloned();
         let (epoch, mut log) = match cached {
             Some(entry) => {
                 let epoch = self
@@ -396,7 +419,11 @@ impl GroupReplica {
         };
         log.final_ts = Some(final_ts);
         self.persistence.as_mut().put_log_entry(epoch, idx, &log).unwrap();
-        self.log.insert(idx, log);
+        // The entry may have been trimmed out of the retained window; the store
+        // above is the authoritative copy either way.
+        if let Some(slot) = self.retained_log_mut(idx) {
+            *slot = log;
+        }
         Ok(())
     }
 
@@ -405,46 +432,45 @@ impl GroupReplica {
         self.log_len_cached
     }
     
+    /// Entry at a log position, if it is still in the retained window.
+    fn retained_log(&self, idx: u64) -> Option<&LogEntry> {
+        let off = idx.checked_sub(self.log_base)?;
+        self.log.get(off as usize)
+    }
+
+    fn retained_log_mut(&mut self, idx: u64) -> Option<&mut LogEntry> {
+        let off = idx.checked_sub(self.log_base)?;
+        self.log.get_mut(off as usize)
+    }
+
     /// Push entry to log
     fn push_log(&mut self, idx: u64, entry: LogEntry) {
-        self.log.insert(idx, entry);
+        debug_assert_eq!(idx, self.log_base + self.log.len() as u64);
+        self.log.push_back(entry);
         self.log_len_cached += 1;
     }
     
     /// Pop last entry from log
     fn pop_log(&mut self) -> Option<LogEntry> {
-        if self.log_len_cached == 0 {
+        // Rollback only ever reaches entries at or above `safe_len`, which the
+        // trim floor never touches; refuse to go below the retained window.
+        if self.log_len_cached <= self.log_base {
             return None;
         }
         self.log_len_cached -= 1;
-        self.log.remove(&self.log_len_cached)
+        self.log.pop_back()
     }
     
     /// Get last log entry reference
     fn last_log(&self) -> Option<&LogEntry> {
-        if self.log_len_cached == 0 {
-            return None;
-        }
-        self.log.get(&(self.log_len_cached - 1))
-    }
-    
-    /// Find log entry in range for destination
-    fn find_log_for_dest(&self, start_idx: u64, gid: Gid) -> Option<&LogEntry> {
-        for idx in start_idx..self.log_len_cached {
-            if let Some(entry) = self.log.get(&idx) {
-                if entry.dest.contains(gid) {
-                    return Some(entry);
-                }
-            }
-            // TODO: If not in cache, check persistence
-        }
-        None
+        self.log.back()
     }
     
     /// Clear all log entries (for testing/reset purposes)
     #[allow(dead_code)]
     fn clear_log(&mut self) {
         self.log.clear();
+        self.log_base = 0;
         self.log_len_cached = 0;
     }
 
@@ -580,8 +606,10 @@ impl GroupReplica {
         self.clock.advance_epoch(epoch);
         self.clock.update(self.pid, epoch, clock);
 
-        // Reset ack tracking for the new epoch
-        let log_len = self.log.len() as u64;
+        // Reset ack tracking for the new epoch. `log.len()` is only the
+        // retained window (the loader skips the safe prefix, and trimming drops
+        // more), so it would under-report our own ack.
+        let log_len = self.log_actual_len();
         for (len, pid) in self.current_epoch_acks.iter_mut() {
             *len = if *pid == self.pid { log_len } else { 0 };
         }
@@ -720,6 +748,9 @@ impl GroupReplica {
                 let id_set = self.msgid.get_mut(&id_low).expect("msgid should be present");
                 assert!(id_set.remove(&entry.msg_id), "msgid should be present");
                 self.msgid_idx.remove(&entry.msg_id);
+                // mirror image of front eviction: msgid_order is in log order
+                let popped = self.msgid_order.pop_back();
+                debug_assert_eq!(popped, Some(entry.msg_id));
                 self.pending.remove_entry_ts(entry.msg_id);
             }
 
@@ -924,12 +955,6 @@ impl GroupReplica {
         })
     }
 
-    /// Get the next log entry destined for to a given Gid, starting at idx.
-    /// Needed by replicas from remote groups to fetch relevant log entries.
-    pub fn next_log_entry_for_dest(&self, start_idx: u64, gid: Gid) -> Option<&LogEntry> {
-        self.find_log_for_dest(start_idx, gid)
-    }
-
     /// Helper method for properly appending to the log
     fn append_inner(&mut self, idx: u64, entry_epoch: Epoch, entry: LogEntry) -> Result<u64, Error> {
         self.append_inner_internal(idx, entry_epoch, entry, false)
@@ -958,6 +983,8 @@ impl GroupReplica {
         }
         // reverse index for multi-group recovery payload lookup
         self.msgid_idx.insert(entry.msg_id, idx);
+        self.msgid_order.push_back(entry.msg_id);
+        debug_assert_eq!(self.msgid_base + self.msgid_order.len() as u64, idx + 1);
 
         if !from_storage {
             self.pending
@@ -1175,6 +1202,57 @@ impl GroupReplica {
                 .expect("failed to update metadata in persistence");
             self.last_metadata_flush = Some(Instant::now());
             self.last_persisted_epoch = Some(self.promised_epoch);
+        }
+
+        self.trim_retained();
+    }
+
+    /// Log position below which nothing in memory is still needed: the quorum-safe
+    /// prefix, capped by the oldest entry some undelivered msg still points at.
+    ///
+    /// Deliberately `safe_len` (the quorum ack) and not the minimum ack: a dead
+    /// follower's ack never advances, and flooring on it would pin the log
+    /// forever. A replica left behind the quorum catches up from persistence or
+    /// from a peer, which is what recovery is for.
+    fn trim_floor(&self) -> u64 {
+        match self.pending.min_log_idx() {
+            Some(idx) => std::cmp::min(self.safe_len, idx),
+            None => self.safe_len,
+        }
+    }
+
+    /// Evict from the front of the two retention windows.
+    ///
+    /// Short window — `log`: payload-bearing, so by far the most expensive per
+    /// entry. `get_log` falls back to persistence (which we never truncate), so
+    /// a miss costs a read, never a wrong answer.
+    ///
+    /// Long window — `msgid` + `msgid_idx`: id-keyed and cheap. `msgid` is the
+    /// proposal dedup check and has no fallback, so its window must outlive the
+    /// re-proposal horizon. `msgid_idx` rides along so collaborative recovery
+    /// can still serve older payloads by id.
+    ///
+    /// Both are floored at `trim_floor()`, so neither can evict a still-pending
+    /// message — the case that would otherwise turn into a silent duplicate
+    /// delivery.
+    fn trim_retained(&mut self) {
+        let floor = self.trim_floor();
+
+        let log_base_target = floor.saturating_sub(self.config.log_retention_entries);
+        while self.log_base < log_base_target {
+            self.log.pop_front().expect("log_base below retained window");
+            self.log_base += 1;
+        }
+
+        let msgid_base_target = floor.saturating_sub(self.config.msgid_retention_entries);
+        while self.msgid_base < msgid_base_target {
+            let id = self.msgid_order.pop_front().expect("msgid_base below retained window");
+            let id_low = (id & MSGID_LOW_MASK) as u16;
+            if let Some(s) = self.msgid.get_mut(&id_low) {
+                s.remove(&id);
+            }
+            self.msgid_idx.remove(&id);
+            self.msgid_base += 1;
         }
     }
 
@@ -1571,14 +1649,14 @@ mod tests {
         let mut dest = GidSet::new();
         dest.insert(Gid(0));
         
-        replica.log.insert(0, LogEntry {
+        replica.push_log(0, LogEntry {
             local_ts: 1,
             msg_id: 1,
             msg: "x".into(),
             dest: dest.clone(),
             final_ts: None,
         });
-        replica.log.insert(1, LogEntry {
+        replica.push_log(1, LogEntry {
             local_ts: 2,
             msg_id: 2,
             msg: "y".into(),
@@ -1647,5 +1725,370 @@ mod tests {
         assert_eq!(replica.safe_len, SAFE);
 
         let _ = std::fs::remove_dir_all(&db_path);
+    }
+}
+
+/// Tests for bounded log retention: the trim floor, the two retention windows,
+/// and the invariant that trimming changes memory use but never the protocol's
+/// externally visible behaviour (delivery order, dedup, rollback).
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Epoch owned by Pid(0), so Pid(0) can act as primary.
+    /// (`Epoch::initial()` is owned by `Pid(u32::MAX)` and nobody can propose in it.)
+    const E: Epoch = Epoch(1, Pid(0));
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Removes the lmdb dirs a test created, however the test ends.
+    struct TestDirs(Vec<String>);
+    impl Drop for TestDirs {
+        fn drop(&mut self) {
+            for d in &self.0 {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    /// `Config::new_for_test` keys persistence only by pid, so replicas across
+    /// tests share lmdb dirs and clobber each other. Give every replica in a
+    /// test its own dir, and set the two retention windows under test.
+    fn test_config(log_retention: u64, msgid_retention: u64) -> (Config, TestDirs) {
+        let tag = format!(
+            "{}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut config = Config::new_for_test();
+        config.log_retention_entries = log_retention;
+        config.msgid_retention_entries = msgid_retention;
+        let mut dirs = vec![];
+        for gi in 0..config.groups.len() {
+            for pi in 0..config.groups[gi].peers.len() {
+                let path = format!("db/test_retention_{}_{}_{}", tag, gi, pi);
+                dirs.push(path.clone());
+                config.groups[gi].peers[pi].persistence_database = path;
+            }
+        }
+        (config, TestDirs(dirs))
+    }
+
+    /// Primary + two followers for Gid(0), all in epoch `E`.
+    fn group(config: &Config) -> (GroupReplica, GroupReplica, GroupReplica) {
+        let mut p = GroupReplica::new(Gid(0), Pid(0), E, config.clone(), false);
+        let mut f1 = GroupReplica::new(Gid(0), Pid(1), E, config.clone(), false);
+        let mut f2 = GroupReplica::new(Gid(0), Pid(2), E, config.clone(), false);
+        p.state = ReplicaState::Primary;
+        f1.state = ReplicaState::Follower;
+        f2.state = ReplicaState::Follower;
+        (p, f1, f2)
+    }
+
+    /// Ship every entry the followers are missing, ack back, and run `update()`
+    /// on the primary — one replication round of the real protocol.
+    fn replicate(p: &mut GroupReplica, f1: &mut GroupReplica, f2: &mut GroupReplica) {
+        for f in [&mut *f1, &mut *f2] {
+            let mut idx = f.log_actual_len();
+            while idx < p.log_actual_len() {
+                let (epoch, entry) = p.log_entry(idx).unwrap();
+                f.append(epoch, idx, entry).unwrap();
+                idx += 1;
+            }
+        }
+        for f in [&*f1, &*f2] {
+            p.add_ack(f.pid, f.current_epoch(), f.log_actual_len(), f.clock.local())
+                .unwrap();
+        }
+        p.update();
+    }
+
+    /// Write `total` entries and metadata with `safe_len` straight to a fresh
+    /// store, as a restart would find them. The write-behind buffer means an
+    /// unflushed store loses everything on drop, so flush explicitly.
+    fn seed_log(path: &str, pid: Pid, total: u64, safe_len: u64) {
+        let mut db = persistence::LMDBPersistence::new(path).unwrap();
+        for idx in 0..total {
+            let entry = LogEntry {
+                local_ts: idx + 1,
+                msg_id: 100 + idx as MsgId,
+                msg: "x".into(),
+                dest: [Gid(0)].into_iter().collect(),
+                final_ts: None,
+            };
+            db.put_log_entry(E, idx, &entry).unwrap();
+        }
+        db.put_metadata(&persistence::ReplicaMetadata {
+            gid: Gid(0),
+            pid,
+            promised_epoch: E,
+            log_epochs: vec![(E, total)],
+            safe_len,
+            clock: total,
+        })
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    fn drain(p: &mut GroupReplica) -> Vec<(MsgId, Clock)> {
+        let mut out = vec![];
+        while let Some(e) = p.next_delivery() {
+            out.push((e.msg_id, e.final_ts.unwrap()));
+        }
+        out
+    }
+
+    /// Propose `n` local msgs with ids `base..base+n`, replicate, deliver.
+    fn workload(
+        p: &mut GroupReplica,
+        f1: &mut GroupReplica,
+        f2: &mut GroupReplica,
+        base: MsgId,
+        n: u64,
+    ) -> Vec<(MsgId, Clock)> {
+        for i in 0..n {
+            p.add_proposal(base + i as MsgId, "x".into(), [Gid(0)]).unwrap();
+        }
+        p.propose().unwrap();
+        replicate(p, f1, f2);
+        let delivered = drain(p);
+        // a second round, so the trim floor sees the post-delivery pending set
+        replicate(p, f1, f2);
+        delivered
+    }
+
+    #[test]
+    fn deque_log_survives_front_eviction() {
+        // window of 2 entries: everything behind the floor gets evicted, and
+        // every evicted entry must still read back correctly from persistence.
+        let (config, _dirs) = test_config(2, 1_000_000);
+        let (mut p, mut f1, mut f2) = group(&config);
+
+        let delivered = workload(&mut p, &mut f1, &mut f2, 100, 10);
+        assert_eq!(delivered.len(), 10);
+
+        assert_eq!(p.log_actual_len(), 10);
+        assert_eq!(p.safe_len, 10);
+        assert_eq!(p.log_base, 8, "floor 10 minus a 2-entry window");
+        assert_eq!(p.log.len(), 2, "deque holds only the retained suffix");
+
+        // every entry, evicted or not, still resolves
+        for idx in 0..10u64 {
+            let (epoch, entry) = p.log_entry(idx).expect("evicted entry must fall back to persistence");
+            assert_eq!(epoch, E);
+            assert_eq!(entry.msg_id, 100 + idx as MsgId);
+            assert_eq!(entry.local_ts, idx + 1);
+            // final_ts was stamped at delivery and must survive eviction
+            assert_eq!(entry.final_ts, Some(idx + 1));
+        }
+    }
+
+    #[test]
+    fn msgid_window_is_independent_of_log_window() {
+        // tiny log window, larger id window: ids outlive their payloads.
+        let (config, _dirs) = test_config(2, 6);
+        let (mut p, mut f1, mut f2) = group(&config);
+
+        workload(&mut p, &mut f1, &mut f2, 100, 10);
+
+        assert_eq!(p.log_base, 8);
+        assert_eq!(p.msgid_base, 4, "floor 10 minus a 6-entry id window");
+        assert_eq!(p.msgid_order.len(), 6);
+        assert_eq!(p.msgid_idx.len(), 6);
+        assert_eq!(p.msgid.values().map(|s| s.len()).sum::<usize>(), 6);
+
+        // ids inside the window are still deduped...
+        for id in 104..110 {
+            assert!(
+                matches!(p.add_proposal(id, "x".into(), [Gid(0)]), Err(Error::IdAlreadyUsed)),
+                "id {} is inside the retention window and must still be rejected",
+                id
+            );
+        }
+        // ...ids evicted from it are not: that is the documented cost of the
+        // window, and why it must outlive the re-proposal horizon.
+        assert!(p.add_proposal(100, "x".into(), [Gid(0)]).is_ok());
+
+        // msgid_idx follows the same window, so payload lookup by id reports
+        // evicted ids as missing rather than answering wrongly
+        let (found, missing) = p.payloads_for_msg_ids(&[100, 109]);
+        assert_eq!(missing, vec![100]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 109);
+    }
+
+    #[test]
+    fn pending_entry_pins_the_floor() {
+        // The case `ts_order.peek()` cannot see: a msg at log idx 0 whose
+        // priority is a large remote group ts, so it sits at the *back* of the
+        // priority queue while still pinning the oldest log position.
+        let (config, _dirs) = test_config(2, 4);
+        let (mut p, mut f1, mut f2) = group(&config);
+
+        let global_id: MsgId = 1;
+        let dest: GidSet = [Gid(0), Gid(1)].into_iter().collect();
+        p.add_proposal(global_id, "g".into(), dest.clone()).unwrap();
+        p.propose().unwrap();
+        replicate(&mut p, &mut f1, &mut f2);
+        // remote group decides a far-future ts: priority 1000, log idx 0
+        p.pending.add_group_ts(global_id, &dest, Gid(1), 1000);
+
+        // nine local msgs behind it, all delivered
+        let delivered = workload(&mut p, &mut f1, &mut f2, 100, 9);
+        assert_eq!(delivered.len(), 9);
+
+        assert_eq!(p.safe_len, 10);
+        assert_eq!(p.pending.min_log_idx(), Some(0));
+        // head of ts_order is *not* the pinning entry
+        let (head_ts, head_id, _, _) = p.pending.blocked_head().unwrap();
+        assert_eq!(head_id, global_id);
+        assert_eq!(head_ts, 1000);
+
+        // floor pinned at 0, so nothing is evicted even though safe_len is 10
+        assert_eq!(p.log_base, 0, "a pending entry must pin the trim floor");
+        assert_eq!(p.msgid_base, 0);
+        assert_eq!(p.log.len(), 10);
+
+        // once clocks pass its final ts it delivers, and the floor is released
+        for _ in 0..1100 {
+            p.clock.tick();
+            f1.clock.tick();
+            f2.clock.tick();
+        }
+        replicate(&mut p, &mut f1, &mut f2);
+        let e = p.next_delivery().unwrap();
+        assert_eq!(e.msg_id, global_id);
+        assert_eq!(p.pending.min_log_idx(), None);
+        replicate(&mut p, &mut f1, &mut f2);
+        assert_eq!(p.log_base, 8);
+    }
+
+    #[test]
+    fn retention_does_not_change_delivery() {
+        // Same workload under a tiny window and under a window that never
+        // fires: delivery order and final timestamps must be identical.
+        let run = |log_ret: u64, msgid_ret: u64| {
+            let (config, dirs) = test_config(log_ret, msgid_ret);
+            let (mut p, mut f1, mut f2) = group(&config);
+            let mut delivered = vec![];
+            for round in 0..10u128 {
+                delivered.extend(workload(&mut p, &mut f1, &mut f2, 1000 + round * 100, 7));
+            }
+            let bases = (p.log_base, p.msgid_base);
+            drop((p, f1, f2));
+            drop(dirs);
+            (delivered, bases)
+        };
+
+        let (trimmed, (log_base, msgid_base)) = run(4, 8);
+        let (untrimmed, (no_log_base, no_msgid_base)) = run(u64::MAX, u64::MAX);
+
+        assert_eq!(trimmed.len(), 70);
+        assert_eq!(trimmed, untrimmed, "trimming must not change delivery");
+        assert_eq!((no_log_base, no_msgid_base), (0, 0), "huge window trims nothing");
+        assert_eq!(log_base, 66);
+        assert_eq!(msgid_base, 62);
+    }
+
+    #[test]
+    fn rollback_keeps_msgid_order_in_step() {
+        // Log truncation on epoch change pops from the tail; front eviction pops
+        // from the head. They share msgid_order, so they must stay consistent.
+        let (config, _dirs) = test_config(u64::MAX, u64::MAX);
+        let mut f = GroupReplica::new(Gid(0), Pid(1), E, config.clone(), false);
+        f.state = ReplicaState::Follower;
+
+        for i in 0..5u64 {
+            let entry = LogEntry {
+                local_ts: i + 1,
+                msg_id: 100 + i as MsgId,
+                msg: "x".into(),
+                dest: [Gid(0)].into_iter().collect(),
+                final_ts: None,
+            };
+            f.append(E, i, entry).unwrap();
+        }
+        assert_eq!(f.msgid_order.len(), 5);
+
+        // new leader (Pid(2)) only has 3 entries of epoch E
+        let (_, len) = f.start_epoch_check(Epoch(2, Pid(2)), vec![(E, 3)]).unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(f.log_actual_len(), 3);
+        assert_eq!(f.log.len(), 3);
+        assert_eq!(f.msgid_order.len(), 3, "msgid_order must shrink with the log");
+        assert_eq!(f.msgid_base + f.msgid_order.len() as u64, f.log_actual_len());
+        assert_eq!(f.msgid_idx.len(), 3);
+        // the rolled-back ids are free to be proposed again
+        assert!(!f.msgid_order.contains(&103));
+        assert!(f.msgid_order.contains(&102));
+    }
+
+    #[test]
+    fn finalize_recovery_acks_the_whole_log() {
+        // finalize_recovery used `log.len()`, which is only the retained window
+        // — after any restart or trim it under-reports the replica's own ack.
+        let (config, _dirs) = test_config(u64::MAX, u64::MAX);
+        seed_log(&config.groups[0].peers[1].persistence_database, Pid(1), 6, 4);
+
+        // restart: the loader only re-inserts entries at or above safe_len, so
+        // the in-memory window (2) is shorter than the log (6)
+        let mut r = GroupReplica::new(Gid(0), Pid(1), E, config.clone(), false);
+        r.state = ReplicaState::Recovering;
+        assert_eq!(r.log_actual_len(), 6);
+        assert_eq!(r.log.len(), 2);
+
+        r.finalize_recovery(Epoch(2, Pid(1)), 6).unwrap();
+        let own_ack = r
+            .current_epoch_acks
+            .iter()
+            .find(|(_, pid)| *pid == Pid(1))
+            .unwrap()
+            .0;
+        assert_eq!(own_ack, 6, "own ack must be the full log, not the window");
+    }
+
+    #[test]
+    fn restart_starts_the_window_at_safe_len() {
+        // The loader only re-inserts entries at or above safe_len, so log_base
+        // and msgid_base must start there rather than at 0.
+        let (config, _dirs) = test_config(u64::MAX, u64::MAX);
+        seed_log(&config.groups[0].peers[0].persistence_database, Pid(0), 5, 3);
+
+        let r = GroupReplica::new(Gid(0), Pid(0), E, config.clone(), false);
+        assert_eq!(r.safe_len, 3);
+        assert_eq!(r.log_base, 3);
+        assert_eq!(r.msgid_base, 3);
+        assert_eq!(r.log.len(), 2, "only the unsafe tail is held in memory");
+        assert_eq!(r.msgid_base + r.msgid_order.len() as u64, r.log_actual_len());
+        // the safe prefix is still readable, from persistence
+        assert_eq!(r.log_entry(0).unwrap().1.msg_id, 100);
+        assert_eq!(r.log_entry(4).unwrap().1.msg_id, 104);
+    }
+
+    #[test]
+    fn min_log_idx_tracks_the_pending_set() {
+        let mut pending = pending::PendingSet::new(Gid(0));
+        let dest: GidSet = [Gid(0)].into_iter().collect();
+        assert_eq!(pending.min_log_idx(), None);
+
+        pending.add_entry_ts(1, &dest, 10, 0);
+        pending.add_entry_ts(2, &dest, 20, 1);
+        pending.add_entry_ts(3, &dest, 30, 2);
+        assert_eq!(pending.min_log_idx(), Some(0));
+
+        pending.add_group_ts(1, &dest, Gid(0), 10);
+        pending.add_group_ts(2, &dest, Gid(0), 20);
+        assert_eq!(pending.pop_next_smallest(21), Some((10, 1, 0)));
+        assert_eq!(pending.min_log_idx(), Some(1), "floor follows the oldest undelivered entry");
+        assert_eq!(pending.pop_next_smallest(21), Some((20, 2, 1)));
+        assert_eq!(pending.min_log_idx(), Some(2));
+
+        // a rolled-back entry drops out of the floor too
+        pending.remove_entry_ts(3);
+        assert_eq!(pending.min_log_idx(), None);
     }
 }

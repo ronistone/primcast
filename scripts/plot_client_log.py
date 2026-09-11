@@ -69,9 +69,13 @@ def parse(path, warmup_s):
             if send_at - first < warmup_s * US:
                 skipped += 1
                 continue
-            last = send_at
+            # run duration now spans deliveries, which trail the last send
+            last = max(last, send_at + latency)
             kind = "global" if "," in dest else "local"
-            idx = int((send_at - first) / (parse.bucket_s * US))
+            # Bucket by delivery time (send_at + latency), not by send time.
+            # Bucketing by send_at charts *offered* load, which stays flat by
+            # construction and cannot show a capacity collapse.
+            idx = int((send_at + latency - first) / (parse.bucket_s * US))
             buckets[kind][idx].append(latency)
             lat_all[kind].append(latency)
 
