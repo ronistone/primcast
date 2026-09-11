@@ -1,6 +1,7 @@
 # Bounded log retention — implementation plan
 
-Status: planned, not started. Branch `multi-group-recovery-impl`.
+Status: **implemented and measured** (2026-09-10), branch `bounded-log-retention`.
+Results in [Measured result](#measured-result); everything under [Deferred](#deferred) is still open.
 Decision record (rationale, rejected alternatives): https://claude.ai/code/artifact/b799abb6-bfea-4bec-9031-a9da970ff1ca
 
 ## Problem
@@ -199,18 +200,54 @@ under-reports its own ack on promotion. Eviction makes it worse. Fix regardless.
 `scripts/plot_client_log.py:74` — bucket index from `send_at + latency`, not `send_at`. As written the
 panel cannot show a capacity collapse.
 
+## Measured result
+
+3x3 local cluster (9 `examples/server` + 3 `client_open_loop`, `example_3_groups.yaml`,
+10k msg/s per client, 50% globals, 3 dests, 100 B msgs), same 180 s workload on each branch.
+Anonymous RSS summed over the 9 server processes — anonymous is the number that matters, since
+LMDB's file-backed pages are reclaimed from page cache and never swap.
+
+| t (s) | baseline anon (MB) | after anon (MB) | file-backed after (MB) | LMDB dir (GB) |
+|---|---|---|---|---|
+| 20 | 1,325 | 610 | 721 | 0.7 |
+| 60 | 4,667 | 1,571 | 1,945 | 2.1 |
+| 100 | 8,748 | 1,681 | 3,208 | 3.4 |
+| 140 | 9,880 | **1,694** | 4,469 | 4.8 |
+| 180 | 11,027 | **1,694** | 5,721 | 6.2 |
+
+Baseline grows linearly at ~61 MB/s with no plateau. After the change it is **flat at 1,694 MB from
+t≈100 s** — byte-identical across the last four samples. The knee at ~100 s is the msgid window
+filling: 1.2M entries at the ~12k appends/s this workload sustains.
+
+The LMDB dir grows identically on both branches (6.2 GB at t=180 s) and file-backed RSS tracks it,
+confirming nothing about persistence changed. The residual 1.7 GB is the pending backlog and the
+client-facing buffers, not the retained windows — the plan's ≈0.9 GB estimate covered only the three
+maps.
+
+Consistency was clean on that same run: 3.6M deliveries per replica, `scripts/check_consistency.sh`
+reported no intra-group, cross-group or ts-order differences, and no panics in any server log.
+
 ## Verification
 
 1. `cargo build --release --examples`.
 2. `cargo test -p primcast-core` — note five GroupReplica/config/remote_learner tests fail pre-existing
    on multi-group branches (always-Promised init + shared `db/` paths). Don't chase them; compare
-   against the pre-change failure set.
+   against the pre-change failure set. The new `retention_tests` module (8 tests) must be green, and
+   `cargo test -p primcast-net` must stay fully green.
+
+   One of those five, `restart_with_unsafe_log_entries_does_not_panic`, turns out to fail for a
+   third reason worth recording: `LMDBPersistence` has a write-behind buffer and **no `Drop` impl**,
+   so a store dropped without `flush()`/`close()` silently loses every buffered entry. The test seeds
+   the store and drops it, so the replica restarts against an empty log. Tests that seed persistence
+   must call `flush()` (see `retention_tests::seed_log`). Whether the production shutdown path
+   flushes is a separate question, not touched here.
 3. Consistency: `./scripts/tmux-open_loop.sh --globals 0.5 -m 1000 --release --check`, kill, then
    `./scripts/check_consistency.sh`. Must be clean — this is the guard against duplicate or misordered
    delivery.
-4. Memory: run the 3×3 cluster with 3 clients at 10k msg/s and sample
-   `ps -eo rss,args | grep examples/server` every 5 s. **RSS must plateau**, not climb linearly. Target
-   ≲ 1 GB total across 9 replicas after the first minute; today it is +83 MB/s without bound.
+4. Memory: run the 3×3 cluster with 3 clients at 10k msg/s and sample **`RssAnon`** from
+   `/proc/<pid>/status` for the 9 `examples/server` processes. Total RSS is the wrong metric: it
+   includes LMDB's file-backed mmap, which grows with the database and is reclaimed under pressure,
+   so it masks the effect in both directions. Anon RSS must **plateau**, not climb linearly.
 5. Throughput: with the fixed plot script, delivered rate must stay flat for the whole run instead of
    decaying after ~195 s.
 
