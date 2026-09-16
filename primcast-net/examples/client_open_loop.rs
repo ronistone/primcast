@@ -68,6 +68,7 @@ struct Payload {
 fn main() {
     let args = Args::parse();
     let cfg = Config::load(&args.cfg).unwrap();
+    primcast_core::set_timed_print(cfg.log_enabled);
     let mut cmd = Args::command(); // just to call .error()
 
     let gid = Gid(args.gid);

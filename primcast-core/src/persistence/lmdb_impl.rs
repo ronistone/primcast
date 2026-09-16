@@ -18,7 +18,7 @@ pub struct LMDBPersistence {
 }
 
 /// Entries buffered before a commit is forced.
-const WRITE_BUF_LIMIT: usize = 256;
+const WRITE_BUF_LIMIT: usize = 4096;
 
 impl LMDBPersistence {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, PersistenceError> {

@@ -44,6 +44,11 @@ pub fn is_timed_print_enabled() -> bool {
     TIMED_PRINT_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Apply a config's `log_enabled` flag to the global `timed_print!` toggle.
+pub fn set_timed_print(enabled: bool) {
+    TIMED_PRINT_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 
 
 #[macro_export]

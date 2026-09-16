@@ -1,6 +1,6 @@
 leader_timeout_secs: 2
 reconnect_timeout_secs: 2
-log_enabled: true
+log_enabled: false
 persistence_backend: "lmdb"
 multi_group_recovery: true
 groups:

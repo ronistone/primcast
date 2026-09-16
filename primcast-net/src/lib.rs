@@ -167,6 +167,7 @@ impl PrimcastReplica {
         debug: Option<u64>,
         _persisted: Option<primcast_core::PersistedState>,
     ) -> PrimcastHandle {
+        primcast_core::set_timed_print(cfg.log_enabled);
         let actual_epoch = Epoch(0, Pid(u32::MAX));
 
         let core = GroupReplica::new(gid, pid, actual_epoch, cfg.clone(), hybrid_clock);

@@ -126,11 +126,7 @@ fn main() {
         }
     }
 
-    if !cfg.log_enabled {
-        primcast_core::disable_timed_print();
-    } else {
-        primcast_core::enable_timed_print();
-    }
+    primcast_core::set_timed_print(cfg.log_enabled);
 
     let msgs_per_millis = args.msgs_per_sec as f64 / 1000.0;
 

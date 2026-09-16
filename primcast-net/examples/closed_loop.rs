@@ -111,6 +111,7 @@ async fn print_stats(
 fn main() {
     let args = Args::parse();
     let cfg = Config::load(&args.cfg).unwrap();
+    primcast_core::set_timed_print(cfg.log_enabled);
     let mut cmd = Args::command(); // just to call .error()
 
     if args.globals < 0.0 || args.globals > 1.0 {
