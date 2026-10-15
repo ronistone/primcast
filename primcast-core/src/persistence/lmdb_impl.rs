@@ -15,15 +15,25 @@ pub struct LMDBPersistence {
     /// The env already runs with NO_SYNC, so this does not weaken durability
     /// beyond what the configuration already accepts.
     write_buf: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// Entries buffered before a commit is forced.
+    write_buf_limit: usize,
 }
 
-/// Entries buffered before a commit is forced.
-const WRITE_BUF_LIMIT: usize = 4096;
+/// Default entries buffered before a commit is forced, when the config does
+/// not override it.
+pub const DEFAULT_WRITE_BUF_LIMIT: usize = 128;
 
 impl LMDBPersistence {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, PersistenceError> {
+        Self::new_with_write_buf_limit(path, DEFAULT_WRITE_BUF_LIMIT)
+    }
+
+    pub fn new_with_write_buf_limit<P: AsRef<Path>>(
+        path: P,
+        write_buf_limit: usize,
+    ) -> Result<Self, PersistenceError> {
         std::fs::create_dir_all(path.as_ref())?;
-        
+
         let env = Environment::new()
             .set_max_readers(126)
             .set_max_dbs(2)
@@ -31,18 +41,19 @@ impl LMDBPersistence {
             .set_flags(lmdb::EnvironmentFlags::NO_SYNC | lmdb::EnvironmentFlags::NO_LOCK)
             .open(path.as_ref())
             .map_err(|e| PersistenceError::Database(e.to_string()))?;
-        
+
         let log_db = env.create_db(Some("log"), lmdb::DatabaseFlags::empty())
             .map_err(|e| PersistenceError::Database(e.to_string()))?;
-        
+
         let metadata_db = env.create_db(Some("metadata"), lmdb::DatabaseFlags::empty())
             .map_err(|e| PersistenceError::Database(e.to_string()))?;
-        
+
         Ok(Self {
             env,
             log_db,
             metadata_db,
             write_buf: Default::default(),
+            write_buf_limit,
         })
     }
 
@@ -81,7 +92,7 @@ impl PersistenceLayer for LMDBPersistence {
         };
         let value = bincode::serialize(&persisted_entry)?;
         self.write_buf.insert(idx, value);
-        if self.write_buf.len() >= WRITE_BUF_LIMIT {
+        if self.write_buf.len() >= self.write_buf_limit {
             self.commit_buffer()?;
         }
         Ok(())

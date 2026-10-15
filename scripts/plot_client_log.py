@@ -254,15 +254,24 @@ def plot_file(path, args):
         tl, pl, _, _ = series["local"]
         tg, pg, _, _ = series["global"]
         n = min(len(tl), len(tg))
+        # p50 solid+thick, p99 dashed+thin (opposite of the WIDTHS convention
+        # used elsewhere) so the two curves stay visually distinct even though
+        # both are drawn in the same color.
+        DELTA_STYLE = {50: dict(lw=1.8, ls="-", alpha=1.0), 99: dict(lw=1.0, ls=(0, (5, 2)), alpha=0.55)}
         labels = []
-        for p, lw, ls, alpha in ((99, 1.0, (0, (5, 2)), 0.55), (50, 1.8, "-", 1.0)):
+        for p in (50, 99):
             d = _smooth(pg[p][:n] - pl[p][:n], args.smooth)
-            ax.plot(tl[:n], d, color=C["global"], lw=lw, ls=ls, alpha=alpha)
+            ax.plot(tl[:n], d, color=C["global"], **DELTA_STYLE[p])
             labels.append((f"p{p}", d[-1], C["global"]))
         ax.axhline(0, color=MUTED, lw=0.9)
         ax.set_yscale("symlog", linthresh=1)
         _end_labels(ax, labels)
-    _style(ax, f"Global − local latency (rolling median, {args.smooth} buckets)",
+        ax.legend(handles=[
+            plt.Line2D([], [], color=C["global"], **DELTA_STYLE[50], label="p50"),
+            plt.Line2D([], [], color=C["global"], **DELTA_STYLE[99], label="p99"),
+        ], fontsize=8, frameon=False, loc="upper left")
+    _style(ax, f"Global − local latency (rolling median, {args.smooth} buckets)\n"
+               "above 0 = global slower than local that bucket",
            "time (s)", "delta (ms, symlog)")
     ax.set_xlim(0, None)
 

@@ -74,6 +74,10 @@ pub struct Config {
     /// reconnect — all second-scale). Default ≈ 60 s at 20k appends/s.
     #[serde(default = "default_msgid_retention_entries")]
     pub msgid_retention_entries: u64,
+    /// LMDB write-behind buffer size: log entries batched before a commit is
+    /// forced. Ignored by other `persistence_backend` values.
+    #[serde(default = "default_lmdb_write_buf_entries")]
+    pub lmdb_write_buf_entries: usize,
 }
 
 /// ≈ 5 s of log at 20k appends/s.
@@ -84,6 +88,10 @@ fn default_log_retention_entries() -> u64 {
 /// ≈ 60 s of log at 20k appends/s.
 fn default_msgid_retention_entries() -> u64 {
     1_200_000
+}
+
+fn default_lmdb_write_buf_entries() -> usize {
+    crate::persistence::DEFAULT_WRITE_BUF_LIMIT
 }
 
 impl GroupConfig {
@@ -148,6 +156,7 @@ impl Config {
             multi_group_recovery: false,
             log_retention_entries: default_log_retention_entries(),
             msgid_retention_entries: default_msgid_retention_entries(),
+            lmdb_write_buf_entries: default_lmdb_write_buf_entries(),
         }
     }
 

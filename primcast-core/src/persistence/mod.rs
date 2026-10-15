@@ -12,7 +12,7 @@ pub mod sled_impl;
 // #[cfg(feature = "rocksdb-persistence")]
 pub use rocksdb_impl::RocksDBPersistence;
 // #[cfg(feature = "lmdb-persistence")]
-pub use lmdb_impl::LMDBPersistence;
+pub use lmdb_impl::{LMDBPersistence, DEFAULT_WRITE_BUF_LIMIT};
 // #[cfg(feature = "sled-persistence")]
 pub use sled_impl::SledPersistence;
 

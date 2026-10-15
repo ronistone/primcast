@@ -284,7 +284,12 @@ impl GroupReplica {
         let mut msgid = HashMap::default();
         msgid.reserve(MSGID_LOW_MASK as usize);
         let persistence_path = config.peer(gid, pid).unwrap().persistence_database.clone();
-        let persistence = get_persistence(&config.persistence_backend, &persistence_path).unwrap();
+        let persistence = get_persistence(
+            &config.persistence_backend,
+            &persistence_path,
+            config.lmdb_write_buf_entries,
+        )
+        .unwrap();
 
         let log_persisted = persistence.list_log_entries().unwrap();
 
@@ -1301,10 +1306,14 @@ impl GroupReplica {
 }
 
 
-fn get_persistence(backend: &str, database: &str) -> Result<Box<dyn PersistenceLayer>, Error> {
+fn get_persistence(
+    backend: &str,
+    database: &str,
+    lmdb_write_buf_entries: usize,
+) -> Result<Box<dyn PersistenceLayer>, Error> {
     match backend {
         "lmdb" => {
-            LMDBPersistence::new(&database)
+            LMDBPersistence::new_with_write_buf_limit(&database, lmdb_write_buf_entries)
                 .map(|p| Box::new(p) as Box<dyn PersistenceLayer>)
                 .map_err(|_| Error::InvalidPersistence)
         }
