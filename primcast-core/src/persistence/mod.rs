@@ -71,6 +71,14 @@ pub trait PersistenceLayer: Send + Sync {
     fn put_log_entry(&mut self, epoch: Epoch, idx: u64, entry: &LogEntry) -> Result<(), PersistenceError>;
     fn get_log_entry(&self, idx: u64) -> Result<Option<(Epoch, LogEntry)>, PersistenceError>;
     fn list_log_entries(&self) -> Result<Vec<PersistedLogEntry>, PersistenceError>;
+    /// Cheap entry count for diagnostics. Default falls back to fully
+    /// materializing/deserializing every entry via `list_log_entries` — backends
+    /// that can count keys without deserializing values (e.g. a raw cursor scan)
+    /// should override this, since callers (e.g. periodic debug dumps) may run
+    /// it repeatedly against a large, still-growing log.
+    fn count_log_entries(&self) -> Result<usize, PersistenceError> {
+        Ok(self.list_log_entries()?.len())
+    }
     fn truncate_log(&mut self, from_idx: u64) -> Result<(), PersistenceError>;
     
     // Metadata operations

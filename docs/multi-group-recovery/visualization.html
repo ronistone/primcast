@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Primcast — Multi-Group Collaborative Recovery</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --txt:#c9d1d9; --muted:#8b949e;
+    --a:#58a6ff; --b:#3fb950; --c:#d29922; --pink:#db61a2; --red:#f85149;
+    --skel:#8b949e; --pay:#3fb950;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:28px 32px 8px}
+  h1{margin:0;font-size:26px}
+  h1 small{color:var(--muted);font-weight:400;font-size:15px;display:block;margin-top:6px}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px 80px}
+  h2{font-size:19px;margin:38px 0 6px;border-bottom:1px solid var(--line);padding-bottom:6px}
+  .sub{color:var(--muted);margin:0 0 14px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:14px 0}
+  code{background:#0b0f14;border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-size:13px;color:#e6edf3}
+  .tag{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.5px;
+    padding:2px 8px;border-radius:20px;vertical-align:middle}
+  .tag.skel{background:rgba(139,148,158,.18);color:#c9d1d9;border:1px solid var(--skel)}
+  .tag.pay{background:rgba(63,185,80,.15);color:var(--pay);border:1px solid var(--pay)}
+  /* legend */
+  .legend{display:flex;gap:22px;flex-wrap:wrap;margin:6px 0 0}
+  .legend span{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--muted)}
+  .dot{width:13px;height:13px;border-radius:3px;display:inline-block}
+  /* SVG */
+  svg{width:100%;height:auto;display:block}
+  .grp{font-weight:700}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  /* before/after cards */
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.cols{grid-template-columns:1fr}}
+  .card h3{margin:0 0 4px;font-size:16px}
+  .badge{font-size:12px;padding:2px 10px;border-radius:20px;font-weight:700}
+  .bad{background:rgba(248,81,73,.15);color:var(--red);border:1px solid var(--red)}
+  .good{background:rgba(63,185,80,.15);color:var(--b);border:1px solid var(--b)}
+  /* phase steps */
+  .steps{counter-reset:s;margin:0;padding:0;list-style:none}
+  .steps li{position:relative;padding:12px 16px 12px 54px;border:1px solid var(--line);
+    border-radius:8px;margin:10px 0;background:#0b0f14}
+  .steps li::before{counter-increment:s;content:counter(s);position:absolute;left:14px;top:12px;
+    width:26px;height:26px;border-radius:50%;background:var(--a);color:#04121f;
+    font-weight:800;display:flex;align-items:center;justify-content:center}
+  .steps b{color:#fff}
+  .k{color:var(--c)}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;margin-top:8px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left}
+  th{background:#0b0f14;color:var(--muted)}
+  td.y{color:var(--b);font-weight:700}
+  td.n{color:var(--red);font-weight:700}
+  .note{border-left:3px solid var(--c);padding:8px 14px;background:rgba(210,153,34,.07);
+    border-radius:0 8px 8px 0;margin:12px 0;color:#e6d6a8;font-size:14px}
+  .pill{display:inline-block;border:1px dashed var(--line);border-radius:6px;padding:2px 8px;
+    font-size:12px;color:var(--muted);margin:2px}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap" style="padding-bottom:0">
+    <h1>Multi-Group Collaborative Recovery
+      <small>Primcast atomic multicast · spread recovery payload load across destination groups</small>
+    </h1>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ===== THE INSIGHT ===== -->
+  <h2>The insight</h2>
+  <p class="sub">A message to several groups is stored — payload and all — in <em>every</em> one of them.</p>
+  <div class="panel">
+    A message addressed to a <code>GidSet</code> is proposed to <b>all</b> its destination
+    groups (<code>propose()</code> → <code>for gid in dest.iter()</code>). So a multi-destination
+    message physically lives, payload included, in each destination group's log.
+    <br><br>
+    When an <span class="grp" style="color:var(--a)">A</span>-node recovers, the missing
+    multi-dest payloads can therefore come from the <b>other destination groups</b> instead of
+    overloading <span class="grp" style="color:var(--a)">A</span>'s own busy peers.
+    <div class="legend">
+      <span><i class="dot" style="background:var(--skel)"></i> <span class="tag skel">SKELETON</span> small, authoritative metadata — always from own group</span>
+      <span><i class="dot" style="background:var(--pay)"></i> <span class="tag pay">PAYLOAD</span> heavy bytes, identical everywhere — offload to co-dest groups</span>
+    </div>
+  </div>
+
+  <!-- ===== WHO HOLDS WHAT ===== -->
+  <h2>Who holds what</h2>
+  <table>
+    <tr><th>Per-entry data</th><th>Group A log</th><th>Co-dest group B log</th><th>B's RemoteLearner(A)</th></tr>
+    <tr><td><code>msg_id</code></td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td></tr>
+    <tr><td>payload <code>msg: Bytes</code> <span class="tag pay">PAYLOAD</span></td><td class="y">yes</td><td class="y">yes</td><td class="n">no</td></tr>
+    <tr><td><code>dest</code>, <code>final_ts</code></td><td class="y">yes</td><td class="y">yes (same)</td><td class="y">tracks</td></tr>
+    <tr><td>A's <code>idx</code> / <code>epoch</code> / <code>local_ts</code> <span class="tag skel">SKELETON</span></td><td class="y">yes</td><td class="n">no</td><td class="n">no</td></tr>
+  </table>
+  <div class="note"><b>Consequence:</b> co-dest groups can serve the <b>payload</b> (byte-identical — same proposal)
+    but not group A's ordering metadata. That skeleton is tiny and must come from A's own peers. This split is the whole design.</div>
+
+  <!-- ===== BEFORE / AFTER ===== -->
+  <h2>Before vs. after</h2>
+  <div class="cols">
+    <!-- BEFORE -->
+    <div class="panel card">
+      <h3>Today <span class="badge bad">single-group</span></h3>
+      <p class="sub">Every byte — skeleton + payload — comes from A's surviving peers.</p>
+      <svg viewBox="0 0 360 230" role="img" aria-label="single group recovery">
+        <!-- recovering node -->
+        <rect x="140" y="95" width="80" height="40" rx="8" fill="#1f2937" stroke="var(--a)" stroke-width="2"/>
+        <text x="180" y="112" text-anchor="middle" fill="var(--a)" font-weight="700">A · p2</text>
+        <text x="180" y="126" text-anchor="middle" fill="var(--muted)" font-size="11">recovering</text>
+        <!-- peers -->
+        <rect x="20" y="20" width="70" height="34" rx="7" fill="#0b0f14" stroke="var(--a)"/>
+        <text x="55" y="41" text-anchor="middle" fill="var(--a)">A · p0</text>
+        <rect x="20" y="176" width="70" height="34" rx="7" fill="#0b0f14" stroke="var(--a)"/>
+        <text x="55" y="197" text-anchor="middle" fill="var(--a)">A · p1</text>
+        <!-- heavy arrows -->
+        <defs>
+          <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 Z" fill="var(--pay)"/></marker>
+        </defs>
+        <path d="M92,42 C120,60 130,80 145,100" stroke="var(--pay)" stroke-width="5" fill="none" marker-end="url(#ah)"/>
+        <path d="M92,190 C120,170 130,150 145,130" stroke="var(--pay)" stroke-width="5" fill="none" marker-end="url(#ah)"/>
+        <text x="118" y="68" fill="var(--pay)" font-size="11">skeleton+payload</text>
+        <text x="100" y="165" fill="var(--pay)" font-size="11">all bytes</text>
+      </svg>
+      <p class="sub" style="margin-top:8px">Group A peers carry 100% of recovery bytes <b>while still serving live traffic</b>.</p>
+    </div>
+    <!-- AFTER -->
+    <div class="panel card">
+      <h3>Proposed <span class="badge good">multi-group</span></h3>
+      <p class="sub">Skeleton from A. Heavy payloads pulled in parallel from co-dest groups B, C.</p>
+      <svg viewBox="0 0 360 230" role="img" aria-label="multi group recovery">
+        <rect x="140" y="95" width="80" height="40" rx="8" fill="#1f2937" stroke="var(--a)" stroke-width="2"/>
+        <text x="180" y="112" text-anchor="middle" fill="var(--a)" font-weight="700">A · p2</text>
+        <text x="180" y="126" text-anchor="middle" fill="var(--muted)" font-size="11">recovering</text>
+        <!-- own peer: skeleton only (thin) -->
+        <rect x="20" y="98" width="70" height="34" rx="7" fill="#0b0f14" stroke="var(--a)"/>
+        <text x="55" y="119" text-anchor="middle" fill="var(--a)">A · p0</text>
+        <!-- group B -->
+        <rect x="270" y="18" width="74" height="34" rx="7" fill="#0b0f14" stroke="var(--b)"/>
+        <text x="307" y="39" text-anchor="middle" fill="var(--b)">B · grp</text>
+        <!-- group C -->
+        <rect x="270" y="178" width="74" height="34" rx="7" fill="#0b0f14" stroke="var(--c)"/>
+        <text x="307" y="199" text-anchor="middle" fill="var(--c)">C · grp</text>
+        <defs>
+          <marker id="as" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--skel)"/></marker>
+          <marker id="ap" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--pay)"/></marker>
+        </defs>
+        <!-- thin skeleton from own peer -->
+        <path d="M92,115 L137,115" stroke="var(--skel)" stroke-width="2" stroke-dasharray="5 4" fill="none" marker-end="url(#as)"/>
+        <text x="96" y="108" fill="var(--skel)" font-size="11">skeleton</text>
+        <!-- heavy payload from B and C -->
+        <path d="M270,40 C235,60 210,85 222,100" stroke="var(--pay)" stroke-width="5" fill="none" marker-end="url(#ap)"/>
+        <path d="M270,192 C235,172 210,148 222,130" stroke="var(--pay)" stroke-width="5" fill="none" marker-end="url(#ap)"/>
+        <text x="214" y="64" fill="var(--pay)" font-size="11">payload</text>
+        <text x="214" y="172" fill="var(--pay)" font-size="11">payload</text>
+      </svg>
+      <p class="sub" style="margin-top:8px">A peers serve only tiny skeletons; payload bandwidth fans out across the cluster.</p>
+    </div>
+  </div>
+
+  <!-- ===== THE 4 PHASES ===== -->
+  <h2>How it runs — 4 phases</h2>
+  <p class="sub">Recovering A-node needs entries <code class="mono">[from_idx, to_idx)</code>.</p>
+  <ol class="steps">
+    <li><b>Skeleton fetch <span class="tag skel">own group</span></b> — ask A's peers for
+      <span class="mono">{idx, entry_epoch, local_ts, final_ts, msg_id, dest}</span>.
+      Authoritative, contiguous, <b>no payload bytes</b>.</li>
+    <li><b>Plan <span class="k">(pluggable)</span></b> — for each skeleton entry:
+      multi-dest &amp; a co-dest group reachable → route payload to a <b>co-dest group</b>;
+      otherwise (single-dest) → an <b>own-group peer</b>.
+      <code>MultiGroupRecoveryPlanner::plan()</code> decides which group and balances load.</li>
+    <li><b>Payload fetch <span class="tag pay">parallel</span></b> — cross-group
+      <code>CrossGroupPayloadRequest{ gid:A, msg_ids }</code> → <code>CrossGroupPayloadResponse{ payloads, missing }</code>.
+      Any <code>missing</code> falls back to an own-group peer. Never fails on a lagging group.</li>
+    <li><b>Reassemble &amp; apply</b> — <code>LogEntry = skeleton + payload</code>,
+      assert <code>payload.msg_id == skeleton.msg_id</code>, sort by idx, check contiguity,
+      <code>recovery_append_batch()</code>, <code>finalize_recovery()</code>.</li>
+  </ol>
+
+  <!-- ===== ISOLATION ===== -->
+  <h2>Built to be swappable</h2>
+  <p class="sub">The routing algorithm is behind one trait; everything else is additive and flag-gated.</p>
+  <div class="panel">
+    <pre class="mono" style="margin:0;overflow:auto;font-size:13px;color:#e6edf3">trait <span style="color:var(--a)">MultiGroupRecoveryPlanner</span> {            <span style="color:var(--muted)">// swap this = change the algorithm</span>
+    fn plan(&self, self_gid, skeletons, reachable_groups, own_peers)
+        -> Vec&lt;(MsgId, PayloadSource)&gt;;     <span style="color:var(--muted)">// OwnPeer(Pid) | CoDestGroup(Gid)</span>
+}
+struct <span style="color:var(--b)">CoDestinationPlanner</span>;                    <span style="color:var(--muted)">// default: round-robin co-dest</span>
+async fn <span style="color:var(--c)">run_multi_group_recovery</span>(.., planner) {..}  <span style="color:var(--muted)">// sibling of existing path</span></pre>
+  </div>
+  <div class="cols">
+    <div class="panel">
+      <h3 style="margin:0 0 8px;font-size:15px">New &amp; isolated</h3>
+      <span class="pill">primcast-net/src/multi_group_recovery.rs · <b>new, all logic</b></span>
+      <span class="pill">trait <code>MultiGroupRecoveryPlanner</code></span>
+      <span class="pill">default <code>CoDestinationPlanner</code></span>
+      <span class="pill">flag <code>multi_group_recovery</code> (default off)</span>
+    </div>
+    <div class="panel">
+      <h3 style="margin:0 0 8px;font-size:15px">Additive only</h3>
+      <span class="pill">messages.rs: +4 variants</span>
+      <span class="pill">lib.rs: +2 handlers, 1 guarded call-site</span>
+      <span class="pill">core: read-only <code>log_skeleton_range()</code>, <code>payloads_by_msg_id()</code></span>
+      <span class="pill">no existing signature changes</span>
+    </div>
+  </div>
+  <div class="note">Flag <b>off</b> ⇒ byte-for-byte today's <code>run_follower_collaborative_recovery</code>.
+    The existing single-group path is always the fallback.</div>
+
+  <!-- ===== CORRECTNESS ===== -->
+  <h2>Why it stays correct</h2>
+  <div class="panel">
+    <ul style="margin:0;padding-left:20px">
+      <li><b>Ordering is always local-authoritative.</b> Co-dest groups never supply A's idx/epoch/local_ts — only opaque payload bytes keyed by msg_id. Global delivery order untouched.</li>
+      <li><b>Payload identity.</b> Same <code>msg_id</code> ⇒ byte-identical payload everywhere (one proposal). Reassembly verifies the match.</li>
+      <li><b>Only safe multi-dest entries offload.</b> The skeleton's <code>dest</code>/<code>final_ts</code> mark eligibility; single-dest &amp; in-flight stay on own peers.</li>
+      <li><b>Completeness fallback.</b> <code>missing</code> msg_ids re-fetch from own peers — recovery never fails on a lagging co-dest group.</li>
+    </ul>
+  </div>
+
+</div>
+</body>
+</html>

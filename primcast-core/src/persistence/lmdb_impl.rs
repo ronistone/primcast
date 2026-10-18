@@ -7,7 +7,18 @@ pub struct LMDBPersistence {
     env: Environment,
     log_db: Database,
     metadata_db: Database,
+    /// Write-behind buffer for log entries. One rw txn per appended entry made
+    /// persistence the dominant cost of both the append and the delivery path
+    /// (both run while the replica lock is held); entries are batched into a
+    /// single txn instead. Reads consult the buffer first, and it is committed
+    /// on flush/close and before any read-modify operation on the log db.
+    /// The env already runs with NO_SYNC, so this does not weaken durability
+    /// beyond what the configuration already accepts.
+    write_buf: std::collections::BTreeMap<u64, Vec<u8>>,
 }
+
+/// Entries buffered before a commit is forced.
+const WRITE_BUF_LIMIT: usize = 256;
 
 impl LMDBPersistence {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, PersistenceError> {
@@ -31,7 +42,27 @@ impl LMDBPersistence {
             env,
             log_db,
             metadata_db,
+            write_buf: Default::default(),
         })
+    }
+
+    /// Commit everything buffered in one transaction.
+    fn commit_buffer(&mut self) -> Result<(), PersistenceError> {
+        if self.write_buf.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| PersistenceError::Database(e.to_string()))?;
+        for (idx, value) in &self.write_buf {
+            txn.put(self.log_db, &Self::log_key(*idx), value, WriteFlags::empty())
+                .map_err(|e| PersistenceError::Database(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| PersistenceError::Database(e.to_string()))?;
+        self.write_buf.clear();
+        Ok(())
     }
     
     fn log_key(idx: u64) -> [u8; 8] {
@@ -43,31 +74,24 @@ impl LMDBPersistence {
 
 impl PersistenceLayer for LMDBPersistence {
     fn put_log_entry(&mut self, epoch: Epoch, idx: u64, entry: &LogEntry) -> Result<(), PersistenceError> {
-        // timed_print!("[BEGIN-LMDB] Put log entry: idx={}, epoch={}", idx, epoch);
         let persisted_entry = PersistedLogEntry {
             epoch,
             idx,
             entry: entry.clone(),
         };
-        
-        let key = Self::log_key(idx);
         let value = bincode::serialize(&persisted_entry)?;
-        
-        let mut txn = self.env.begin_rw_txn()
-            .map_err(|e| PersistenceError::Database(e.to_string()))?;
-        
-        txn.put(self.log_db, &key, &value, WriteFlags::empty())
-            .map_err(|e| PersistenceError::Database(e.to_string()))?;
-        
-        txn.commit()
-            .map_err(|e| PersistenceError::Database(e.to_string()))?;
-
-        // timed_print!("[END-LMDB] Put log entry: idx={}, epoch={}", idx, epoch);
-        
+        self.write_buf.insert(idx, value);
+        if self.write_buf.len() >= WRITE_BUF_LIMIT {
+            self.commit_buffer()?;
+        }
         Ok(())
     }
-    
+
     fn get_log_entry(&self, idx: u64) -> Result<Option<(Epoch, LogEntry)>, PersistenceError> {
+        if let Some(value) = self.write_buf.get(&idx) {
+            let persisted: PersistedLogEntry = bincode::deserialize(value)?;
+            return Ok(Some((persisted.epoch, persisted.entry)));
+        }
         let key = Self::log_key(idx);
         
         let txn = self.env.begin_ro_txn()
@@ -85,6 +109,9 @@ impl PersistenceLayer for LMDBPersistence {
     
     fn list_log_entries(&self) -> Result<Vec<PersistedLogEntry>, PersistenceError> {
         let mut entries = Vec::new();
+        for value in self.write_buf.values() {
+            entries.push(bincode::deserialize::<PersistedLogEntry>(value)?);
+        }
         
         let txn = self.env.begin_ro_txn()
             .map_err(|e| PersistenceError::Database(e.to_string()))?;
@@ -101,8 +128,29 @@ impl PersistenceLayer for LMDBPersistence {
         entries.sort_by_key(|e| e.idx);
         Ok(entries)
     }
-    
+
+    fn count_log_entries(&self) -> Result<usize, PersistenceError> {
+
+        // Count keys via a raw cursor scan — no bincode deserialization, no Vec
+        // materialization/sort. Unlike `list_log_entries`, cost stays cheap even
+        // as the log grows into the hundreds of thousands of entries.
+        let txn = self.env.begin_ro_txn()
+            .map_err(|e| PersistenceError::Database(e.to_string()))?;
+        let mut cursor = txn.open_ro_cursor(self.log_db)
+            .map_err(|e| PersistenceError::Database(e.to_string()))?;
+        let committed = cursor.iter().count();
+        // add buffered entries that are not in the db yet
+        let buffered_new = self
+            .write_buf
+            .keys()
+            .filter(|idx| txn.get(self.log_db, &Self::log_key(**idx)).is_err())
+            .count();
+        Ok(committed + buffered_new)
+    }
+
     fn truncate_log(&mut self, from_idx: u64) -> Result<(), PersistenceError> {
+        self.write_buf.retain(|idx, _| *idx < from_idx);
+        self.commit_buffer()?;
         let mut txn = self.env.begin_rw_txn()
             .map_err(|e| PersistenceError::Database(e.to_string()))?;
         
@@ -165,17 +213,20 @@ impl PersistenceLayer for LMDBPersistence {
     }
     
     fn flush(&mut self) -> Result<(), PersistenceError> {
+        self.commit_buffer()?;
         self.env.sync(true)
             .map_err(|e| PersistenceError::Database(e.to_string()))?;
         Ok(())
     }
     
     fn close(&mut self) -> Result<(), PersistenceError> {
-        // LMDB closes automatically when dropped
+        // LMDB closes automatically when dropped, but buffered writes must land
+        self.commit_buffer()?;
         Ok(())
     }
     
     fn clear_all(&mut self) -> Result<(), PersistenceError> {
+        self.write_buf.clear();
         let mut txn = self.env.begin_rw_txn()
             .map_err(|e| PersistenceError::Database(e.to_string()))?;
         

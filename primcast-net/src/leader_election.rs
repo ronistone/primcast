@@ -86,6 +86,7 @@ impl LeaderElection {
             let children = zk.get_children(self.base_path.as_str(), false).await?;
             let mut sorted_children = children;
             sorted_children.sort();
+            timed_print!("[LeaderElection] gid={} pid={} re-evaluated: {} children, sorted={:?}", self.gid.0, self.pid.0, sorted_children.len(), sorted_children);
 
             if let Some((index, _)) = sorted_children.iter().enumerate()
                 .find(|(_, node)| format!("{}/{}", self.base_path, node) == my_node)
@@ -111,9 +112,20 @@ impl LeaderElection {
                     self.publish(0, leader_pid).await;
 
                     let predecessor = format!("{}/{}", self.base_path, sorted_children[index - 1]);
+                    timed_print!("[LeaderElection] gid={} pid={} watching predecessor {}", self.gid.0, self.pid.0, predecessor);
+                    // DEBUG: throttled liveness print for this poll loop, to distinguish
+                    // "zk.exists() itself is stuck/never returning" from "polling fine but
+                    // predecessor still reports existing" while chasing a failover freeze.
+                    let mut poll_count: u64 = 0;
                     loop {
-                        if zk.exists(&predecessor, false).await?.is_none() {
+                        let exists = zk.exists(&predecessor, false).await?;
+                        poll_count += 1;
+                        if exists.is_none() {
+                            timed_print!("[LeaderElection] gid={} pid={} predecessor {} gone after {} polls", self.gid.0, self.pid.0, predecessor, poll_count);
                             continue 'main;
+                        }
+                        if poll_count % 40 == 0 {
+                            timed_print!("[LeaderElection] gid={} pid={} still watching predecessor {} (poll #{}, still exists)", self.gid.0, self.pid.0, predecessor, poll_count);
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }

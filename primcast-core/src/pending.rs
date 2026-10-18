@@ -85,9 +85,14 @@ impl PendingSet {
         use std::collections::hash_map::Entry;
         let ts;
 
-        if entry_ts % 5 == 0 {
-            timed_print!("({} {}) > ({} {}) ADD_ENTRY_TS", entry_ts, msg_id, self.last_popped.0, self.last_popped.1);
-        }
+        crate::sampled_print!(
+            crate::LOG_SAMPLE,
+            "({} {}) > ({} {}) ADD_ENTRY_TS",
+            entry_ts,
+            msg_id,
+            self.last_popped.0,
+            self.last_popped.1
+        );
         assert!((entry_ts, msg_id) > self.last_popped);
         assert!(entry_ts > self.highest_local_ts);
 
@@ -95,7 +100,7 @@ impl PendingSet {
             Entry::Occupied(mut e) => {
                 let m = e.get_mut();
                 // we've already seen the message through some remote group ts
-                timed_print!("add_entry_ts: msg {} already present {:?} < {:?}", msg_id, m.missing_group_ts, m.dest);
+                crate::sampled_print!(crate::LOG_SAMPLE, "add_entry_ts: msg {} already present {:?} < {:?}", msg_id, m.missing_group_ts, m.dest);
                 assert!(m.missing_group_ts.len() <= m.dest.len());
                 assert!(m.missing_group_ts.contains(self.gid));
                 m.last_modified = Instant::now();
@@ -186,6 +191,39 @@ impl PendingSet {
             // remove from ts_order
             self.ts_order.remove(&msg_id).unwrap();
         }
+    }
+
+    /// Head-of-line info: the smallest-ts pending msg and the groups whose ts
+    /// it is still missing. When this stays the same across debug dumps while
+    /// the log keeps growing, deliveries are blocked behind that one message.
+    pub fn blocked_head(&self) -> Option<(Clock, MsgId, GidSet, bool)> {
+        let (_, Reverse((ts, msg_id))) = self.ts_order.peek()?;
+        let p = self.all.get(msg_id)?;
+        Some((*ts, *msg_id, p.missing_group_ts.clone(), p.entry_ts.is_some()))
+    }
+
+    /// Number of pending msgs known only through a remote group ts, i.e. msgs
+    /// this group still has to propose locally (see `missing_entry_ts`).
+    pub fn missing_entry_ts_len(&self) -> usize {
+        self.all.values().filter(|p| p.entry_ts.is_none()).count()
+    }
+
+    /// Messages known only through a remote group ts and untouched for at least
+    /// `age` — i.e. this group owes them a local ts and they are not simply in
+    /// flight. Every destination group blocks on them (`final_ts` is None), so
+    /// they must be proposed locally or nothing behind them can be delivered.
+    pub fn missing_entry_ts_older_than(&self, age: std::time::Duration) -> Vec<(MsgId, GidSet)> {
+        let now = Instant::now();
+        self.all
+            .iter()
+            .filter_map(|(msg_id, p)| {
+                if p.entry_ts.is_none() && now.duration_since(p.last_modified) >= age {
+                    Some((*msg_id, p.dest.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Returns the list of messages not yet proposed in the local group

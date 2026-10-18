@@ -56,6 +56,11 @@ pub struct Config {
     pub reconnect_timeout_secs: usize,
     pub log_enabled: bool,
     pub persistence_backend: String,
+    /// Enable multi-group collaborative recovery: fetch payloads of multi-dest
+    /// messages from co-destination groups instead of own-group peers.
+    /// Defaults to false (single-group recovery) when absent from the config.
+    #[serde(default)]
+    pub multi_group_recovery: bool,
 }
 
 impl GroupConfig {
@@ -117,6 +122,7 @@ impl Config {
             reconnect_timeout_secs: 2,
             log_enabled: true,
             persistence_backend: "lmdb".to_string(),
+            multi_group_recovery: false,
         }
     }
 

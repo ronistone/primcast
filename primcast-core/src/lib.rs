@@ -64,6 +64,24 @@ macro_rules! timed_print {
         }
     }
 }
+/// Like `timed_print!`, but only every `$n`-th call at that call site. For
+/// per-message traces on the hot path, where printing every line costs more
+/// than the protocol work it describes (and buries the interesting lines).
+#[macro_export]
+macro_rules! sampled_print {
+    ($n:expr, $($arg:tt)*) => {{
+        static SAMPLE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if $crate::is_timed_print_enabled()
+            && SAMPLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % $n == 0
+        {
+            $crate::timed_print!($($arg)*);
+        }
+    }};
+}
+
+/// Sampling rate for the per-message hot-path traces.
+pub const LOG_SAMPLE: u64 = 10;
+
 /// Split msgid set into multiple hashsets to prevent large reallocations
 const MSGID_LOW_MASK: MsgId = 0xff;
 
@@ -116,6 +134,20 @@ impl std::fmt::Debug for LogEntry {
     }
 }
 
+/// Authoritative per-entry metadata for a log position, without the payload.
+/// Used by multi-group collaborative recovery: the recovering node fetches the
+/// (small) skeleton from its own group and the (large) payload from co-dest
+/// groups, keyed by `msg_id`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogSkeletonEntry {
+    pub idx: u64,
+    pub entry_epoch: Epoch,
+    pub local_ts: Clock,
+    pub final_ts: Option<Clock>,
+    pub msg_id: MsgId,
+    pub dest: GidSet,
+}
+
 pub struct GroupReplica {
     pub gid: Gid,
     pub pid: Pid,
@@ -140,6 +172,11 @@ pub struct GroupReplica {
     safe_len: u64,
     /// All MsgId present in the log
     msgid: HashMap<u16, HashSet<MsgId>>,
+    /// Reverse index MsgId -> log idx, for serving payloads by msg_id during
+    /// multi-group collaborative recovery. Covers in-memory entries (idx >= the
+    /// safe_len at load time); lookups that miss are reported as `missing` so the
+    /// caller can fall back to an own-group peer.
+    msgid_idx: HashMap<MsgId, u64>,
     /// Msgs which we know about that have not yet been delivered.
     /// We don't keep an explicit set of delivered msgs: the set of delivered msgs is (msgid - pending).
     pending: PendingSet,
@@ -154,7 +191,15 @@ pub struct GroupReplica {
     accepts: HashSet<Pid>,
 
     persistence: Box<dyn PersistenceLayer>,
+    /// Metadata is only read back at restart, so it is flushed on epoch change
+    /// and otherwise at most once per `METADATA_FLUSH_INTERVAL` — not once per
+    /// delivery round.
+    last_metadata_flush: Option<Instant>,
+    last_persisted_epoch: Option<Epoch>,
 }
+
+/// How often `update` persists replica metadata (see `last_metadata_flush`).
+const METADATA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug)]
 pub enum Error {
@@ -253,6 +298,7 @@ impl GroupReplica {
             current_epoch_acks,
             safe_len: safe_len,
             msgid,
+            msgid_idx: HashMap::default(),
             pending: PendingSet::new(gid),
 
             leader_last_seen: Instant::now(),
@@ -262,6 +308,8 @@ impl GroupReplica {
             accepts: Default::default(),
             remote_learners,
             persistence,
+            last_metadata_flush: None,
+            last_persisted_epoch: None,
         };
 
         // Reset log_epochs and log_len_cached to safe_len so the loading loop
@@ -326,18 +374,29 @@ impl GroupReplica {
     // }
 
     fn update_log_ts(&mut self, idx: u64, final_ts: Clock) -> Result<(), Error> {
-        let mut entry = self.persistence.as_mut().get_log_entry(idx);
-        if let Ok(e) = &mut entry {
-            if e.is_none() {
-                return Err(Error::InvalidIndex { len: self.log_actual_len() });
+        // This runs once per delivered message. Reading the entry back from the
+        // store first cost an extra LMDB read txn per delivery; the in-memory log
+        // holds it in the common case, so only fall back to the store on a miss.
+        let cached = self.log.get(&idx).cloned();
+        let (epoch, mut log) = match cached {
+            Some(entry) => {
+                let epoch = self
+                    .log_epochs
+                    .iter()
+                    .find(|&&(_, len)| len > idx)
+                    .map(|&(e, _)| e)
+                    .ok_or(Error::InvalidIndex { len: self.log_actual_len() })?;
+                (epoch, entry)
             }
-            let (epoch, log) = e.as_mut().unwrap();
-            log.final_ts = Some(final_ts);
-            self.persistence.as_mut().put_log_entry(*epoch, idx, log).unwrap();
-            self.log.insert(idx, log.clone());
-        }
-
-        
+            None => match self.persistence.as_mut().get_log_entry(idx) {
+                Ok(Some((epoch, entry))) => (epoch, entry),
+                Ok(None) => return Err(Error::InvalidIndex { len: self.log_actual_len() }),
+                Err(_) => return Err(Error::InvalidIndex { len: self.log_actual_len() }),
+            },
+        };
+        log.final_ts = Some(final_ts);
+        self.persistence.as_mut().put_log_entry(epoch, idx, &log).unwrap();
+        self.log.insert(idx, log);
         Ok(())
     }
 
@@ -418,21 +477,25 @@ impl GroupReplica {
             self.min_new_epoch_ts()
         );
         timed_print!("acks: {:?} epoch: {:?}", self.current_epoch_acks, self.current_epoch());
+        timed_print!(
+            "blocked_head: {:?} missing_local_ts: {}",
+            self.pending.blocked_head(),
+            self.pending.missing_entry_ts_len(),
+        );
         timed_print!("remote learners:");
         for (gid, l) in &self.remote_learners {
             timed_print!(
-                "    {:?} - safe_idx:{:?} next_entry:{:?} acks:{:?}",
+                "    {:?} - safe_idx:{:?} next_entry:{:?} buffered:{} following_epoch:{:?} acks:{:?}",
                 gid,
                 l.safe_idx(),
                 l.next_expected_log_entry(),
+                l.buffered(),
+                l.log_epoch(),
                 Vec::from_iter(l.remote_info()),
             );
         }
 
-        let mut count = 0;
-        for _ in self.persistence.as_ref().list_log_entries().unwrap() {
-            count += 1;
-        }
+        let count = self.persistence.as_ref().count_log_entries().unwrap();
         timed_print!(
             "persistence: {} entries in log",
             count
@@ -540,6 +603,10 @@ impl GroupReplica {
         self.promised_epoch = epoch;
         self.state = ReplicaState::Candidate;
         self.accepts.clear();
+        // self counts as an accept, mirroring the self-promise below — otherwise
+        // quorum_size external accepts are needed instead of quorum_size - 1,
+        // which run_candidate's local quorum counting (net crate) doesn't expect.
+        self.accepts.insert(self.pid);
         // add self promise
         let (current_epoch, log_len) = self.log_status();
         self.add_promise(epoch, self.pid, self.clock.local(), current_epoch, log_len)
@@ -652,6 +719,7 @@ impl GroupReplica {
                 let id_low = (entry.msg_id & MSGID_LOW_MASK) as u16;
                 let id_set = self.msgid.get_mut(&id_low).expect("msgid should be present");
                 assert!(id_set.remove(&entry.msg_id), "msgid should be present");
+                self.msgid_idx.remove(&entry.msg_id);
                 self.pending.remove_entry_ts(entry.msg_id);
             }
 
@@ -787,8 +855,11 @@ impl GroupReplica {
     }
 
     /// Get the entry at a given log position.
+    /// Returns None for an index this replica does not have — callers (recovery
+    /// range serving, skeleton serving, follower sync) are written against the
+    /// Option and must not be killed by a peer asking for too much.
     pub fn log_entry(&self, idx: u64) -> Option<(Epoch, LogEntry)> {
-        let e = self.get_log(idx).expect("out of range log idx");
+        let e = self.get_log(idx).ok()?;
         // derive entry epoch from the log_epochs array
         let mut epoch = None;
         // timed_print!("get log entry {:?} {:?}", idx, self.log_epochs);
@@ -800,6 +871,46 @@ impl GroupReplica {
             }
         }
         Some((epoch.unwrap(), e))
+    }
+
+    /// Return the metadata-only skeletons for log positions in `[from, to)`.
+    /// Authoritative ordering data; carries no payload bytes. Used as the first
+    /// phase of multi-group collaborative recovery.
+    pub fn log_skeleton_range(&self, from: u64, to: u64) -> Vec<LogSkeletonEntry> {
+        let end = std::cmp::min(to, self.log_actual_len());
+        let mut out = Vec::with_capacity((end.saturating_sub(from)) as usize);
+        for idx in from..end {
+            if let Some((epoch, entry)) = self.log_entry(idx) {
+                out.push(LogSkeletonEntry {
+                    idx,
+                    entry_epoch: epoch,
+                    local_ts: entry.local_ts,
+                    final_ts: entry.final_ts,
+                    msg_id: entry.msg_id,
+                    dest: entry.dest,
+                });
+            }
+        }
+        out
+    }
+
+    /// Look up payloads by `msg_id` (for serving co-dest groups during recovery).
+    /// Returns `(found, missing)`: `found` pairs each resolvable `msg_id` with its
+    /// payload bytes; `missing` lists ids not present in this replica's index so
+    /// the caller can fall back to an own-group peer.
+    pub fn payloads_for_msg_ids(&self, ids: &[MsgId]) -> (Vec<(MsgId, Bytes)>, Vec<MsgId>) {
+        let mut found = Vec::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for &id in ids {
+            match self.msgid_idx.get(&id) {
+                Some(&idx) => match self.get_log(idx) {
+                    Ok(entry) if entry.msg_id == id => found.push((id, entry.msg)),
+                    _ => missing.push(id),
+                },
+                None => missing.push(id),
+            }
+        }
+        (found, missing)
     }
 
     pub fn log_entry_for_remote(&self, idx: u64) -> Option<RemoteEntry> {
@@ -845,6 +956,8 @@ impl GroupReplica {
                 s.insert(entry.msg_id);
             }
         }
+        // reverse index for multi-group recovery payload lookup
+        self.msgid_idx.insert(entry.msg_id, idx);
 
         if !from_storage {
             self.pending
@@ -1037,23 +1150,44 @@ impl GroupReplica {
         for (gid, l) in &mut self.remote_learners {
             l.update();
             while let Some((msg_id, dest, ts)) = l.next_delivery() {
-                timed_print!("msg_id: {}, to timestamp: {}", msg_id, ts);
+                sampled_print!(crate::LOG_SAMPLE, "remote ts from {:?}: msg_id: {}, to timestamp: {}", gid, msg_id, ts);
                 self.pending.add_group_ts(msg_id, &dest, *gid, ts);
             }
         }
-        self.persistence.put_metadata(&persistence::ReplicaMetadata { 
-                gid: self.gid, 
-                pid: self.pid,
-                promised_epoch: self.promised_epoch.clone(),
-                log_epochs: self.log_epochs.clone(),
-                safe_len: self.safe_len.clone(),
-                clock: self.clock.get(self.pid),
-            }).expect("failed to update metadata in persistence");
+        // `update` runs on every delivery round; persisting metadata each time is
+        // one LMDB write txn per round for values that only matter on restart.
+        // Write on epoch change, else at most every METADATA_FLUSH_INTERVAL.
+        let epoch_changed = self.last_persisted_epoch != Some(self.promised_epoch);
+        if epoch_changed
+            || self
+                .last_metadata_flush
+                .map_or(true, |t| t.elapsed() >= METADATA_FLUSH_INTERVAL)
+        {
+            self.persistence
+                .put_metadata(&persistence::ReplicaMetadata {
+                    gid: self.gid,
+                    pid: self.pid,
+                    promised_epoch: self.promised_epoch.clone(),
+                    log_epochs: self.log_epochs.clone(),
+                    safe_len: self.safe_len.clone(),
+                    clock: self.clock.get(self.pid),
+                })
+                .expect("failed to update metadata in persistence");
+            self.last_metadata_flush = Some(Instant::now());
+            self.last_persisted_epoch = Some(self.promised_epoch);
+        }
     }
 
     /// Returns the list of messages with some decided remote timestamp but not proposed locally yet.
     pub fn missing_local_ts(&mut self) -> Vec<(MsgId, GidSet)> {
         self.pending.missing_entry_ts()
+    }
+
+    /// Same as `missing_local_ts`, restricted to messages that have been waiting
+    /// for a local ts for at least `age` (so messages merely in flight are not
+    /// re-proposed).
+    pub fn missing_local_ts_older_than(&self, age: std::time::Duration) -> Vec<(MsgId, GidSet)> {
+        self.pending.missing_entry_ts_older_than(age)
     }
 
     pub fn min_clock_leader(&self) -> Clock {
@@ -1353,6 +1487,69 @@ mod tests {
         assert_eq!(replica.log_entry(0).unwrap().1.msg_id, 1);
         assert_eq!(replica.log_entry(1).unwrap().1.msg_id, 2);
         assert_eq!(replica.log_entry(2).unwrap().1.msg_id, 3);
+    }
+
+    #[test]
+    fn skeleton_range_and_payload_lookup() {
+        // hermetic persistence dir so the test is independent of run order
+        // (new_for_test keys persistence only by pid, so tests sharing a pid
+        // otherwise clobber each other's lmdb state).
+        let mut config = Config::new_for_test();
+        let unique = format!(
+            "db/test_skeleton_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        config.groups[0].peers[1].persistence_database = unique;
+
+        let mk = |ts: Clock, id: MsgId, payload: &str, gids: &[Gid]| LogEntry {
+            local_ts: ts,
+            msg_id: id,
+            msg: payload.to_string().into(),
+            dest: {
+                let mut s = GidSet::new();
+                for g in gids {
+                    s.insert(*g);
+                }
+                s
+            },
+            final_ts: None,
+        };
+
+        let entries = vec![
+            (0u64, Epoch::initial(), mk(1, 10, "a", &[Gid(0)])),
+            (1u64, Epoch::initial(), mk(2, 20, "bb", &[Gid(0), Gid(1)])),
+            (2u64, Epoch::initial(), mk(3, 30, "ccc", &[Gid(0), Gid(1)])),
+        ];
+
+        let mut replica =
+            GroupReplica::new(Gid(0), Pid(1), Epoch::initial(), config.clone(), false);
+        replica.state = ReplicaState::Recovering;
+        replica.recovery_append_batch(entries).unwrap();
+
+        // skeleton range carries metadata, no payload, in idx order
+        let skel = replica.log_skeleton_range(0, 3);
+        assert_eq!(skel.len(), 3);
+        assert_eq!(skel[0].idx, 0);
+        assert_eq!(skel[0].msg_id, 10);
+        assert!(skel[1].dest.contains(Gid(1)));
+        assert!(!skel[0].dest.contains(Gid(1)));
+        assert_eq!(skel[2].msg_id, 30);
+
+        // partial range is clamped to log length
+        assert_eq!(replica.log_skeleton_range(1, 99).len(), 2);
+
+        // payload lookup resolves known ids and reports unknown ones as missing
+        let (found, missing) = replica.payloads_for_msg_ids(&[30, 10, 999]);
+        assert_eq!(missing, vec![999]);
+        let mut found_sorted = found.clone();
+        found_sorted.sort_by_key(|(id, _)| *id);
+        assert_eq!(found_sorted[0].0, 10);
+        assert_eq!(&found_sorted[0].1[..], b"a");
+        assert_eq!(found_sorted[1].0, 30);
+        assert_eq!(&found_sorted[1].1[..], b"ccc");
     }
 
     #[test]
